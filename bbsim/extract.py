@@ -17,7 +17,7 @@ import pandas as pd
 from bbsim.config import ExitFieldConfig
 from bbsim.geometry import FaceInfo
 from bbsim.naming import frequency_label
-from bbsim.readers import read_exit_field_fld, read_far_field_ffd, wait_for_file
+from bbsim.readers import FieldFileError, read_exit_field_fld, read_far_field_ffd, wait_for_file
 from bbsim.sampling import FarFieldGrid
 from bbsim.schema import FAR_FIELD_COLUMNS, WAVEGUIDE_COLUMNS, order_columns
 
@@ -133,6 +133,12 @@ def extract_waveguide(hfss: Any, ctx: ExtractionContext, ephi: int) -> pd.DataFr
             wait_for_file(path, ctx.timeout_s)
             df = read_exit_field_fld(path)
             path.unlink()
+            if frames and len(df) != len(frames[0]):
+                # Geant4 pairs exit points across polarizations by row index; every angle must have the same grid.
+                raise FieldFileError(
+                    f"exit field for phi={phi} theta={theta} Ephi={ephi} has {len(df)} points, "
+                    f"but the first angle had {len(frames[0])}"
+                )
             df["Freq"] = ctx.freq_label
             df["Ephi"] = ephi
             df["IWavePhi"] = float(phi)

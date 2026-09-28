@@ -76,6 +76,29 @@ def far_field_sphere_kwargs(accepted: Collection[str], grid: FarFieldGrid, name:
     raise RuntimeError(f"unrecognised Hfss.insert_infinite_sphere signature: {sorted(accepted)}")
 
 
+def initial_mesh_settings_kwargs() -> dict[str, Any]:
+    """Global mesh settings of the script-generated reference designs (crack1Rohan_500GHz, crack2_500GHz).
+
+    The GUI-made base designs carry ``UseAutoLength=false`` with a 0.1 mm defeature length, which a
+    duplicated design would inherit; the legacy script created a fresh design and therefore solved with
+    ``UseAutoLength=true``. These kwargs reproduce the reference ``MeshSettings`` block exactly.
+    """
+    return dict(level=5, method="Auto", dynamic_surface=False, flex_mesh=False, curvilinear=False,
+                fallback=True, phi=True, auto_model_resolution=True)
+
+
+def reset_initial_mesh_settings(hfss: Any) -> tuple[Any, dict[str, Any]]:
+    """Apply the reference global mesh settings; return (inherited settings, requested kwargs) for the manifest."""
+    try:
+        inherited = dict(hfss.mesh.initial_mesh_settings.props)
+    except Exception as exc:  # noqa: BLE001 - informational only
+        inherited = f"unavailable: {exc}"
+    requested = initial_mesh_settings_kwargs()
+    if not hfss.mesh.assign_initial_mesh_from_slider(**requested):
+        raise RuntimeError("assign_initial_mesh_from_slider returned False")
+    return inherited, requested
+
+
 def initialize_variables(hfss: Any, ei_v_per_m: float) -> None:
     hfss["Ephi"] = 0
     hfss.variable_manager.set_variable("Ei", str(ei_v_per_m), sweep=False)

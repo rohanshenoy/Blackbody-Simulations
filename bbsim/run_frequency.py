@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import shutil
+import sys
 import time
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 
@@ -13,6 +16,7 @@ from bbsim.manifest import build_manifest, sha256_file, write_json
 from bbsim.naming import frequency_design_name, frequency_label, last_adaptive_solution
 from bbsim.paths import JobDirs, create_job_dirs, default_job_id
 from bbsim.sampling import incident_angle_values, incoming_power_w
+from bbsim.schema import KEY_COLUMNS
 
 log = logging.getLogger("bbsim.run")
 
@@ -42,6 +46,15 @@ def overrides_from_args(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
+def allocation_warning(cores: int, env: Mapping[str, str] | None = None) -> str | None:
+    """Message when the configured solver cores disagree with the Slurm allocation, else None."""
+    env = os.environ if env is None else env
+    allocated = env.get("SLURM_CPUS_PER_TASK")
+    if allocated and allocated.isdigit() and int(allocated) != cores:
+        return f"solver.cores = {cores} but SLURM_CPUS_PER_TASK = {allocated}; pass --cores to match the allocation"
+    return None
+
+
 def _setup_logging(logfile: Path, level: str) -> None:
     logging.basicConfig(level=level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s",
                         handlers=[logging.FileHandler(logfile), logging.StreamHandler()])
@@ -61,6 +74,7 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
         export_convergence_text,
         initialize_variables,
         insert_far_field_sphere,
+        reset_initial_mesh_settings,
         set_total_fields,
         solve,
     )
@@ -96,6 +110,10 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
             hfss.set_active_design(run_design)
         if hfss.modeler.model_units != "mm":
             raise RuntimeError(f"model units are {hfss.modeler.model_units!r}; the configuration assumes mm")
+        # duplicate_design copies the base design's global mesh settings (manual 0.1 mm model resolution in the
+        # GUI-made base designs); the legacy script solved a fresh design with Auto. Restore the reference settings.
+        mesh_inherited, mesh_requested = reset_initial_mesh_settings(hfss)
+        log.info("initial mesh settings reset to %s (inherited: %s)", mesh_requested, mesh_inherited)
 
         # Same order as legacy main(): variables, faces/boundaries, exit CS, calculator, setup, sphere, plane wave.
         clear_boundaries_and_excitations(hfss)
@@ -128,6 +146,7 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
             scratch_dir=dirs.scratch, timeout_s=cfg.output.export_timeout_s,
             incoming_power_w=incoming_power_w(exc.ei_v_per_m, entrance.area_mm2),
         )
+        exit_point_counts: dict[int, dict] = {}
         for ephi in cfg.output.polarizations:
             waveguide = extract_waveguide(hfss, ctx, ephi)
             far_field = extract_far_field(hfss, ctx, ephi)
@@ -136,8 +155,17 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
             waveguide.to_csv(out_dir / "waveguide.csv", index=False)
             far_field.to_csv(out_dir / "far_field.csv", index=False)
             outputs[str(ephi)] = str(out_dir)
+            exit_point_counts[ephi] = waveguide.groupby(KEY_COLUMNS).size().to_dict()
             convergence[str(ephi)] = export_convergence_text(hfss, setup, f"Ephi='{ephi}'", dirs.logs / f"convergence_Ephi{ephi}.txt")
             log.info("wrote %s (%d waveguide rows, %d far-field rows)", out_dir, len(waveguide), len(far_field))
+        # Geant4 pairs the Ephi=0 and Ephi=1 exit points of each incident angle by row index.
+        first_ephi, first_counts = next(iter(exit_point_counts.items()))
+        for ephi, counts in exit_point_counts.items():
+            if counts != first_counts:
+                raise RuntimeError(
+                    f"exit-point counts per incident angle differ between polarization Ephi={first_ephi} and "
+                    f"Ephi={ephi}; Geant4 pairs them by row index. Ephi={first_ephi}: {first_counts}; Ephi={ephi}: {counts}"
+                )
         hfss.save_project()
 
     manifest = build_manifest(
@@ -154,6 +182,7 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
                     "polarization_convention": "Ephi=0: E_theta=1; Ephi=1: E_phi=1", "incoming_power_w": ctx.incoming_power_w},
         solver={"setup": setup, "parametric_sweep": parametric, "frequency_label": label, "formulation": "TotalFields",
                 "max_delta_e": cfg.solver.max_delta_e, "max_passes": cfg.solver.max_passes, "cores": cfg.solver.cores,
+                "initial_mesh_settings": {"requested": mesh_requested, "inherited_from_base_design": mesh_inherited},
                 "boundaries": {"rbin": "Radiation on entrance", "rbout": "Radiation on exit", "other faces": "default PEC"},
                 "convergence": convergence},
         far_field={"sphere": sphere, "theta_step_deg": grid.theta_step_deg, "phi_step_deg": grid.phi_step_deg,
@@ -173,11 +202,18 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     cfg = load_config(args.config, overrides_from_args(args))
+    if not cfg.project.path.is_file():
+        print(f"prepared project not found: {cfg.project.path} (run prepare_hfss_project.py first, or pass --project)",
+              file=sys.stderr)
+        return 2
     job_id = args.job_id or default_job_id()
     dirs = create_job_dirs(cfg.output.root, cfg.project.dataset_id, cfg.solver.frequency_ghz, job_id)
     _setup_logging(dirs.logs / "run.log", args.log_level)
     write_json(dirs.root / "effective_config.json", config_to_dict(cfg))
     log.info("job %s -> %s", job_id, dirs.root)
+    warning = allocation_warning(cfg.solver.cores)
+    if warning:
+        log.warning(warning)
     try:
         manifest = run_job(cfg, dirs, job_id)
     except Exception:  # noqa: BLE001 - report and exit non-zero; the session is already released

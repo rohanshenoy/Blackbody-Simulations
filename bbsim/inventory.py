@@ -32,6 +32,13 @@ def object_record(hfss: Any, object_name: str) -> dict[str, Any]:
     }
 
 
+def _mesh_settings(hfss: Any) -> Any:
+    try:
+        return dict(hfss.mesh.initial_mesh_settings.props)
+    except Exception as exc:  # noqa: BLE001 - informational only
+        return f"unavailable: {exc}"
+
+
 def inventory_design(hfss: Any) -> dict[str, Any]:
     odesign = hfss.odesign
     boundary_module = odesign.GetModule("BoundarySetup")
@@ -47,6 +54,7 @@ def inventory_design(hfss: Any) -> dict[str, Any]:
         "excitations": _native_pairs(boundary_module.GetExcitations()),
         "setups": [str(s) for s in analysis_module.GetSetups()],
         "coordinate_systems": [str(cs.name) for cs in hfss.modeler.coordinate_systems],
+        "initial_mesh_settings": _mesh_settings(hfss),
     }
 
 
@@ -75,9 +83,9 @@ def compare_retained_designs(source: dict[str, Any], prepared: dict[str, Any], d
             diffs.append(f"prepared design {new!r} missing")
             continue
         label = f"{old} -> {new}"
-        for key in ("solution_type", "units", "variables", "boundaries", "excitations", "setups"):
-            if s[key] != p[key]:
-                diffs.append(f"{label}: {key} differ: {s[key]!r} vs {p[key]!r}")
+        for key in ("solution_type", "units", "variables", "boundaries", "excitations", "setups", "initial_mesh_settings"):
+            if s.get(key) != p.get(key):
+                diffs.append(f"{label}: {key} differ: {s.get(key)!r} vs {p.get(key)!r}")
         renames = object_map.get(old, {})
         s_objs = {renames.get(o["name"], o["name"]): o for o in s["objects"]}
         p_objs = {o["name"]: o for o in p["objects"]}
