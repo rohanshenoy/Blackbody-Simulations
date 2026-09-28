@@ -1,16 +1,15 @@
 import pandas as pd
 import numpy as np
 
-waveguide_0_data = "C:/Users/Jason Wang/spyder/projects/Blackbody/Blackbody-Simulations/HFSSSimData/InfParallelPlate_bbsim23_500GHz_Ephi=0/waveguide.csv"
-waveguide_1_data = "C:/Users/Jason Wang/spyder/projects/Blackbody/Blackbody-Simulations/HFSSSimData/InfParallelPlate_bbsim23_500GHz_Ephi=1/waveguide.csv"
-
-far_field_0_data = "C:/Users/Jason Wang/spyder/projects/Blackbody/Blackbody-Simulations/HFSSSimData/InfParallelPlate_bbsim23_500GHz_Ephi=0/far_field.csv"
-far_field_1_data = "C:/Users/Jason Wang/spyder/projects/Blackbody/Blackbody-Simulations/HFSSSimData/InfParallelPlate_bbsim23_500GHz_Ephi=1/far_field.csv"
-
-waveguide_0_df = pd.read_csv(waveguide_0_data)
-waveguide_1_df = pd.read_csv(waveguide_1_data)
-far_field_0_df = pd.read_csv(far_field_0_data)
-far_field_1_df = pd.read_csv(far_field_1_data)
+def load_datasets(ephi0_dir, ephi1_dir):
+    """Load waveguide and far-field tables for the Ephi=0 and Ephi=1 datasets of one frequency."""
+    import os
+    return (
+        pd.read_csv(os.path.join(ephi0_dir, "waveguide.csv")),
+        pd.read_csv(os.path.join(ephi1_dir, "waveguide.csv")),
+        pd.read_csv(os.path.join(ephi0_dir, "far_field.csv")),
+        pd.read_csv(os.path.join(ephi1_dir, "far_field.csv")),
+    )
 
 #%% Stage 1: Finding the transmission power fraction of the waveguide
 
@@ -185,38 +184,6 @@ def get_angular_emission_distribution(phi_in, theta_in, polarization_0, polariza
     result["Polarization"] = [vec for vec in normalized_polarizations]
 
     return result
-#%%
-(polarization_0, polarization_1) = (1, 0) # polarization_0 corresponds to E_theta=1, E_phi=0 and polarization_1 corresponds to E_theta=0, E_phi=1
-magnitude_squared = polarization_0**2 + polarization_1**2
-assert np.isclose(magnitude_squared, 1.0), f"Magnitude squared is {magnitude_squared}, expected 1."
-
-phi_in = 0
-theta_in = 180
-
-# Stage 1
-power_transmission_fraction = get_S21(
-    phi_in, theta_in, polarization_0, polarization_1, waveguide_0_df, waveguide_1_df
-)
-
-# With this probability, the photon does not make it to the outgoing face of the waveguide
-print(power_transmission_fraction)
-
-# Stage 2
-face_emission_distribution = get_face_emission_distribution(
-    phi_in, theta_in, polarization_0, polarization_1, waveguide_0_df, waveguide_1_df
-)
-print(face_emission_distribution.sort_values("Probability", ascending=False).head())
-
-# Stage 3
-angular_emission_distribution = get_angular_emission_distribution(phi_in, theta_in, polarization_0, polarization_1, far_field_0_df, far_field_1_df)
-print(
-    angular_emission_distribution
-    .assign(
-        Polarization=lambda df: df["Polarization"].apply(lambda arr: np.array2string(arr, precision=4, separator=',', suppress_small=True))
-    )[["Theta", "Phi", "Probability", "Polarization"]]
-    .sort_values("Probability", ascending=False)
-    .head()
-)
 #%%
 # Sample run
 def sample_emission_point(face_distribution):
@@ -410,38 +377,73 @@ def simulate_multiple_emissions(
         )
         results.append(result)
     return results
-#%%
-N = 1 # or any number of desired samples
-all_results = simulate_multiple_emissions(
-    N,
-    phi_in,
-    theta_in,
-    polarization_0,
-    polarization_1,
-    waveguide_0_df,
-    waveguide_1_df,
-    far_field_0_df,
-    far_field_1_df
-)
 
-num_reached = sum(1 for r in all_results if r["reached_end"])
-print(f"Out of {N} photons, {num_reached} reached the end face.")
-print(f"Transmission rate: {num_reached / N:.4f}")
 
-reached = [r for r in all_results if r["reached_end"]]
+def main(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(description="Sample photon emission through a gap from HFSS exports.")
+    parser.add_argument("ephi0_dir", help="<id>_<freq>GHz_Ephi=0 directory with waveguide.csv and far_field.csv")
+    parser.add_argument("ephi1_dir", help="<id>_<freq>GHz_Ephi=1 directory")
+    parser.add_argument("--phi-in", type=float, default=0.0)
+    parser.add_argument("--theta-in", type=float, default=180.0)
+    parser.add_argument("--polarization", type=float, nargs=2, default=(1.0, 0.0), metavar=("P0", "P1"),
+                        help="Amplitudes of (E_theta=1, E_phi=0) and (E_theta=0, E_phi=1); squares must sum to 1")
+    parser.add_argument("--n", type=int, default=1, help="Number of photons to sample")
+    args = parser.parse_args(argv)
 
-points = pd.DataFrame([{
-    "X": r["sampled_point"]["X"],
-    "Y": r["sampled_point"]["Y"],
-    "Z": r["sampled_point"]["Z"],
-    "Probability": r["point_probability"]
-} for r in reached])
+    waveguide_0_df, waveguide_1_df, far_field_0_df, far_field_1_df = load_datasets(args.ephi0_dir, args.ephi1_dir)
+    polarization_0, polarization_1 = args.polarization
+    magnitude_squared = polarization_0**2 + polarization_1**2
+    assert np.isclose(magnitude_squared, 1.0), f"Magnitude squared is {magnitude_squared}, expected 1."
+    phi_in, theta_in = args.phi_in, args.theta_in
 
-angles = pd.DataFrame([{
-    "Theta": r["sampled_angle"]["Theta"],
-    "Phi": r["sampled_angle"]["Phi"],
-    "Probability": r["angle_probability"]
-} for r in reached])
+    # Stage 1
+    power_transmission_fraction = get_S21(
+        phi_in, theta_in, polarization_0, polarization_1, waveguide_0_df, waveguide_1_df
+    )
+    print(power_transmission_fraction)
 
-print(points.head())
-print(angles.head())
+    # Stage 2
+    face_emission_distribution = get_face_emission_distribution(
+        phi_in, theta_in, polarization_0, polarization_1, waveguide_0_df, waveguide_1_df
+    )
+    print(face_emission_distribution.sort_values("Probability", ascending=False).head())
+
+    # Stage 3
+    angular_emission_distribution = get_angular_emission_distribution(
+        phi_in, theta_in, polarization_0, polarization_1, far_field_0_df, far_field_1_df
+    )
+    print(
+        angular_emission_distribution
+        .assign(
+            Polarization=lambda df: df["Polarization"].apply(
+                lambda arr: np.array2string(arr, precision=4, separator=',', suppress_small=True))
+        )[["Theta", "Phi", "Probability", "Polarization"]]
+        .sort_values("Probability", ascending=False)
+        .head()
+    )
+
+    N = args.n
+    all_results = simulate_multiple_emissions(
+        N, phi_in, theta_in, polarization_0, polarization_1,
+        waveguide_0_df, waveguide_1_df, far_field_0_df, far_field_1_df
+    )
+    num_reached = sum(1 for r in all_results if r["reached_end"])
+    print(f"Out of {N} photons, {num_reached} reached the end face.")
+    print(f"Transmission rate: {num_reached / N:.4f}")
+    reached = [r for r in all_results if r["reached_end"]]
+    points = pd.DataFrame([{
+        "X": r["sampled_point"]["X"], "Y": r["sampled_point"]["Y"], "Z": r["sampled_point"]["Z"],
+        "Probability": r["point_probability"]
+    } for r in reached])
+    angles = pd.DataFrame([{
+        "Theta": r["sampled_angle"]["Theta"], "Phi": r["sampled_angle"]["Phi"],
+        "Probability": r["angle_probability"]
+    } for r in reached])
+    print(points.head())
+    print(angles.head())
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

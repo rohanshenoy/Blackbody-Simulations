@@ -1,3 +1,46 @@
+# HFSS / AEDT artifacts (the reference InfParallelPlate.aedt is tracked on purpose)
+*.aedtresults/
+*.aedt.lock
+*.aedt.auto
+*.aedt.bak
+*.aedt.batchinfo/
+*.aedtz
+*.aedb/
+*.pyaedt/
+*.asol
+*.lock
+*.fld
+*.ffd
+*.prop
+
+# Generated projects, run outputs, logs
+projects/
+.prepare_tmp_*/
+*.inventory.json
+*.inventory.source.json
+*.mapping.json
 HFSSSimData/
+outputs/
+scratch/
+reference/
+figs/
+slurm-*.out
+slurm-*.err
+*.log
+
+# Legacy local folders
 redraw_model/
 Old Code/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+envs/
+
+# Editors and OS
+.idea/
+.spyproject/
+.vscode/
+.DS_Store
