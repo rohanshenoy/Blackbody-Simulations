@@ -20,7 +20,7 @@ class Tolerances:
     coord_m: float = 1e-9
     angle_deg: float = 1e-6
     ingoing_rel: float = 1e-9
-    t_atol: float = 0.01
+    t_atol: float = 1e-3   # reference T at 45-degree incidence is 0.012-0.13; 0.01 would hide 80 % errors there
     t_rtol: float = 0.05
     t_noise_floor: float = 1e-6
     corr_warn: float = 0.95
@@ -40,6 +40,7 @@ class ComparisonResult:
     candidate: str
     reference: str
     checks: list[Check]
+    tolerances: dict = field(default_factory=dict)
 
     @property
     def passed(self) -> bool:
@@ -47,10 +48,11 @@ class ComparisonResult:
 
     def to_dict(self) -> dict:
         return {"candidate": self.candidate, "reference": self.reference, "passed": self.passed,
-                "checks": [asdict(c) for c in self.checks]}
+                "tolerances": dict(self.tolerances), "checks": [asdict(c) for c in self.checks]}
 
     def format_table(self) -> str:
-        lines = [f"candidate: {self.candidate}", f"reference: {self.reference}", ""]
+        tol = " ".join(f"{k}={v}" for k, v in self.tolerances.items())
+        lines = [f"candidate: {self.candidate}", f"reference: {self.reference}", f"tolerances: {tol}", ""]
         for c in self.checks:
             status = "PASS" if c.passed else ("FAIL" if c.severity == "fail" else "WARN")
             lines.append(f"{status:4} {c.name:26} {c.detail}")
@@ -98,21 +100,29 @@ def _transmission(df: pd.DataFrame) -> dict[tuple[float, float], float]:
 def _check_transmission(cand: pd.DataFrame, ref: pd.DataFrame, tol: Tolerances) -> Check:
     tc, tr = _transmission(cand), _transmission(ref)
     rows, failures, noise = [], [], []
+    worst_rel, worst_key = 0.0, None
     for key in sorted(set(tc) & set(tr)):
         c, r = tc[key], tr[key]
         if c < tol.t_noise_floor and r < tol.t_noise_floor:
             noise.append(key)
             rows.append({"key": list(key), "candidate": c, "reference": r, "status": "noise"})
             continue
+        rel = abs(c - r) / abs(r) if r else float("inf")
+        if rel > worst_rel:
+            worst_rel, worst_key = rel, key
         ok = abs(c - r) <= max(tol.t_atol, tol.t_rtol * abs(r))
-        rows.append({"key": list(key), "candidate": c, "reference": r, "status": "pass" if ok else "fail"})
+        rows.append({"key": list(key), "candidate": c, "reference": r, "rel_diff": rel,
+                     "status": "pass" if ok else "fail"})
         if not ok:
             failures.append(key)
     n_pass = len(rows) - len(failures) - len(noise)
     detail = f"{n_pass} pass, {len(noise)} below noise floor, {len(failures)} fail"
     if failures:
         detail += f": {failures}"
-    return Check("waveguide.transmission", not failures, "fail", detail, {"rows": rows})
+    if worst_key is not None:
+        detail += f"; max rel diff {worst_rel:.3f} at {worst_key}"
+    return Check("waveguide.transmission", not failures, "fail", detail,
+                 {"rows": rows, "max_rel_diff": worst_rel, "max_rel_diff_key": list(worst_key) if worst_key else None})
 
 
 def _magnitude(df: pd.DataFrame, prefixes: list[str]) -> np.ndarray:
@@ -180,4 +190,4 @@ def compare_datasets(candidate_dir: Path, reference_dir: Path, tol: Tolerances =
                    _check_keys("far_field", cf, rf)]
         checks += _check_points_and_fields("far_field", cf, rf, ["Theta", "Phi"], ["rEtheta", "rEphi"], tol.angle_deg, tol)
 
-    return ComparisonResult(str(candidate_dir), str(reference_dir), checks)
+    return ComparisonResult(str(candidate_dir), str(reference_dir), checks, asdict(tol))

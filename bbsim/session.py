@@ -10,6 +10,22 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+# Without these the session could open a blank project or attach to another user's desktop on the node.
+ESSENTIAL_KWARGS = ("project", "version", "non_graphical", "new_desktop")
+
+
+def require_essential_kwargs(callable_obj: Any, extra: tuple[str, ...] = ()) -> None:
+    """Raise if the installed Hfss() does not accept the arguments the headless session depends on."""
+    params = inspect.signature(callable_obj).parameters
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return
+    missing = [k for k in (*ESSENTIAL_KWARGS, *extra) if k not in params]
+    if missing:
+        raise RuntimeError(
+            f"installed PyAEDT Hfss() does not accept {missing}; this runner needs a PyAEDT release with the "
+            f"project/design/version/new_desktop arguments (PyAEDT >= 0.10). Signature: {inspect.signature(callable_obj)}"
+        )
+
 
 def supported_kwargs(callable_obj: Any, wanted: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     """Keep only keyword arguments that ``callable_obj`` accepts.
@@ -44,6 +60,7 @@ def aedt_session(project_path: Path | None, design: str | None, version: str = "
         close_on_exit=True,
         remove_lock=True,
     )
+    require_essential_kwargs(Hfss.__init__, extra=("design",) if design is not None else ())
     kwargs, dropped = supported_kwargs(Hfss.__init__, wanted)
     if dropped:
         log.warning("This PyAEDT's Hfss() does not accept %s; continuing without them", dropped)

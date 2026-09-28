@@ -61,8 +61,12 @@ class ExcitationConfig:
     phi_step_deg: float
 
     def __post_init__(self) -> None:
-        if self.ei_v_per_m <= 0:
-            raise ConfigError("ei_v_per_m must be positive")
+        if self.ei_v_per_m != 1.0:
+            raise ConfigError(
+                "ei_v_per_m must be 1.0: the HFSS plane wave amplitude is fixed at 1 V/m by the polarization "
+                "expressions ['Ephi', '1-Ephi'] (as in the reference run); Ei only scales IngoingPower, so any "
+                "other value would silently rescale every transmission ratio"
+            )
         for name in ("theta", "phi"):
             lo, hi, step = (getattr(self, f"{name}_{k}_deg") for k in ("lower", "upper", "step"))
             if hi < lo:
@@ -110,6 +114,9 @@ class FarFieldConfig:
             raise ConfigError("a_mm, b_mm and fineness must be positive")
         if not 0 < self.min_coarseness_deg <= self.max_coarseness_deg:
             raise ConfigError("need 0 < min_coarseness_deg <= max_coarseness_deg")
+        for name in ("theta", "phi"):
+            if getattr(self, f"{name}_upper_deg") < getattr(self, f"{name}_lower_deg"):
+                raise ConfigError(f"{name}_upper_deg must not be below {name}_lower_deg")
 
 
 @dataclass(frozen=True)
@@ -117,6 +124,16 @@ class ExitFieldConfig:
     manual: bool = True
     resolution_mm: tuple[float, float, float] = (0.0, 0.1, 0.001)
     boundary_mm: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None
+
+    def __post_init__(self) -> None:
+        res = self.resolution_mm
+        if len(res) != 3 or any(v < 0 for v in res) or not any(v > 0 for v in res):
+            raise ConfigError(f"resolution_mm must be 3 non-negative steps with at least one positive, got {list(res)}")
+        if self.boundary_mm is not None:
+            ok = (len(self.boundary_mm) == 2 and all(len(corner) == 3 for corner in self.boundary_mm)
+                  and all(hi >= lo for lo, hi in zip(*self.boundary_mm)))
+            if not ok:
+                raise ConfigError("boundary_mm must be [[xmin, ymin, zmin], [xmax, ymax, zmax]] with max >= min")
 
 
 @dataclass(frozen=True)
@@ -128,6 +145,8 @@ class OutputConfig:
     def __post_init__(self) -> None:
         if not self.polarizations or any(p not in (0, 1) for p in self.polarizations):
             raise ConfigError(f"polarizations must be a non-empty subset of [0, 1], got {list(self.polarizations)}")
+        if len(set(self.polarizations)) != len(self.polarizations):
+            raise ConfigError(f"polarizations must not repeat, got {list(self.polarizations)}")
         if self.export_timeout_s <= 0:
             raise ConfigError("export_timeout_s must be positive")
 

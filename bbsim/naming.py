@@ -3,11 +3,14 @@ from __future__ import annotations
 
 
 def frequency_label(frequency_ghz: float) -> str:
-    """``500`` and ``500.0`` -> ``"500GHz"``; ``512.5`` -> ``"512.5GHz"``."""
+    """``500`` and ``500.0`` -> ``"500GHz"``; ``512.5`` -> ``"512.5GHz"``; ``1234.5678`` -> ``"1234.5678GHz"``.
+
+    The label is also the HFSS solve frequency, so it keeps every digit (shortest round-trip repr).
+    """
     value = float(frequency_ghz)
     if value.is_integer():
         return f"{int(value)}GHz"
-    return f"{value:g}GHz"
+    return f"{value!r}GHz"
 
 
 def frequency_design_name(base_design: str, frequency_ghz: float) -> str:
