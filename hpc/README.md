@@ -6,14 +6,32 @@ or Open OnDemand. Paste each step's output into `hpc/RESULTS.md` before moving o
 
 ## 0. Get the branch onto HPC
 
-On the Mac (`/Users/rohanshenoy/supercdms/Blackbody-Simulations`), publish the branch:
+`origin` is Jason's repository, which we can only read, so the branch travels as a git bundle
+(no publishing) or via a fork under your own GitHub account.
 
-    git push -u origin linux-hpc-migration
+Bundle route. On the Mac (`/Users/rohanshenoy/supercdms/Blackbody-Simulations`):
+
+    git bundle create ~/Desktop/bbsim-linux-hpc-migration.bundle main..linux-hpc-migration
+    scp ~/Desktop/bbsim-linux-hpc-migration.bundle rshenoy@login.hpc.caltech.edu:/home/rshenoy/BBRSim/
 
 On HPC (login node is fine; no solver runs here):
 
     cd /home/rshenoy/BBRSim/Blackbody-Simulations
-    git fetch origin && git checkout linux-hpc-migration && git pull
+    git status --short                      # expect nothing
+    git fetch origin                        # main must be present (the bundle builds on it)
+    git bundle verify ../bbsim-linux-hpc-migration.bundle
+    git fetch ../bbsim-linux-hpc-migration.bundle linux-hpc-migration:linux-hpc-migration
+    git checkout linux-hpc-migration
+
+To pick up later commits, rebuild and copy the bundle, then on HPC
+`git fetch ../bbsim-linux-hpc-migration.bundle linux-hpc-migration:linux-hpc-migration && git checkout linux-hpc-migration && git reset --hard linux-hpc-migration`.
+
+Fork route. On the Mac, `gh repo fork ModerJason/Blackbody-Simulations --remote --remote-name fork`
+then `git push -u fork linux-hpc-migration`; on HPC, `git remote add fork <fork url>`,
+`git fetch fork`, `git checkout -b linux-hpc-migration fork/linux-hpc-migration`.
+
+Then, on HPC:
+
     source /home/rshenoy/BBRSim/bb_env.sh
     python -m pip freeze > requirements-hpc.txt      # commit this: it pins the tested combination
     python -c "import ansys.aedt.core as c; print(c.__version__)"
