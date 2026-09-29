@@ -23,8 +23,9 @@ On HPC (login node is fine; no solver runs here):
     git fetch ../bbsim-linux-hpc-migration.bundle linux-hpc-migration:linux-hpc-migration
     git checkout linux-hpc-migration
 
-To pick up later commits, rebuild and copy the bundle, then on HPC
-`git fetch ../bbsim-linux-hpc-migration.bundle linux-hpc-migration:linux-hpc-migration && git checkout linux-hpc-migration && git reset --hard linux-hpc-migration`.
+To pick up later commits, rebuild and copy the bundle, then on HPC (with the branch checked out):
+
+    git fetch ../bbsim-linux-hpc-migration.bundle linux-hpc-migration && git merge --ff-only FETCH_HEAD
 
 Fork route. On the Mac, `gh repo fork ModerJason/Blackbody-Simulations --remote --remote-name fork`
 then `git push -u fork linux-hpc-migration`; on HPC, `git remote add fork <fork url>`,

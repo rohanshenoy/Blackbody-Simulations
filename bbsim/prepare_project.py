@@ -1,7 +1,8 @@
 """CLI: produce a cleaned copy of the reference project with renamed base designs.
 
-The input project is copied to a temporary file before AEDT opens it, so the
-reference is never touched (not even by a lock file). The copy is saved-as to
+The input project is copied to a temporary directory (node-local $TMPDIR under
+Slurm) before AEDT opens it, so the reference is never touched (not even by a
+lock file). The copy is saved-as to
 the output path, which performs the 2023 R2 -> 2025 R2 conversion. Designs not
 in the mapping are deleted from the output only. The output is reopened and
 inventoried, and retained designs are diffed against the source.
@@ -13,6 +14,9 @@ import logging
 import shutil
 import sys
 import tempfile
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,6 +51,34 @@ def validate_paths(input_path: Path, output_path: Path, force: bool) -> None:
         sys.exit("input and output must be different files")
     if output_path.exists() and not force:
         sys.exit(f"output exists (use --force to overwrite): {output_path}")
+
+
+@contextmanager
+def temporary_copy(source: Path, base_dir: Path | None = None, cleanup_timeout_s: float = 60.0) -> Iterator[Path]:
+    """Copy ``source`` into a fresh temporary directory and remove that directory afterwards.
+
+    The default location is the system temp dir ($TMPDIR, node-local under Slurm), not the NFS home.
+    AEDT can keep files open for a moment after the desktop is released and NFS then leaves ``.nfs*``
+    placeholders, so removal is retried for ``cleanup_timeout_s`` and a final failure is logged, not
+    raised: the copy is disposable and must never turn a successful run into a non-zero exit.
+    """
+    holder = Path(tempfile.mkdtemp(prefix="bbsim_prepare_", dir=str(base_dir) if base_dir else None))
+    work = holder / source.name
+    shutil.copy2(source, work)
+    try:
+        yield work
+    finally:
+        deadline = time.monotonic() + cleanup_timeout_s
+        while True:
+            try:
+                shutil.rmtree(holder)
+                break
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    leftovers = sorted(str(q.relative_to(holder)) for q in holder.rglob("*")) if holder.exists() else []
+                    log.warning("could not remove temporary copy %s (%s); leftovers: %s", holder, exc, leftovers[:20])
+                    break
+                time.sleep(2.0)
 
 
 def apply_cleanup(hfss: Any, mapping: DesignMapping, deletions: list[str]) -> list[dict]:
@@ -98,12 +130,12 @@ def main(argv: list[str] | None = None) -> int:
 
     from bbsim.session import aedt_session, aedt_versions  # lazy PyAEDT import
 
-    with tempfile.TemporaryDirectory(dir=output_path.parent, prefix=".prepare_tmp_") as tmp:
-        work = Path(tmp) / input_path.name
-        shutil.copy2(input_path, work)
+    with temporary_copy(input_path) as work:
         with aedt_session(work, design=None, version=args.aedt_version) as hfss:
             versions = aedt_versions(hfss)
             source_inv = inventory_project(hfss)
+            source_inv["project_file"] = str(input_path)   # inventoried via a temporary copy of this file
+            source_inv["source_sha256"] = source_sha
             write_json(output_path.with_suffix(".inventory.source.json"), source_inv)
             errors = validate_mapping(mapping, source_inv)
             deletions = plan_deletions(mapping, source_inv)
