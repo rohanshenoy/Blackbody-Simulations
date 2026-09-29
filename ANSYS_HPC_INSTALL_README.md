@@ -232,11 +232,14 @@ Imports succeeded
 ```
 
 The installer reported completion, first-time AEDT configuration succeeded,
-and the Python import/path checks above passed. Non-graphical AEDT startup,
-an actual HFSS license checkout, and a simulation have **not yet been
-verified**. An X-display error or successful DNS lookup does not verify a
-license checkout. The next step is an AEDT startup test in an interactive
-compute allocation.
+and the Python import/path checks above passed.
+
+Update 2026-09-28: non-graphical AEDT 2025.2 startup on a compute node was
+verified with PyAEDT 1.7.0 (`python hpc/aedt_smoke_test.py`, Slurm job
+3614903, debug QOS): the desktop started over gRPC in 43 s, created and
+saved a project, and released cleanly, so the base AEDT license checkout
+works from compute nodes. An HFSS solver license checkout and an actual
+simulation have **not yet been verified**; see `hpc/RESULTS.md`.
 
 Before batch execution, Blackbody-Simulations still needs its graphical
 `Hfss(..., non_graphical=False)` launches adapted for non-graphical use, plus
