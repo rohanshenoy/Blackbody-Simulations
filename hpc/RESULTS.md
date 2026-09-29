@@ -67,6 +67,18 @@ The leftover directory on HPC must be removed by hand (`rm -rf /home/rshenoy/BBR
 
 ## 3. Prepared project
 
+2026-09-28, same allocation (job 3614903, hpc-91-17), code at f6ececa. Command:
+`python prepare_hfss_project.py --input InfParallelPlate.aedt --output /home/rshenoy/BBRSim/projects/ParallelPlateGaps.aedt --mapping configs/design_mapping.json`.
+Result: PASS.
+
+    Prepared project verified: /resnick/home/rshenoy/BBRSim/projects/ParallelPlateGaps.aedt
+    a264705100ab80ff2a3b2315b0529a8505c2903b996c98cd0d65d7144097482f  InfParallelPlate.aedt
+
+The cleaned project holds parallel_plate_gap_50um and parallel_plate_gap_100um (object `gap` in each),
+saved by AEDT 2025 R2; the reopen inventory matched the source designs (geometry, materials, units,
+mesh settings) and the reference project's hash is unchanged. Records next to the output:
+ParallelPlateGaps.inventory.source.json, ParallelPlateGaps.inventory.json, ParallelPlateGaps.mapping.json.
+
 ## 4. Single-angle baseline
 
 ## 5. Full reference run and comparison
