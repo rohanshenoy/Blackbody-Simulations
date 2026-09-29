@@ -6,30 +6,26 @@ or Open OnDemand. Paste each step's output into `hpc/RESULTS.md` before moving o
 
 ## 0. Get the branch onto HPC
 
-`origin` is Jason's repository, which we can only read, so the branch travels as a git bundle
-(no publishing) or via a fork under your own GitHub account.
+`origin` is Jason's repository, which we can only read. The branch lives on the fork
+https://github.com/rohanshenoy/Blackbody-Simulations (remote name `fork` on the Mac).
 
-Bundle route. On the Mac (`/Users/rohanshenoy/supercdms/Blackbody-Simulations`):
-
-    git bundle create ~/Desktop/bbsim-linux-hpc-migration.bundle main..linux-hpc-migration
-    scp ~/Desktop/bbsim-linux-hpc-migration.bundle rshenoy@login.hpc.caltech.edu:/home/rshenoy/BBRSim/
-
-On HPC (login node is fine; no solver runs here):
+First time on HPC:
 
     cd /home/rshenoy/BBRSim/Blackbody-Simulations
     git status --short                      # expect nothing
-    git fetch origin                        # main must be present (the bundle builds on it)
-    git bundle verify ../bbsim-linux-hpc-migration.bundle
-    git fetch ../bbsim-linux-hpc-migration.bundle linux-hpc-migration:linux-hpc-migration
-    git checkout linux-hpc-migration
+    git remote add fork https://github.com/rohanshenoy/Blackbody-Simulations.git
+    git fetch fork
+    git checkout -B linux-hpc-migration fork/linux-hpc-migration
 
-To pick up later commits, rebuild and copy the bundle, then on HPC (with the branch checked out):
+Later updates on HPC (branch checked out):
 
-    git fetch ../bbsim-linux-hpc-migration.bundle linux-hpc-migration && git merge --ff-only FETCH_HEAD
+    git pull --ff-only fork linux-hpc-migration
 
-Fork route. On the Mac, `gh repo fork ModerJason/Blackbody-Simulations --remote --remote-name fork`
-then `git push -u fork linux-hpc-migration`; on HPC, `git remote add fork <fork url>`,
-`git fetch fork`, `git checkout -b linux-hpc-migration fork/linux-hpc-migration`.
+Publishing from the Mac: `git push fork linux-hpc-migration`. Never push to `origin`.
+
+Offline alternative (no GitHub): `git bundle create ~/Desktop/bbsim-linux-hpc-migration.bundle main..linux-hpc-migration`
+on the Mac, `scp` it to `/home/rshenoy/BBRSim/`, then on HPC
+`git fetch ../bbsim-linux-hpc-migration.bundle linux-hpc-migration && git merge --ff-only FETCH_HEAD`.
 
 Then, on HPC:
 
