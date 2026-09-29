@@ -38,6 +38,33 @@ so lines appear twice.
 
 ## 2. Dry-run inventory
 
+2026-09-28 18:22, same allocation (job 3614903, hpc-91-17). Command:
+`python prepare_hfss_project.py --input InfParallelPlate.aedt --output /home/rshenoy/BBRSim/projects/ParallelPlateGaps.aedt --mapping configs/design_mapping.json --dry-run`.
+Result: inventory PASS; the 2023 R2 project opened headlessly in 2025 R2 with no conversion prompt.
+AEDT started in 5.2 s (warm); the 18-design inventory took about 1.5 s.
+
+    Designs found: 18
+      crack2          units=mm  objects: crack2[vacuum]  setups=[] boundaries=0
+      crack1Rohan     units=mm  objects: crack1[vacuum]  setups=[] boundaries=0
+      (16 others, all HFSS, e.g. crack1Rohan_500GHz setups=['500GHz'] boundaries=2,
+       backagain2_500GHz setups=['500GHz', '500GHz_refine'], infrarmitigation boundaries=3)
+    Renames:
+      crack1Rohan/crack1 -> parallel_plate_gap_50um/gap  (dataset_id InfParallelPlate_crack1Rohan, 50 um)
+      crack2/crack2 -> parallel_plate_gap_100um/gap  (dataset_id InfParallelPlate_crack2, 100 um)
+    Deletions (16): [backagain, backagain2, backagain2_500GHz, backagain_500GHz, crack1Rohan_500GHz,
+      crack1again_500GHz, crack2_500GHz, cylindrical2, height_perturb, hollow, hollow_500GHz,
+      infrarmitigation, rectangle, right_angle, stub, stub2]
+    Dry run: no project written.
+
+Both base designs confirmed bare (no setups, boundaries or excitations), as the runner assumes.
+Two harmless PyAEDT warnings "Not enough vertices or non-planar face" while reading cylindrical2.
+
+Defect found: after the desktop was released, Python's TemporaryDirectory cleanup raised
+`OSError: [Errno 39] Directory not empty: .../projects/.prepare_tmp_vxeyq9hv` (AEDT/NFS left entries
+behind), so the successful dry run exited 1. Fixed in f6ececa: the working copy now lives in the
+node-local $TMPDIR, removal is retried for 60 s, and a final failure is logged rather than raised.
+The leftover directory on HPC must be removed by hand (`rm -rf /home/rshenoy/BBRSim/projects/.prepare_tmp_*`).
+
 ## 3. Prepared project
 
 ## 4. Single-angle baseline
