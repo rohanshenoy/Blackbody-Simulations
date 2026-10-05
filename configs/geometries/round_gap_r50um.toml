@@ -1,0 +1,15 @@
+# Round gap for build_hfss_project.py: a vacuum cylinder of radius 50 um and length 0.4 mm, Jason's
+# cylindrical2 dimensions, created in the canonical pose (axis +z from z = 0, centred on x = y = 0).
+
+[project]
+output = "/home/rshenoy/BBRSim/projects/RoundGap.aedt"
+design = "round_gap_r50um"
+object = "gap"
+dataset_id = "RoundGap_r50um"
+aedt_version = "2025.2"
+
+[solid]
+kind = "cylinder"        # "cad" comes later, through the same script
+material = "vacuum"
+radius_mm = 0.05
+length_mm = 0.4
