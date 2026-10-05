@@ -40,3 +40,8 @@ def last_adaptive_solution(frequency_ghz: float) -> str:
 def dataset_dir_name(dataset_id: str, frequency_ghz: float, ephi: int) -> str:
     """Directory stem read by BBRCrackLibrary: ``<id>_<freq>GHz_Ephi=<n>``."""
     return f"{dataset_id}_{frequency_label(frequency_ghz)}_Ephi={int(ephi)}"
+
+
+def dataset_record_name(dataset_id: str, frequency_ghz: float) -> str:
+    """Sidecar beside the two dataset directories: ``<id>_<freq>GHz.dataset.json``."""
+    return f"{dataset_id}_{frequency_label(frequency_ghz)}.dataset.json"
