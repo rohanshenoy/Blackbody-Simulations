@@ -12,6 +12,9 @@ field E_inc = E_total - E_scattered, and fits the phase slope along each line. T
 not depend on the e^{+jwt} / e^{-jwt} convention:
     arrival-direction reading, k = -r_hat(theta, phi) = (0, -0.707, +0.707):  k_y / k_z = -1
     alternative, k = (sin t cos p, sin t sin p, -cos t) = (0, +0.707, +0.707): k_y / k_z = +1
+The ratio cannot tell k from -k. As a self-check outside the verdict, the JSON also reports whether the z
+slope is negative, as HFSS's e^{+jwt} (E_inc ~ e^{-jk.r}) requires for a wave entering the gap (k_z > 0 in
+both readings above).
 """
 from __future__ import annotations
 
@@ -40,6 +43,9 @@ LINES_MM = {
 }
 EXPECTED_RATIO = -1.0
 TOLERANCE = 0.05
+SLOPE_Z_NOTE = ("Self-check, not in the verdict: under HFSS's e^{+jwt}, E_inc ~ e^{-jk.r}, so a wave entering the "
+                "gap (k_z > 0) needs a negative z slope. The ratio cannot tell k from -k; false means k points out "
+                "of the gap or the phasors use e^{-jwt}.")
 
 
 def phase_slope(positions_m: np.ndarray, field: np.ndarray) -> float:
@@ -111,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
         "slope_y_rad_per_m": slopes["y"], "slope_z_rad_per_m": slopes["z"], "k0_rad_per_m": k0,
         "ratio_ky_over_kz": ratio, "magnitude_over_k0": math.hypot(slopes["y"], slopes["z"]) / k0,
         "expected_ratio": EXPECTED_RATIO, "verdict": verdict(ratio),
+        "slope_z_negative_as_expected": bool(slopes["z"] < 0), "slope_z_note": SLOPE_Z_NOTE,
     }
     text = json.dumps(result, indent=2)
     print(text)
