@@ -1,6 +1,7 @@
 """Run configuration: TOML file -> validated frozen dataclasses, with dotted CLI overrides."""
 from __future__ import annotations
 
+import math
 import tomllib
 from collections.abc import Mapping
 from dataclasses import MISSING, asdict, dataclass, fields
@@ -10,6 +11,10 @@ from typing import Any
 
 class ConfigError(ValueError):
     """The configuration is missing, malformed, or violates a constraint."""
+
+
+POSE_RULES = ("canonical-z", "unchecked")
+SYMMETRIES = ("mirror_l", "mirror_g", "end_to_end", "rotational")
 
 
 @dataclass(frozen=True)
@@ -41,13 +46,31 @@ class GeometryConfig:
     exit_cs_y: tuple[float, float, float]
     expected_box_size_mm: tuple[float, float, float] | None = None
     expected_face_area_mm2: float | None = None
+    pose: str = "canonical-z"
+    symmetry: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("exit_cs_x", "exit_cs_y"):
             if len(getattr(self, name)) != 3:
                 raise ConfigError(f"{name} must have 3 components")
+        x = [float(c) for c in self.exit_cs_x]
+        y = [float(c) for c in self.exit_cs_y]
+        for name, v in (("exit_cs_x", x), ("exit_cs_y", y)):
+            if abs(math.sqrt(sum(c * c for c in v)) - 1.0) > 1e-9:
+                raise ConfigError(f"{name} must be a unit vector, got {v}")
+        if abs(sum(a * b for a, b in zip(x, y))) > 1e-9:
+            raise ConfigError(f"exit_cs_x and exit_cs_y must be orthogonal, got {x} and {y}")
         if self.expected_box_size_mm is not None and len(self.expected_box_size_mm) != 3:
             raise ConfigError("expected_box_size_mm must have 3 components")
+        if self.pose not in POSE_RULES:
+            raise ConfigError(f"pose must be one of {list(POSE_RULES)}, got {self.pose!r}")
+        if isinstance(self.symmetry, str):
+            raise ConfigError(f"symmetry must be a list such as [\"mirror_l\"], got the string {self.symmetry!r}")
+        unknown = [s for s in self.symmetry if s not in SYMMETRIES]
+        if unknown:
+            raise ConfigError(f"symmetry values must be from {list(SYMMETRIES)}, got {unknown}")
+        if len(set(self.symmetry)) != len(self.symmetry):
+            raise ConfigError(f"symmetry must not repeat, got {list(self.symmetry)}")
 
 
 @dataclass(frozen=True)
@@ -124,6 +147,7 @@ class ExitFieldConfig:
     manual: bool = True
     resolution_mm: tuple[float, float, float] = (0.0, 0.1, 0.001)
     boundary_mm: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None
+    edge_samples: int = 64
 
     def __post_init__(self) -> None:
         res = self.resolution_mm
@@ -134,6 +158,8 @@ class ExitFieldConfig:
                   and all(hi >= lo for lo, hi in zip(*self.boundary_mm)))
             if not ok:
                 raise ConfigError("boundary_mm must be [[xmin, ymin, zmin], [xmax, ymax, zmax]] with max >= min")
+        if isinstance(self.edge_samples, bool) or not isinstance(self.edge_samples, int) or self.edge_samples < 8:
+            raise ConfigError(f"edge_samples must be an integer >= 8, got {self.edge_samples!r}")
 
 
 @dataclass(frozen=True)

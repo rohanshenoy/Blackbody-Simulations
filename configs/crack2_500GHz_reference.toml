@@ -15,6 +15,7 @@ exit_cs_x = [0.0, 0.0, 1.0]
 exit_cs_y = [0.0, 1.0, 0.0]
 expected_box_size_mm = [0.1, 10.0, 1.5]
 expected_face_area_mm2 = 1.0
+symmetry = ["mirror_l", "mirror_g", "end_to_end"]
 
 [excitation]
 ei_v_per_m = 1.0
