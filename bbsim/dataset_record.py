@@ -167,6 +167,10 @@ def build_dataset_record(manifest: Mapping[str, Any], manifest_sha256: str,
     bbox = [float(v) for v in geo["bounding_box_mm"]]
     size = [hi - lo for lo, hi in zip(bbox[:3], bbox[3:])]
     frequency_ghz = float(cfg["solver"]["frequency_ghz"])
+    # Arrival-direction convention: (theta, phi) are the angles of -k. Normal entry travels into the gap,
+    # k = -n_entrance, so -k is the entrance outward normal: theta = acos(n_z), 180 under canonical-z.
+    entrance_normal_z = float(geo["entrance_face"]["outward_normal"][2])
+    normal_entry_theta_deg = round(math.degrees(math.acos(max(-1.0, min(1.0, entrance_normal_z)))), 12) + 0.0
     record: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "dataset_id": cfg["project"]["dataset_id"],
@@ -196,7 +200,7 @@ def build_dataset_record(manifest: Mapping[str, Any], manifest_sha256: str,
         },
         "excitation": {
             "coordinate_system": "global", "incidence_convention": "arrival_direction",
-            "normal_entry_theta_deg": 180.0,
+            "normal_entry_theta_deg": normal_entry_theta_deg,
             "plane_wave_origin": "entrance_face_center",
             "origin_mm_global": [float(v) for v in geo["entrance_face"]["center_mm"]],
             "incident_phi_deg": exc["incident_phi_deg"], "incident_theta_deg": exc["incident_theta_deg"],
