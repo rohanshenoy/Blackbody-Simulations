@@ -61,7 +61,7 @@ def _setup_logging(logfile: Path, level: str) -> None:
 
 
 def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
-    from bbsim.extract import ExtractionContext, extract_far_field, extract_waveguide
+    from bbsim.extract import ExtractionContext, describe_exit_face, extract_far_field, extract_waveguide
     from bbsim.geometry import create_exit_coordinate_system, create_exit_face_list, select_faces
     from bbsim.hfss_setup import (
         EXIT_CS,
@@ -146,9 +146,10 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
             scratch_dir=dirs.scratch, timeout_s=cfg.output.export_timeout_s,
             incoming_power_w=incoming_power_w(exc.ei_v_per_m, entrance.area_mm2),
         )
+        face_geometry = describe_exit_face(hfss, ctx)
         exit_point_counts: dict[int, dict] = {}
         for ephi in cfg.output.polarizations:
-            waveguide = extract_waveguide(hfss, ctx, ephi)
+            waveguide = extract_waveguide(hfss, ctx, ephi, face_geometry)
             far_field = extract_far_field(hfss, ctx, ephi)
             out_dir = dirs.dataset_dir(cfg.project.dataset_id, freq, ephi)
             out_dir.mkdir(parents=True, exist_ok=False)
