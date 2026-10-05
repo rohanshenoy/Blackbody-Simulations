@@ -91,6 +91,35 @@ ParallelPlateGaps.inventory.source.json, ParallelPlateGaps.inventory.json, Paral
 
 ## 4. Single-angle baseline
 
+2026-10-05, batch (`hpc/run_frequency.sbatch`: 4 cores, 32G, `-t 02:00:00`), code at 271c280, job
+`baseline1`. Result: FAIL after the solve.
+
+    13:09:37 solving 500GHz with 4 cores (1 incident angles x 2 polarizations)
+    13:10:44 Design setup None solved correctly in 0.0h 1.0m 6.0s      (PyAEDT: AnalyzeAll, blocking)
+    13:10:44 solve finished in 66.6 s
+    GrpcApiError: Failed to execute gRPC AEDT command: ClcEval        (extract.py, evaluate_outgoing_power)
+
+Diagnostic (`hpc/diagnose_calculator.py` at 38a17f4, 13:17, on a copy of the job's project and results):
+the three designs, the setup `500GHz`, the solutions `500GHz : LastAdaptive` and the Ephi table, the
+variable `Ephi='0'` and the excitation `plane_wave_500GHz` (PhiPoints 1, ThetaPoints 1) are all present.
+Every `ClcEval` failed with AEDT's message "Script macro error: Error in performing operation", a bare
+constant evaluated with `Freq` alone included, so neither the expression nor the variation arguments are
+at fault. (`odesign.ListVariations` is not reachable over gRPC; the call belongs to the Solutions module.)
+
+Root cause: `ClcEval` followed by `GetTopEntryValue` reads the GUI calculator stack back. That stateful
+round trip exists over COM (Windows, where the legacy script ran) but not over the gRPC transport PyAEDT
+uses on Linux. PyAEDT 1.7.0 evaluates calculator expressions by `CalculatorWrite` to a file and reading
+it back (`visualization/post/fields_calculator.py`: "ClcEval does not return any value"), and pyEPR's
+notes on its PyAEDT gRPC backend name this read-back as the one operation that does not survive gRPC.
+
+Fix (this branch, with this entry): `evaluate_outgoing_power` writes each value with `CalculatorWrite`
+(the intrinsics plus `Phase='0deg'`, as PyAEDT passes them) and reads it with `read_calculator_scalar`.
+The fake AEDT used by the tests now refuses `ClcEval` and `GetTopEntryValue` the way gRPC does.
+
+Open: whether the 66.6 s solve left complete field data for both polarizations (step 4a answers it on
+`job_baseline1` without a new solve), and why the Slurm job stayed alive after Python released the
+desktop at 13:10:47 (`sacct` end time to record). Next: step 4a, then step 4 as `baseline2`.
+
 ## 5. Full reference run and comparison
 
 ## 5b. Incident-direction check

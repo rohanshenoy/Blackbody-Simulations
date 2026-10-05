@@ -69,24 +69,52 @@ empty `verification_differences` list. Confirm the reference is untouched:
 
     sha256sum InfParallelPlate.aedt   # a264705100ab80ff2a3b2315b0529a8505c2903b996c98cd0d65d7144097482f
 
-## 4. Single-angle baseline (same allocation, or a new debug one)
+## 4. Single-angle baseline (batch)
 
-    python run_hfss_frequency.py --config configs/crack1_500GHz_single_angle.toml --job-id baseline1
+The first use of the HFSS solver licence. One paste on the login node:
 
-Expected: exit 0, and
-`/home/rshenoy/BBRSim/outputs/InfParallelPlate_crack1Rohan_500GHz/job_baseline1/` containing
-`InfParallelPlate_crack1Rohan_500GHz_Ephi=0/{waveguide.csv,far_field.csv,manifest.json}`,
-`logs/run.log` and `logs/convergence_Ephi0.txt`. Check the grid sizes and transmission:
+    mkdir -p /home/rshenoy/BBRSim/outputs      # Slurm cannot create its --output directory
+    cd /home/rshenoy/BBRSim/Blackbody-Simulations && git pull --ff-only fork linux-hpc-migration
+    sbatch -t 02:00:00 hpc/run_frequency.sbatch configs/crack1_500GHz_single_angle.toml --job-id baseline2
+    squeue -u rshenoy
+
+Expected: the job ends `COMPLETED`; `/home/rshenoy/BBRSim/outputs/slurm-<id>.out` ends with
+`done; manifest at .../job_baseline2/manifest.json`; and
+`/home/rshenoy/BBRSim/outputs/InfParallelPlate_crack1Rohan_500GHz/job_baseline2/` holds
+`InfParallelPlate_crack1Rohan_500GHz_Ephi={0,1}/{waveguide.csv,far_field.csv,manifest.json}`,
+`InfParallelPlate_crack1Rohan_500GHz.dataset.json`, `logs/run.log` and `logs/convergence_Ephi{0,1}.txt`.
+A job id is used once: resubmitting with an existing `--job-id` stops with `FileExistsError` before AEDT
+starts, because the job directory exists. Pick a new id (`baseline3`, ...).
+
+Then check the grid sizes and the transmission:
 
     python - <<'PY'
     import pandas as pd
-    d = "/home/rshenoy/BBRSim/outputs/InfParallelPlate_crack1Rohan_500GHz/job_baseline1/InfParallelPlate_crack1Rohan_500GHz_Ephi=0"
+    d = "/home/rshenoy/BBRSim/outputs/InfParallelPlate_crack1Rohan_500GHz/job_baseline2/InfParallelPlate_crack1Rohan_500GHz_Ephi=0"
     w = pd.read_csv(f"{d}/waveguide.csv"); f = pd.read_csv(f"{d}/far_field.csv")
     print(len(w), len(f), w.OutgoingPower.iloc[0] / w.IngoingPower.iloc[0])
     PY
 
 Expected: `5151 19388 <T>`, with T close to the Windows reference 1.0545 (AEDT 2023 R2).
-Record T, the number of passes and final delta E from the convergence file, and the solve time.
+Record T, the number of passes and final delta E from the convergence file, the solve time from
+`logs/run.log`, `sacct -j <id> -o JobID,State,ExitCode,Elapsed,MaxRSS` and
+`du -sh <job> <job>/project/*.aedtresults`.
+
+History: `baseline1` (2026-10-05) solved in 66.6 s and failed at the first calculator read-back,
+`ClcEval` over gRPC (RESULTS.md, step 4). The runner now reads calculator results through a file.
+
+### 4a. Extraction diagnostic on a solved job (no new solve)
+
+When a run fails after its solve, `hpc/diagnose_calculator.py` copies the job's project and results,
+lists the results folder, asks AEDT what it holds, and runs the runner's own extraction on the copy,
+writing the CSV tables beside it. Debug QOS, no solver licence:
+
+    sbatch -A golwala -p expansion -q debug -N 1 -c 4 --mem=16G -t 00:30:00 \
+      -o /home/rshenoy/BBRSim/outputs/diag-%j.out \
+      --wrap 'bash -lc "source /home/rshenoy/BBRSim/bb_env.sh && cd /home/rshenoy/BBRSim/Blackbody-Simulations && python hpc/diagnose_calculator.py --job /home/rshenoy/BBRSim/outputs/InfParallelPlate_crack1Rohan_500GHz/job_baseline1"'
+
+Expected in `/home/rshenoy/BBRSim/outputs/diag-<id>.out`: `FIELDS: present`, one `T=` line per
+polarization, and `EXTRACTION PASS`; the tables are in `<job>/diagnose_<utc>/`.
 
 ## 5. Full reference run (batch) and comparison
 

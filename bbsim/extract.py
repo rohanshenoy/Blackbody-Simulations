@@ -20,7 +20,7 @@ import pandas as pd
 from bbsim.config import ExitFieldConfig
 from bbsim.geometry import FaceInfo, GeometryError
 from bbsim.naming import frequency_label
-from bbsim.readers import FieldFileError, read_exit_field_fld, read_far_field_ffd, wait_for_file
+from bbsim.readers import FieldFileError, read_calculator_scalar, read_exit_field_fld, read_far_field_ffd, wait_for_file
 from bbsim.sampling import FarFieldGrid
 from bbsim.schema import FAR_FIELD_COLUMNS, WAVEGUIDE_COLUMNS, order_columns
 
@@ -257,20 +257,33 @@ def describe_exit_face(hfss: Any, ctx: ExtractionContext) -> ExitFaceGeometry:
 
 
 def evaluate_outgoing_power(hfss: Any, ctx: ExtractionContext, ephi: int) -> dict[tuple[float, float], float]:
+    """The named expression ``outgoing_power`` (real Poynting flux through the exit face) per incident direction.
+
+    Each value is written to a scratch file with ``CalculatorWrite`` and read back. The legacy script read
+    the calculator stack instead (``ClcEval`` then ``GetTopEntryValue``); that read-back is stateful GUI
+    behaviour which fails over the gRPC transport AEDT uses on Linux (HPC step 4, job baseline1: every
+    variation failed, a bare constant included). PyAEDT 1.7.0 evaluates expressions through a file for the
+    same reason, and like it we pass ``Phase`` with the intrinsics.
+    """
     fields = hfss.odesign.GetModule("FieldsReporter")
-    fields.CalcStack("clear")
-    fields.CopyNamedExprToStack("outgoing_power")
+    path = ctx.scratch_dir / f"outgoing_power_{ctx.freq_label}_Ephi{ephi}.fld"
     power: dict[tuple[float, float], float] = {}
     total = len(ctx.phi_values) * len(ctx.theta_values)
     for phi in ctx.phi_values:
         for theta in ctx.theta_values:
-            args = intrinsics(ephi, ctx.freq_label, float(phi), float(theta))
-            fields.ClcEval(ctx.solution, args, "Fields")
-            result = fields.GetTopEntryValue(ctx.solution, args)
-            fields.CalcStack("pop")
+            if path.exists():
+                path.unlink()
+            args = intrinsics(ephi, ctx.freq_label, float(phi), float(theta)) + ["Phase:=", "0deg"]
+            fields.CalcStack("clear")
+            fields.CopyNamedExprToStack("outgoing_power")
+            fields.CalculatorWrite(str(path), ["Solution:=", ctx.solution], args)
+            wait_for_file(path, ctx.timeout_s)
+            value = read_calculator_scalar(path)
+            path.unlink()
             key = (float(phi), float(theta))
-            power[key] = float(result[0])
-            log.info("[power %d/%d] phi=%s theta=%s Ephi=%s -> %.6e W", len(power), total, phi, theta, ephi, power[key])
+            power[key] = value
+            log.info("[power %d/%d] phi=%s theta=%s Ephi=%s -> %.6e W", len(power), total, phi, theta, ephi, value)
+    fields.CalcStack("clear")
     return power
 
 

@@ -67,6 +67,27 @@ def read_exit_field_fld(path: Path) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=EXIT_FIELD_COLUMNS)
 
 
+def read_calculator_scalar(path: Path) -> float:
+    """Read the value a Fields Calculator ``CalculatorWrite`` wrote for a scalar expression.
+
+    The file holds header lines and then the value; PyAEDT 1.7.0 reads its last line the same way.
+    The last token of the last non-empty line is taken, so a ``x y z value`` row is read too.
+    A missing or non-finite value is an error: the power enters the dataset BBRsim loads.
+    """
+    path = Path(path)
+    lines = [line for line in path.read_text().splitlines() if line.strip()]
+    if not lines:
+        raise FieldFileError(f"{path}: no numeric value (empty file)")
+    token = lines[-1].split()[-1]
+    try:
+        value = float(token)
+    except ValueError:
+        raise FieldFileError(f"{path}: no numeric value on the last line: {lines[-1].strip()!r}") from None
+    if not math.isfinite(value):
+        raise FieldFileError(f"{path}: non-finite value {token!r} on the last line")
+    return value
+
+
 def read_far_field_ffd(path: Path, theta_step_deg: float, phi_step_deg: float) -> pd.DataFrame:
     """Read an infinite-sphere .ffd export.
 
