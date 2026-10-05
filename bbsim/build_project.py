@@ -2,7 +2,10 @@
 
 The solid is created in the canonical pose (propagation along +z, entrance at z = 0) so the runner's
 pose rule and BBRsim's frame hold by construction. The input spec is never modified; an existing
-output is overwritten only with --force.
+output is overwritten only with --force, and never while AEDT's lock file <output>.lock exists.
+
+Exit codes: 0 verified; 2 invalid spec, existing output without --force, or a lock file (no AEDT started);
+3 verification differences or a failed AEDT session. Exits 0 and 3 write <output>.build.json.
 """
 from __future__ import annotations
 
@@ -65,6 +68,10 @@ def verify_build(design: Mapping[str, Any], spec: GeometrySpec) -> list[str]:
     for side in ("min", "max"):
         try:
             face = select_face_on_bounding_plane(obj["faces"], expected, FaceSelector("z", side), tol_mm=TOL_MM)
+            # Pose: axis x = y = 0. The runner takes the plane-wave and exit-frame origins from these centres.
+            if max(abs(c) for c in face.center_mm[:2]) > TOL_MM:
+                diffs.append(f"end face z {side}: face {face.id} centre {list(face.center_mm)} mm is off the "
+                             "axis x = y = 0")
             check_face_area(face, spec.solid.end_face_area_mm2)
         except GeometryError as exc:
             diffs.append(f"end face z {side}: {exc}")
@@ -89,39 +96,60 @@ def main(argv: list[str] | None = None) -> int:
     if output.exists() and not args.force:
         print(f"output exists (use --force to overwrite): {output}", file=sys.stderr)
         return 2
+    # AEDT's lock, <project>.aedt.lock, means another AEDT session has the project open or an earlier run died;
+    # only the user can tell which, so it is reported, never removed. A leftover <stem>.aedtresults needs
+    # nothing: the base design has no setups and run_frequency copies only the .aedt file.
+    lock = Path(f"{output}.lock")
+    if lock.exists():
+        print(f"AEDT lock file exists: {lock}\n  Close the AEDT session that has the project open or, if none does, "
+              f"delete the lock left by an earlier run; --force does not remove it.", file=sys.stderr)
+        return 2
     output.parent.mkdir(parents=True, exist_ok=True)
 
     from bbsim.session import aedt_session, aedt_versions  # lazy PyAEDT import
 
     solid = spec.solid
-    with aedt_session(None, design=spec.project.design, version=spec.project.aedt_version) as hfss:
-        versions = aedt_versions(hfss)
-        hfss.modeler.model_units = "mm"
-        created = hfss.modeler.create_cylinder(orientation="Z", origin=[0.0, 0.0, 0.0], radius=solid.radius_mm,
-                                               height=solid.length_mm, name=spec.project.object,
-                                               material=solid.material)
-        if not created:
-            raise BuildError("create_cylinder returned False")
-        built = inventory_design(hfss)
-        build_diffs = verify_build(built, spec)
-        hfss.save_project(file_name=str(output), overwrite=True)
+    versions: dict[str, str] = {}
+    built = reopened = error = None
+    build_diffs: list[str] = []
+    stage = "build"
+    try:
+        with aedt_session(None, design=spec.project.design, version=spec.project.aedt_version) as hfss:
+            versions = aedt_versions(hfss)
+            hfss.modeler.model_units = "mm"
+            created = hfss.modeler.create_cylinder(orientation="Z", origin=[0.0, 0.0, 0.0], radius=solid.radius_mm,
+                                                   height=solid.length_mm, name=spec.project.object,
+                                                   material=solid.material)
+            if not created:
+                raise BuildError("create_cylinder returned False")
+            built = inventory_design(hfss)
+            build_diffs = verify_build(built, spec)
+            hfss.save_project(file_name=str(output), overwrite=True)
 
-    with aedt_session(output, design=None, version=spec.project.aedt_version) as hfss:
-        reopened = inventory_project(hfss)
+        stage = "reopen"
+        with aedt_session(output, design=None, version=spec.project.aedt_version) as hfss:
+            reopened = inventory_project(hfss)
+    except Exception as exc:  # noqa: BLE001 - recorded below and reported as exit 3; the session is already released
+        log.exception("%s session failed", stage)
+        error = f"{stage} session failed: {type(exc).__name__}: {exc}"
 
     diffs = [f"after build: {d}" for d in build_diffs]
-    designs = sorted(reopened["designs"])
-    if designs != [spec.project.design]:
-        diffs.append(f"reopened project designs {designs} != [{spec.project.design!r}]")
-    if spec.project.design in reopened["designs"]:
-        diffs += [f"after reopen: {d}" for d in verify_build(reopened["designs"][spec.project.design], spec)]
-    write_json(output.with_suffix(".inventory.json"), reopened)
+    if error:
+        diffs.append(error)
+    else:
+        designs = sorted(reopened["designs"])
+        if designs != [spec.project.design]:
+            diffs.append(f"reopened project designs {designs} != [{spec.project.design!r}]")
+        if spec.project.design in reopened["designs"]:
+            diffs += [f"after reopen: {d}" for d in verify_build(reopened["designs"][spec.project.design], spec)]
+        write_json(output.with_suffix(".inventory.json"), reopened)
+    # Written on failure too, so a record of an earlier build never sits beside a project it does not describe.
     write_json(output.with_suffix(".build.json"), {
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "spec_file": str(args.spec.resolve()), "spec": dataclasses.asdict(spec), "versions": versions,
         "built_inventory": built, "reopened_inventory": reopened,
-        "output_project": str(output), "output_sha256": sha256_file(output),
-        "verification_differences": diffs,
+        "output_project": str(output), "output_sha256": sha256_file(output) if output.is_file() else None,
+        "error": error, "verification_differences": diffs,
     })
     if diffs:
         print("\nBUILD VERIFICATION FAILED:\n  " + "\n  ".join(diffs))
