@@ -1,5 +1,5 @@
 # Reproduces InfParallelPlate_crack2_500GHz_Ephi={0,1} (Windows baseline, AEDT 2023 R2)
-# on Linux with AEDT 2025 R2. Values taken from design crack1Rohan_500GHz in InfParallelPlate.aedt.
+# on Linux with AEDT 2025 R2. Values taken from design crack2_500GHz in InfParallelPlate.aedt.
 
 [project]
 path = "/home/rshenoy/BBRSim/projects/ParallelPlateGaps.aedt"

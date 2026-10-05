@@ -282,20 +282,20 @@ older `libuv`) and can shadow Geant4's libraries. Appending to an empty
 `LD_LIBRARY_PATH` also leaves an empty entry, which the loader reads as the
 current directory. `bb_env.sh` (section 6) removes both.
 
-**Code transfer.** The checkout is `/home/rshenoy/BBRSim/BBRSimulation`, cloned
-from a git bundle made on the Mac:
+**Code transfer.** The checkout is `/home/rshenoy/BBRSim/BBRSimulation`. It was
+first cloned from a git bundle; since 2026-10-04 it tracks the public GitHub
+repository and is updated with `git pull` (Rohan's decision; no bundle):
 
 ```bash
-# Mac
-cd /Users/rohanshenoy/BBRsim/BBRSimulation
-git bundle create ~/Desktop/bbrsim-main.bundle main bbrsim-V00-01-00
-scp ~/Desktop/bbrsim-main.bundle rshenoy@login.hpc.caltech.edu:/home/rshenoy/BBRSim/
-
-# HPC, first time
-cd /home/rshenoy/BBRSim && git clone -b main bbrsim-main.bundle BBRSimulation
-# HPC, later: copy a new bundle over the old one, then
-cd /home/rshenoy/BBRSim/BBRSimulation && git pull --ff-only
+# HPC
+cd /home/rshenoy/BBRSim/BBRSimulation
+git checkout -- tests        # drop the local copies of the two test fixes below
+git remote set-url origin https://github.com/rohanshenoy/BBRSimulation.git   # once
+git fetch origin --tags && git pull --ff-only origin main
+git describe                 # expect bbrsim-V00-01-00-25-gad57e21
 ```
+
+A fresh machine clones `https://github.com/rohanshenoy/BBRSimulation.git` instead.
 
 `bb_env.sh` (section 6) loads the compiler and Geant4 modules, and sources the
 installed BBRsim's `bbrsim_env.sh` once `install/` exists.
