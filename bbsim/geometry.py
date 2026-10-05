@@ -42,8 +42,12 @@ def select_face_on_bounding_plane(faces: Sequence[Mapping[str, Any]], bounding_b
                                   selector: FaceSelector, tol_mm: float = 1e-6) -> FaceInfo:
     """Pick the unique planar face whose centre lies on the bounding-box plane ``axis = min|max``.
 
-    Non-planar faces are never candidates: PyAEDT reports a point on a vertex-free curved face as its
-    centre (for a cylinder's side, the centre of one end circle), which can lie on an end plane.
+    Non-planar faces are never candidates. AEDT's GetFaceCenter fails on a curved face, and PyAEDT 1.7.0 then
+    reports the centroid of the face's vertices if it has more than one (a face without AEDT vertices gets one
+    per edge, at the edge's start), else the centroid of four samples on its first edge. The side of a cylinder
+    from z = 0 to z = L, bounded by its end circles, thus reports a mid-length point such as (R, 0, L/2), on
+    the plane x = R but on neither end plane. A curved face with at most one vertex whose first edge is an end
+    circle would report that circle's centre, on the end plane.
     The outward normal is defined by construction (-axis for ``min``, +axis for ``max``); a normal
     reported by PyAEDT must agree with it.
     """
