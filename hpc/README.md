@@ -132,6 +132,11 @@ reading: stop and tell the BBRsim side, whose azimuth formula depends on it. If 
 `ScatteredFields`, paste the error; Rohan then reads the incident wave direction once in the GUI
 (Open OnDemand) and records it here.
 
+Also expected: `"slope_z_negative_as_expected": true`. It is a self-check outside the verdict and the
+exit code: the ratio cannot tell k from -k, and under HFSS's e^{+jwt} a wave entering the gap needs a
+negative z slope. `false` means the wave runs out of the gap or the phasors use e^{-jwt}: stop and
+tell the BBRsim side, as for `ALTERNATIVE`.
+
 ## 6. Build the round-gap project (batch, debug QOS)
 
     sbatch -A golwala -p expansion -q debug -N 1 -c 4 --mem=16G -t 00:30:00 \
@@ -158,14 +163,17 @@ When it finishes:
     s = json.load(open(f"{job}/RoundGap_r50um_2000GHz.dataset.json"))
     print(len(w), len(f), w.OutgoingPower.iloc[0] / w.IngoingPower.iloc[0])
     print(s["exit_field"]["points_per_key_retained"], s["exit_field"]["cross_section"], s["modes"]["mode"], s["modes"]["propagating_count"])
+    print(sum("all-nan rows" in line for line in open(f"{job}/logs/run.log")))
     PY
 
 Expected: `N 1369 <T>` with N from 7825 to 7845 (twenty lattice points lie exactly on the rim, four on
 the axes and sixteen off them; 7845 means HFSS kept them all, 7825 none; record the exact N), T strictly
 between 0 and 1, then the same N,
-`{'shape': 'disc', 'radius_m': 5e-05}` (to rounding), `TE11 1`. Record T as the first round-gap
-reference value (no Windows reference exists), the passes and final delta E from
-`logs/convergence_Ephi0.txt`, and `sacct -j <id> --format=MaxRSS,Elapsed`.
+`{'shape': 'disc', 'radius_m': 5e-05}` (to rounding), `TE11 1`, then `0`. A non-zero last line means
+`logs/run.log` holds the reader's warning that HFSS wrote outside lattice points as rows other than
+nine tokens; those points are still skipped and the run stands, but copy the warning into RESULTS.md.
+Record T as the first round-gap reference value (no Windows reference exists), the passes and final
+delta E from `logs/convergence_Ephi0.txt`, and `sacct -j <id> --format=MaxRSS,Elapsed`.
 
 ## 8. Round gap, full sweep
 
