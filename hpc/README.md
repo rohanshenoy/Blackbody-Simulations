@@ -117,3 +117,71 @@ explicitly rather than loosening it silently. Field-distribution lines are warni
 
 Memory (32G) and time (8h) in the batch script are first guesses; set them from the
 baseline's `sacct -j <id> --format=MaxRSS,Elapsed` before larger runs.
+
+## 5b. Incident-direction check (batch, no new solve)
+
+After step 5, with `<job>` the step-5 job directory named in its `slurm-<id>.out`:
+
+    sbatch -A golwala -p expansion -q debug -N 1 -c 4 --mem=16G -t 00:30:00 \
+        -o /home/rshenoy/BBRSim/outputs/slurm-%j.out \
+        --wrap 'source /home/rshenoy/BBRSim/bb_env.sh && cd /home/rshenoy/BBRSim/Blackbody-Simulations && python hpc/check_incident_direction.py --project <job>/project/ParallelPlateGaps.aedt --design parallel_plate_gap_50um_500GHz --out <job>/incident_direction.json'
+
+Expected: exit 0, `"verdict": "PASS: arrival direction, k = -r_hat(theta, phi)"`, `ratio_ky_over_kz`
+near -1 and `magnitude_over_k0` near 1. `ALTERNATIVE` (ratio near +1) means HFSS uses the other
+reading: stop and tell the BBRsim side, whose azimuth formula depends on it. If `EditSources` rejects
+`ScatteredFields`, paste the error; Rohan then reads the incident wave direction once in the GUI
+(Open OnDemand) and records it here.
+
+## 6. Build the round-gap project (batch, debug QOS)
+
+    sbatch -A golwala -p expansion -q debug -N 1 -c 4 --mem=16G -t 00:30:00 \
+        -o /home/rshenoy/BBRSim/outputs/slurm-%j.out \
+        --wrap 'source /home/rshenoy/BBRSim/bb_env.sh && cd /home/rshenoy/BBRSim/Blackbody-Simulations && python build_hfss_project.py --spec configs/geometries/round_gap_r50um.toml'
+
+Expected: `Build verified: /resnick/home/rshenoy/BBRSim/projects/RoundGap.aedt` (or the same path under
+`/home`), exit 0, `RoundGap.build.json` with `"verification_differences": []`, and
+`RoundGap.inventory.json` listing one design `round_gap_r50um` with one object `gap` [vacuum],
+bounding box [-0.05, -0.05, 0, 0.05, 0.05, 0.4] and 3 faces. Record the PyAEDT warnings, if any, about
+non-planar faces: they come from the curved side and are expected.
+
+## 7. Round gap, single angle at 2000 GHz
+
+    sbatch -t 02:00:00 hpc/run_frequency.sbatch configs/round_gap_r50um_2000GHz_single_angle.toml --job-id roundgap1
+
+When it finishes:
+
+    python - <<'PY'
+    import json, pandas as pd
+    job = "/home/rshenoy/BBRSim/outputs/RoundGap_r50um_2000GHz/job_roundgap1"
+    d = f"{job}/RoundGap_r50um_2000GHz_Ephi=0"
+    w = pd.read_csv(f"{d}/waveguide.csv"); f = pd.read_csv(f"{d}/far_field.csv")
+    s = json.load(open(f"{job}/RoundGap_r50um_2000GHz.dataset.json"))
+    print(len(w), len(f), w.OutgoingPower.iloc[0] / w.IngoingPower.iloc[0])
+    print(s["exit_field"]["points_per_key_retained"], s["exit_field"]["cross_section"], s["modes"]["mode"], s["modes"]["propagating_count"])
+    PY
+
+Expected: `7845 1369 <T>` or `7825 1369 <T>` (record which: it tells whether HFSS evaluates the four
+rim points on the axes), T strictly between 0 and 1, then `7845` or `7825`,
+`{'shape': 'disc', 'radius_m': 5e-05}` (to rounding), `TE11 1`. Record T as the first round-gap
+reference value (no Windows reference exists), the passes and final delta E from
+`logs/convergence_Ephi0.txt`, and `sacct -j <id> --format=MaxRSS,Elapsed`.
+
+## 8. Round gap, full sweep
+
+    sbatch hpc/run_frequency.sbatch configs/round_gap_r50um_2000GHz_reference.toml
+
+When it finishes, with `<job>` named in its `slurm-<id>.out`:
+
+    python - <<'PY'
+    import pandas as pd
+    job = "<job>"
+    for e in (0, 1):
+        w = pd.read_csv(f"{job}/RoundGap_r50um_2000GHz_Ephi={e}/waveguide.csv")
+        r = w[(w.IWavePhi == 0) & (w.IWaveTheta == 180)].iloc[0]
+        print(e, r.OutgoingPower / r.IngoingPower, len(w))
+    PY
+
+Expected: two lines with 15 x (7845 or 7825) rows each, and the two T values at normal incidence equal
+to within the convergence tolerance (a few percent at MaxDeltaE 0.02): a round gap cannot prefer a
+polarization at normal incidence. A large difference means a frame or polarization error; stop and
+report. Record memory and wall time; they size the job array (next-steps item 5).

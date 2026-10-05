@@ -3,13 +3,14 @@
 Fill each section with the exact command, date, Slurm job ID, and pasted output.
 A section without pasted output is not done. Steps are defined in `hpc/README.md`.
 
-## Status (2026-10-04)
+## Status (2026-10-05)
 
 - Steps 0 to 3: PASS (2026-09-28). The step 1 smoke test also passes under the
   merged `bb_env.sh` that loads Geant4 (Slurm job 3693291, 2026-09-30).
 - Next: step 4. First update the HPC checkout to the fork tip and capture
   `requirements-hpc.txt` with `python -m pip freeze --exclude-editable`.
-- After that: step 5.
+- After that: step 5, then the round-gap steps 5b, 6, 7 and 8 (code for them is on
+  the branch and tested on the Mac against a fake AEDT only).
 - BBRsim (Geant4) on HPC is tracked in `ANSYS_HPC_INSTALL_README.md` section 8.
 
 ## 0. Get the branch onto HPC
@@ -91,5 +92,13 @@ ParallelPlateGaps.inventory.source.json, ParallelPlateGaps.inventory.json, Paral
 ## 4. Single-angle baseline
 
 ## 5. Full reference run and comparison
+
+## 5b. Incident-direction check
+
+## 6. Round-gap project
+
+## 7. Round gap, single angle at 2000 GHz
+
+## 8. Round gap, full sweep
 
 ## Discrepancies and decisions
