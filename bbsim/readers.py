@@ -5,14 +5,18 @@ read_hfss_far_field). The readers never delete files; callers own scratch paths.
 """
 from __future__ import annotations
 
+import logging
 import math
 import time
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from bbsim.schema import EXIT_FIELD_COLUMNS
+
+log = logging.getLogger(__name__)
 
 
 class FieldFileError(ValueError):
@@ -26,17 +30,23 @@ class ExportTimeoutError(RuntimeError):
 def read_exit_field_fld(path: Path) -> pd.DataFrame:
     """Read an ExportOnGrid/CalculatorWrite .fld: two header lines, then 9 floats per line.
 
-    A row whose six field values are all ``nan`` is a grid point outside the solved region and is
-    skipped. Any other non-finite value is an error: BBRsim rejects non-finite fields at load (BBR013).
+    A row whose tokens after the three coordinates are all ``nan`` is a grid point outside the solved
+    region and is skipped, whatever their number: the form AEDT 2025 R2 writes for such a point is
+    unverified, and the legacy reader skipped any row ending in ``nan``. Skipped rows without the full
+    9 tokens are reported in one warning per file. Any other non-finite value is an error: BBRsim
+    rejects non-finite fields at load (BBR013).
     """
     lines = Path(path).read_text().splitlines()
     rows: list[list[float]] = []
+    odd_outside: list[tuple[int, int]] = []  # (line number, token count) of all-nan rows without 9 tokens
     for lineno, line in enumerate(lines[2:], start=3):
         parts = line.split()
         if not parts:
             continue
         field_tokens = parts[3:]
         if field_tokens and all(token.lower() == "nan" for token in field_tokens):
+            if len(parts) != len(EXIT_FIELD_COLUMNS):
+                odd_outside.append((lineno, len(parts)))
             continue
         if len(parts) != len(EXIT_FIELD_COLUMNS):
             raise FieldFileError(f"{path}: line {lineno} has {len(parts)} fields, expected {len(EXIT_FIELD_COLUMNS)}")
@@ -47,6 +57,11 @@ def read_exit_field_fld(path: Path) -> pd.DataFrame:
         if not all(math.isfinite(v) for v in values):
             raise FieldFileError(f"{path}: line {lineno} has a non-finite value outside an all-nan row: {line.strip()!r}")
         rows.append(values)
+    if odd_outside:
+        counts = dict(sorted(Counter(n for _, n in odd_outside).items()))
+        log.warning("%s: %d all-nan rows with a token count other than %d (counts %s, first at line %d) skipped as "
+                    "outside points; HFSS writes outside points in another form, or the export was cut short",
+                    path, len(odd_outside), len(EXIT_FIELD_COLUMNS), counts, odd_outside[0][0])
     if not rows:
         raise FieldFileError(f"{path}: no numeric data rows")
     return pd.DataFrame(rows, columns=EXIT_FIELD_COLUMNS)
