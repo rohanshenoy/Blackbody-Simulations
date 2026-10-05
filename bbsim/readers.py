@@ -5,6 +5,7 @@ read_hfss_far_field). The readers never delete files; callers own scratch paths.
 """
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 
@@ -25,7 +26,8 @@ class ExportTimeoutError(RuntimeError):
 def read_exit_field_fld(path: Path) -> pd.DataFrame:
     """Read an ExportOnGrid/CalculatorWrite .fld: two header lines, then 9 floats per line.
 
-    Lines whose last token is ``nan`` (points outside the solved region) are skipped.
+    A row whose six field values are all ``nan`` is a grid point outside the solved region and is
+    skipped. Any other non-finite value is an error: BBRsim rejects non-finite fields at load (BBR013).
     """
     lines = Path(path).read_text().splitlines()
     rows: list[list[float]] = []
@@ -33,11 +35,18 @@ def read_exit_field_fld(path: Path) -> pd.DataFrame:
         parts = line.split()
         if not parts:
             continue
-        if parts[-1].lower() == "nan":
+        field_tokens = parts[3:]
+        if field_tokens and all(token.lower() == "nan" for token in field_tokens):
             continue
         if len(parts) != len(EXIT_FIELD_COLUMNS):
             raise FieldFileError(f"{path}: line {lineno} has {len(parts)} fields, expected {len(EXIT_FIELD_COLUMNS)}")
-        rows.append([float(p) for p in parts])
+        try:
+            values = [float(token) for token in parts]
+        except ValueError:
+            raise FieldFileError(f"{path}: line {lineno} has a non-numeric field: {line.strip()!r}") from None
+        if not all(math.isfinite(v) for v in values):
+            raise FieldFileError(f"{path}: line {lineno} has a non-finite value outside an all-nan row: {line.strip()!r}")
+        rows.append(values)
     if not rows:
         raise FieldFileError(f"{path}: no numeric data rows")
     return pd.DataFrame(rows, columns=EXIT_FIELD_COLUMNS)
