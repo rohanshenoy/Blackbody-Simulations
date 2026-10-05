@@ -189,6 +189,13 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
                 )
         retained = int(next(iter(first_counts.values())))
         lattice_points = lattice.lattice_points if lattice is not None else None
+        if lattice_points is not None and retained > lattice_points:
+            # HFSS can omit lattice points outside the solid but never add any: the lattice model is wrong,
+            # and so would be the grid recorded in the manifest and the sidecar.
+            raise RuntimeError(
+                f"exit field has {retained} points per incident angle, more than the {lattice_points} points of "
+                f"the ExportOnGrid lattice {lattice.counts}; the lattice model disagrees with the HFSS export"
+            )
         outside_points = "omitted" if lattice_points is not None and retained < lattice_points else "none"
         hfss.save_project()
 
