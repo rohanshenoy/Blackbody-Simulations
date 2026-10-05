@@ -261,7 +261,7 @@ have not been made as part of this environment setup.
 
 ## 8. Geant4 and BBRsim (2026-09-30)
 
-BBRsim, the Geant4 package (Mac checkout `/Users/rohanshenoy/geant4/BBRSimulation`),
+BBRsim, the Geant4 package (Mac checkout `/Users/rohanshenoy/BBRsim/BBRSimulation`),
 is built against the cluster's own Geant4 module. Nothing Geant4-related is
 installed by us, and no administrator rights are needed.
 
@@ -287,7 +287,7 @@ from a git bundle made on the Mac:
 
 ```bash
 # Mac
-cd /Users/rohanshenoy/geant4/BBRSimulation
+cd /Users/rohanshenoy/BBRsim/BBRSimulation
 git bundle create ~/Desktop/bbrsim-main.bundle main bbrsim-V00-01-00
 scp ~/Desktop/bbrsim-main.bundle rshenoy@login.hpc.caltech.edu:/home/rshenoy/BBRSim/
 

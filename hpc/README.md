@@ -92,7 +92,7 @@ Record T, the number of passes and final delta E from the convergence file, and 
 
 On the Mac, copy the reference datasets to HPC:
 
-    scp -r /Users/rohanshenoy/geant4/BBRSimulation/data/waveguides/InfParallelPlate_crack1Rohan_500GHz_Ephi=* \
+    scp -r /Users/rohanshenoy/BBRsim/BBRSimulation/data/waveguides/InfParallelPlate_crack1Rohan_500GHz_Ephi=* \
         rshenoy@login.hpc.caltech.edu:/home/rshenoy/BBRSim/reference/
 
 (Create `/home/rshenoy/BBRSim/reference` on HPC first; use your usual login host if it differs.)
