@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import shutil
@@ -11,9 +12,12 @@ from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 
+import numpy as np
+
 from bbsim.config import RunConfig, config_to_dict, load_config
+from bbsim.dataset_record import build_dataset_record
 from bbsim.manifest import build_manifest, sha256_file, write_json
-from bbsim.naming import frequency_design_name, frequency_label, last_adaptive_solution
+from bbsim.naming import dataset_record_name, frequency_design_name, frequency_label, last_adaptive_solution
 from bbsim.paths import JobDirs, create_job_dirs, default_job_id
 from bbsim.sampling import incident_angle_values, incoming_power_w
 from bbsim.schema import KEY_COLUMNS
@@ -55,13 +59,19 @@ def allocation_warning(cores: int, env: Mapping[str, str] | None = None) -> str 
     return None
 
 
+def _axis_summary(values, step: float) -> dict[str, float | int]:
+    """The emitted far-field grid along one angle: first and last value, point count, step (degrees)."""
+    return {"min": float(values[0]), "max": float(values[-1]), "count": int(len(values)), "step": float(step)}
+
+
+
 def _setup_logging(logfile: Path, level: str) -> None:
     logging.basicConfig(level=level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s",
                         handlers=[logging.FileHandler(logfile), logging.StreamHandler()])
 
 
 def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
-    from bbsim.extract import ExtractionContext, describe_exit_face, extract_far_field, extract_waveguide
+    from bbsim.extract import ExtractionContext, describe_exit_face, exit_grid, extract_far_field, extract_waveguide
     from bbsim.geometry import create_exit_coordinate_system, create_exit_face_list, select_faces
     from bbsim.hfss_setup import (
         EXIT_CS,
@@ -96,6 +106,7 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
     theta_values = incident_angle_values(exc.theta_lower_deg, exc.theta_upper_deg, exc.theta_step_deg)
     outputs: dict[str, str] = {}
     convergence: dict[str, str] = {}
+    files: dict[str, dict] = {}
 
     with aedt_session(job_project, cfg.project.design, cfg.project.aedt_version) as hfss:
         versions = aedt_versions(hfss)
@@ -147,14 +158,18 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
             incoming_power_w=incoming_power_w(exc.ei_v_per_m, entrance.area_mm2),
         )
         face_geometry = describe_exit_face(hfss, ctx)
+        lattice = exit_grid(face_geometry, cfg.exit_field) if cfg.exit_field.manual else None
         exit_point_counts: dict[int, dict] = {}
         for ephi in cfg.output.polarizations:
             waveguide = extract_waveguide(hfss, ctx, ephi, face_geometry)
             far_field = extract_far_field(hfss, ctx, ephi)
             out_dir = dirs.dataset_dir(cfg.project.dataset_id, freq, ephi)
             out_dir.mkdir(parents=True, exist_ok=False)
-            waveguide.to_csv(out_dir / "waveguide.csv", index=False)
-            far_field.to_csv(out_dir / "far_field.csv", index=False)
+            for name, table in (("waveguide.csv", waveguide), ("far_field.csv", far_field)):
+                path = out_dir / name
+                table.to_csv(path, index=False)
+                files[f"{out_dir.name}/{name}"] = {"sha256": sha256_file(path), "bytes": path.stat().st_size,
+                                                   "rows": len(table)}
             outputs[str(ephi)] = str(out_dir)
             exit_point_counts[ephi] = waveguide.groupby(KEY_COLUMNS).size().to_dict()
             convergence[str(ephi)] = export_convergence_text(hfss, setup, f"Ephi='{ephi}'", dirs.logs / f"convergence_Ephi{ephi}.txt")
@@ -167,8 +182,12 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
                     f"exit-point counts per incident angle differ between polarization Ephi={first_ephi} and "
                     f"Ephi={ephi}; Geant4 pairs them by row index. Ephi={first_ephi}: {first_counts}; Ephi={ephi}: {counts}"
                 )
+        retained = int(next(iter(first_counts.values())))
+        lattice_points = lattice.lattice_points if lattice is not None else None
+        outside_points = "omitted" if lattice_points is not None and retained < lattice_points else "none"
         hfss.save_project()
 
+    exit_cs_z = [float(v) + 0.0 for v in np.cross(cfg.geometry.exit_cs_x, cfg.geometry.exit_cs_y)]
     manifest = build_manifest(
         config=config_to_dict(cfg),
         job={"id": job_id, "root": str(dirs.root), "wall_time_s": time.perf_counter() - t_start, "solve_time_s": solve_s},
@@ -177,7 +196,12 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
         geometry={"object": cfg.geometry.object, "units": "mm", "material": solid["material"],
                   "bounding_box_mm": solid["bounding_box_mm"],
                   "entrance_face": asdict(entrance), "exit_face": asdict(exit_face),
-                  "exit_cs": {"name": EXIT_CS, "x": list(cfg.geometry.exit_cs_x), "y": list(cfg.geometry.exit_cs_y)}},
+                  "exit_cs": {"name": EXIT_CS, "x": list(cfg.geometry.exit_cs_x), "y": list(cfg.geometry.exit_cs_y),
+                              "z": exit_cs_z},
+                  "pose": cfg.geometry.pose, "symmetry": list(cfg.geometry.symmetry),
+                  "cross_section": face_geometry.cross_section, "bounds_method": face_geometry.bounds_method,
+                  "exit_face_vertex_count": face_geometry.vertex_count,
+                  "edge_sampling_sagitta_mm": face_geometry.sagitta_mm},
         excitation={"plane_wave": plane_wave, "ei_v_per_m": exc.ei_v_per_m, "incident_phi_deg": phi_values.tolist(),
                     "incident_theta_deg": theta_values.tolist(), "polarizations": list(cfg.output.polarizations),
                     "polarization_convention": "Ephi=0: E_theta=1; Ephi=1: E_phi=1", "incoming_power_w": ctx.incoming_power_w},
@@ -187,9 +211,13 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
                 "boundaries": {"rbin": "Radiation on entrance", "rbout": "Radiation on exit", "other faces": "default PEC"},
                 "convergence": convergence},
         far_field={"sphere": sphere, "theta_step_deg": grid.theta_step_deg, "phi_step_deg": grid.phi_step_deg,
-                   "points_per_angle": grid.points_per_angle, "coordinate_system": EXIT_CS, "radiation_surface": EXIT_FACE_LIST},
+                   "points_per_angle": grid.points_per_angle, "coordinate_system": EXIT_CS, "radiation_surface": EXIT_FACE_LIST,
+                   "theta_deg": _axis_summary(grid.theta_values, grid.theta_step_deg),
+                   "phi_deg": _axis_summary(grid.phi_values, grid.phi_step_deg)},
         exit_field={"manual": cfg.exit_field.manual, "resolution_mm": list(cfg.exit_field.resolution_mm),
-                    "points_in_si": True, "coordinate_system": EXIT_CS},
+                    "points_in_si": True, "field_in_ref_cs": False, "coordinate_system": EXIT_CS,
+                    "grid": lattice.axis_record() if lattice is not None else None, "lattice_points": lattice_points,
+                    "retained_points_per_key": retained, "outside_points": outside_points},
         outputs=outputs,
         versions=versions,
     )
@@ -197,6 +225,9 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
     write_json(manifest_path, manifest)
     for out_dir in outputs.values():
         shutil.copy2(manifest_path, Path(out_dir) / "manifest.json")
+    # Built from the manifest exactly as written, so the sidecar cannot disagree with it.
+    record = build_dataset_record(json.loads(manifest_path.read_text()), sha256_file(manifest_path), files)
+    write_json(dirs.root / dataset_record_name(cfg.project.dataset_id, freq), record)
     return manifest_path
 
 
