@@ -140,6 +140,20 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
         sphere, grid = insert_far_field_sphere(hfss, cfg.far_field, freq)
         plane_wave = create_plane_wave(hfss, entrance, exc, freq)
         set_total_fields(hfss)
+
+        # The export lattice needs only geometry: describe the exit face before the licensed solve, so a
+        # geometry problem costs seconds rather than a solve.
+        ctx = ExtractionContext(
+            frequency_ghz=freq, solution=last_adaptive_solution(freq), sphere_name=sphere,
+            phi_values=phi_values, theta_values=theta_values, grid=grid, exit_field=cfg.exit_field,
+            exit_face=exit_face, exit_cs_name=EXIT_CS, exit_cs_x=cfg.geometry.exit_cs_x, exit_cs_y=cfg.geometry.exit_cs_y,
+            scratch_dir=dirs.scratch, timeout_s=cfg.output.export_timeout_s,
+            incoming_power_w=incoming_power_w(exc.ei_v_per_m, entrance.area_mm2),
+        )
+        face_geometry = describe_exit_face(hfss, ctx)
+        lattice = exit_grid(face_geometry, cfg.exit_field) if cfg.exit_field.manual else None
+        if lattice is not None:
+            log.info("exit lattice: %d points per incident angle (%s)", lattice.lattice_points, face_geometry.bounds_method)
         hfss.save_project()
 
         log.info("solving %s with %d cores (%d incident angles x 2 polarizations)", setup, cfg.solver.cores,
@@ -150,15 +164,6 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
         solve_s = time.perf_counter() - t_solve
         log.info("solve finished in %.1f s", solve_s)
 
-        ctx = ExtractionContext(
-            frequency_ghz=freq, solution=last_adaptive_solution(freq), sphere_name=sphere,
-            phi_values=phi_values, theta_values=theta_values, grid=grid, exit_field=cfg.exit_field,
-            exit_face=exit_face, exit_cs_name=EXIT_CS, exit_cs_x=cfg.geometry.exit_cs_x, exit_cs_y=cfg.geometry.exit_cs_y,
-            scratch_dir=dirs.scratch, timeout_s=cfg.output.export_timeout_s,
-            incoming_power_w=incoming_power_w(exc.ei_v_per_m, entrance.area_mm2),
-        )
-        face_geometry = describe_exit_face(hfss, ctx)
-        lattice = exit_grid(face_geometry, cfg.exit_field) if cfg.exit_field.manual else None
         exit_point_counts: dict[int, dict] = {}
         for ephi in cfg.output.polarizations:
             waveguide = extract_waveguide(hfss, ctx, ephi, face_geometry)
