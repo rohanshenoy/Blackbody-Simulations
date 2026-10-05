@@ -181,11 +181,31 @@ def exit_grid(face: ExitFaceGeometry, exit_field: ExitFieldConfig) -> ExitGrid:
     return ExitGrid(tuple(float(v) for v in lo), tuple(float(v) for v in hi), resolution)
 
 
+def _outside_outline_hull(y: np.ndarray, z: np.ndarray, vertices_m: Sequence[Sequence[float]],
+                          tol_m: float) -> np.ndarray:
+    """True where a point lies farther than ``tol_m`` outside the convex hull of a polygon outline.
+
+    The hull equals the face for convex outlines and contains it otherwise, so a point on the face is
+    never rejected; the outline's point order does not matter.
+    """
+    from scipy.spatial import ConvexHull
+
+    try:
+        hull = ConvexHull(np.asarray(vertices_m, dtype=float))
+    except Exception as exc:  # noqa: BLE001 - degenerate outline (fewer than 3 points, or collinear)
+        raise FieldFileError(f"cannot test containment in a degenerate polygon outline: {exc}") from None
+    # Rows of hull.equations are [unit outward normal, offset]; inside means normal . p + offset <= 0.
+    distance = np.column_stack((y, z)) @ hull.equations[:, :2].T + hull.equations[:, 2]
+    return np.any(distance > tol_m, axis=1)
+
+
 def check_points_within(df: pd.DataFrame, cross_section: dict, where: str,
-                        rel_tol: float = CONTAIN_REL_TOL, plane_tol_m: float = PLANE_TOL_M) -> None:
+                        rel_tol: float = CONTAIN_REL_TOL, plane_tol_m: float = PLANE_TOL_M,
+                        polygon_tol_m: float = 0.0) -> None:
     """Every retained exit point (metres, exit frame) must lie on x_e = 0 and inside the declared cross-section.
 
     Catches an HFSS that writes values (for example zeros) instead of nan for lattice points outside the solid.
+    ``polygon_tol_m`` widens a polygon outline built from edge samples, whose chords cut inside the true edge.
     """
     x, y, z = (df[c].to_numpy(dtype=float) for c in ("X", "Y", "Z"))
     if len(x) and float(np.max(np.abs(x))) > plane_tol_m:
@@ -196,8 +216,12 @@ def check_points_within(df: pd.DataFrame, cross_section: dict, where: str,
     elif shape == "rectangle":
         outside = ((np.abs(y) > cross_section["y_e_half_m"] * (1 + rel_tol))
                    | (np.abs(z) > cross_section["z_e_half_m"] * (1 + rel_tol)))
+    elif shape == "polygon":
+        outline = np.asarray(cross_section["vertices_m"], dtype=float)
+        size = float(np.max(np.ptp(outline, axis=0))) if len(outline) else 0.0
+        outside = _outside_outline_hull(y, z, outline, rel_tol * size + polygon_tol_m)
     else:
-        return  # polygon: no containment test yet; BBRsim does not accept polygons yet either
+        raise FieldFileError(f"{where}: unknown cross-section shape {shape!r}")
     if np.any(outside):
         raise FieldFileError(f"{where}: {int(np.sum(outside))} exit points lie outside the declared {shape} "
                              "cross-section; HFSS must write nan, not values, outside the solid")
@@ -285,7 +309,8 @@ def extract_waveguide(hfss: Any, ctx: ExtractionContext, ephi: int, face: ExitFa
             wait_for_file(path, ctx.timeout_s)
             df = read_exit_field_fld(path)
             path.unlink()
-            check_points_within(df, face.cross_section, f"exit field for phi={phi} theta={theta} Ephi={ephi}")
+            check_points_within(df, face.cross_section, f"exit field for phi={phi} theta={theta} Ephi={ephi}",
+                                polygon_tol_m=face.sagitta_mm * 1e-3)
             if frames and len(df) != len(frames[0]):
                 # Geant4 pairs exit points across polarizations by row index; every angle must have the same grid.
                 raise FieldFileError(
