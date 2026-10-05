@@ -18,11 +18,16 @@ def object_record(hfss: Any, object_name: str) -> dict[str, Any]:
             normal = [float(v) for v in face.normal] if face.normal else None
         except Exception:  # noqa: BLE001 - normal is informational only
             normal = None
+        try:
+            planar = bool(face.is_planar)
+        except Exception:  # noqa: BLE001 - None means PyAEDT could not tell
+            planar = None
         faces.append({
             "id": int(face.id),
             "center_mm": [float(c) for c in face.center],
             "area_mm2": float(hfss.modeler.get_face_area(face.id)),
             "normal": normal,
+            "is_planar": planar,
         })
     return {
         "name": object_name,
