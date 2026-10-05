@@ -141,8 +141,8 @@ reading: stop and tell the BBRsim side, whose azimuth formula depends on it. If 
 Expected: `Build verified: /resnick/home/rshenoy/BBRSim/projects/RoundGap.aedt` (or the same path under
 `/home`), exit 0, `RoundGap.build.json` with `"verification_differences": []`, and
 `RoundGap.inventory.json` listing one design `round_gap_r50um` with one object `gap` [vacuum],
-bounding box [-0.05, -0.05, 0, 0.05, 0.05, 0.4] and 3 faces. Record the PyAEDT warnings, if any, about
-non-planar faces: they come from the curved side and are expected.
+bounding box [-0.05, -0.05, 0, 0.05, 0.05, 0.4] and 3 faces. PyAEDT warnings "Not enough vertices or
+non-planar face" are expected: the two vertex-free end caps and the curved side have no computable normal.
 
 ## 7. Round gap, single angle at 2000 GHz
 
@@ -160,8 +160,9 @@ When it finishes:
     print(s["exit_field"]["points_per_key_retained"], s["exit_field"]["cross_section"], s["modes"]["mode"], s["modes"]["propagating_count"])
     PY
 
-Expected: `7845 1369 <T>` or `7825 1369 <T>` (record which: it tells whether HFSS evaluates the four
-rim points on the axes), T strictly between 0 and 1, then `7845` or `7825`,
+Expected: `N 1369 <T>` with N from 7825 to 7845 (twenty lattice points lie exactly on the rim, four on
+the axes and sixteen off them; 7845 means HFSS kept them all, 7825 none; record the exact N), T strictly
+between 0 and 1, then the same N,
 `{'shape': 'disc', 'radius_m': 5e-05}` (to rounding), `TE11 1`. Record T as the first round-gap
 reference value (no Windows reference exists), the passes and final delta E from
 `logs/convergence_Ephi0.txt`, and `sacct -j <id> --format=MaxRSS,Elapsed`.
@@ -181,7 +182,7 @@ When it finishes, with `<job>` named in its `slurm-<id>.out`:
         print(e, r.OutgoingPower / r.IngoingPower, len(w))
     PY
 
-Expected: two lines with 15 x (7845 or 7825) rows each, and the two T values at normal incidence equal
+Expected: two lines with 15 x N rows each (N as in step 7), and the two T values at normal incidence equal
 to within the convergence tolerance (a few percent at MaxDeltaE 0.02): a round gap cannot prefer a
 polarization at normal incidence. A large difference means a frame or polarization error; stop and
 report. Record memory and wall time; they size the job array (next-steps item 5).
