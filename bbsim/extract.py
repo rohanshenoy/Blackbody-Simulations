@@ -250,8 +250,9 @@ def describe_exit_face(hfss: Any, ctx: ExtractionContext) -> ExitFaceGeometry:
         log.warning("edge-sampling sagitta %.3g mm exceeds half the smallest grid step %.3g mm; "
                     "raise exit_field.edge_samples", sagitta, min(positive))
     cross_section = classify_cross_section(local, len(vertex_ids))
-    log.info("exit face %s: %d vertices, bounds from %s, cross-section %s", face_id, len(vertex_ids), method,
-             cross_section["shape"])
+    sampling = f", chord sagitta {sagitta:.3g} mm" if method == "edge_samples" else ""
+    log.info("exit face %s: %d vertices, bounds from %s, cross-section %s%s", face_id, len(vertex_ids), method,
+             cross_section["shape"], sampling)
     return ExitFaceGeometry(local, len(vertex_ids), method, cross_section, sagitta)
 
 
