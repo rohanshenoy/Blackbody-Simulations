@@ -150,6 +150,13 @@ class ExitFieldConfig:
     edge_samples: int = 64
 
     def __post_init__(self) -> None:
+        if self.manual is not True:
+            raise ConfigError(
+                f"manual={self.manual!r} is not supported; only manual = true (ExportOnGrid on the exit-frame "
+                "lattice) is ported. The mesh export (CalculatorWrite) writes points in HFSS global coordinates "
+                "with no lattice, so its CSVs and sidecar would fail BBRsim's exit-plane and grid checks; it "
+                "remains in legacy/bbsim1freq.py."
+            )
         res = self.resolution_mm
         if len(res) != 3 or any(v < 0 for v in res) or not any(v > 0 for v in res):
             raise ConfigError(f"resolution_mm must be 3 non-negative steps with at least one positive, got {list(res)}")
