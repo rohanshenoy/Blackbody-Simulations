@@ -295,6 +295,31 @@ constant 5.54 % below the reference's Ephi=0 at phi = 0: the reference's Ephi=0 
 outlier. Once the Ephi=1 column is right, the Ephi=0 keys at phi = 0 and (45, 180) will still miss the
 5 % tolerance by 0.5 %; that is Rohan's decision, with this evidence.
 
+Polarization probe (2026-10-06, job 4071971, diagnostic on the saved reference1 solution, key (90, 180),
+no new solve): integer 0 and integer 1 both gave T = 3.534e-11 (the Ephi=0 value, cut off), also right
+after a text 1; text "1" gave T = 0.99937; text "0" gave 3.534e-11. ExportOnGrid gave the same field for
+integer 1 and text 1 (max |E| 1.2935 V/m). **Root cause confirmed:** over gRPC, CalculatorWrite ignores
+an integer design-variable value and evaluates the nominal variation; no caching is involved.
+
+**reference2** (2026-10-06, run job 4071972, code at `470bd48`; comparison job 4071973): run done
+(solve 198.6 s; Ephi=0 and Ephi=1 converged in 7 passes, last delta 0.0160 and 0.0056). Comparison:
+
+    reference CSVs: all four sha256 OK
+    Ephi=1: RESULT: PASS. Transmission 8 pass, 7 below noise floor, 0 fail; max rel diff 0.003 at (45,180).
+    Ephi=0: RESULT: FAIL. Transmission 3 pass, 7 below noise floor, 5 fail at (0,45) (0,90) (0,135) (0,180)
+            (45,180), each exactly -5.544 %; (45,45) -3.24 %, (45,90) -1.87 %, (45,135) -3.24 % pass.
+    Structure (columns, Freq, Ephi, 15 keys, ingoing power, waveguide and far-field grids): PASS, both.
+    Fields: |E| correlation >= 0.999 (exit) and >= 0.9999 (far) at every transmitting key; the WARN
+            minima come from cut-off keys (T <= 1e-10), whose fields are numerical noise on both sides.
+
+Self-consistency at normal incidence (E along the gap; physics makes (0,180) Ephi=0 and (90,180) Ephi=1
+the same incident field): ours 0.99605 and 0.99937, ratio 0.9967; the Windows reference 1.05451 and
+0.99607, ratio 1.0587. Our Ephi=0 equals the reference's Ephi=1 at these keys, and our Ephi=1 matches
+the reference's Ephi=1 within 0.33 %. The five failing keys are the Windows Ephi=0 variation's constant
+5.54 % offset (its own adaptive mesh), not a difference in the 2025 R2 dataset. Acceptance of step 5 with
+this documented exception, a tolerance change, or a convergence study first: Rohan's decision.
+Comparison records: `/home/rshenoy/BBRSim/outputs/InfParallelPlate_crack1Rohan_500GHz/job_reference2/comparison_Ephi{0,1}.json`.
+
 ## 5b. Incident-direction check
 
 ## 6. Round-gap project
