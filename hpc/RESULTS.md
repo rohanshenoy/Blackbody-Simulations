@@ -239,6 +239,29 @@ T equals the step 4a value to every printed digit (same setup, same mesh). Wall 
 
 ## 5. Full reference run and comparison
 
+2026-10-06, run job 4069263 (hpc-89-25, code at `a9df6e4`, `--job-id reference1`, `-t 02:00:00`) and
+comparison job 4069264 (`hpc/compare_reference.sbatch`, dependent `afterok`). **Run: PASS; comparison:
+FAIL on transmission only.**
+
+    run:   COMPLETED 0:0, Elapsed 00:06:00, MaxRSS 1995148K (batch step); job directory 345M
+           Ephi=0 and Ephi=1: 77265 waveguide rows, 290820 far-field rows each; done; manifest written
+    reference CSVs (HPC BBRSimulation checkout): all four sha256 OK
+    Ephi=0: columns, Freq, Ephi, keys (15), ingoing power (rel 0), waveguide and far-field points: PASS
+            transmission FAIL: 3 pass, 7 below noise floor, 5 fail at (0,45) (0,90) (0,135) (0,180) (45,180);
+            max rel diff 0.055 at (0,135)
+            fields WARN: waveguide min |E| correlation -0.2472, max nRMS 0.3720; far field -0.2101, 0.2723
+    Ephi=1: same structural PASSes
+            transmission FAIL: 4 pass, 3 below noise floor, 8 fail at (0,45) (0,90) (0,135) (0,180)
+            (90,45) (90,90) (90,135) (90,180); max rel diff 7.3e9 at (0,180), where the reference is 1.4e-10
+            fields WARN: waveguide min corr -0.0571, max nRMS 0.3437; far field 0.0358, 0.2207
+
+The schema, keys, grids and ingoing power are identical to the Windows reference: the pipeline
+reproduces the dataset's structure exactly on AEDT 2025 R2. The transmission values differ by up to
+5.5 % at the transmitting keys, against the reference's own 5.9 % spread between physically identical
+keys (step 4). At Ephi=1, phi=0 the candidate exceeds the 1e-6 noise floor where the reference holds
+1e-12 to 1e-10 (E along the long side, below the TE01 cutoff). The field minima are aggregates over all
+15 keys, cut-off ones included. Per-key detail: `hpc/compare_detail.py` (next).
+
 ## 5b. Incident-direction check
 
 ## 6. Round-gap project
