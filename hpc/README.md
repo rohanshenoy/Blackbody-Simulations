@@ -103,22 +103,23 @@ Record T, the number of passes and final delta E from the convergence file, the 
 History: `baseline1` (2026-10-05) solved in 66.6 s and failed at the first calculator read-back,
 `ClcEval` over gRPC (RESULTS.md, step 4). The runner now reads calculator results through a file.
 
-### 4a. Extraction diagnostic on a solved job (no new solve)
+### 4a. Solve-and-probe diagnostic
 
 When a run fails after its solve, `hpc/diagnose_calculator.py` copies the job's project and results,
-lists the results folder, asks AEDT what it holds, and runs the runner's own extraction on the copy,
-writing the CSV tables beside it. Debug QOS, no solver licence:
+lists the results folder, asks AEDT what it holds, then evaluates `outgoing_power` with the runner's
+arguments and with variants, exports the exit and far fields alone, and runs the runner's own
+extraction on the copy, writing the CSV tables beside it. With `--solve` it first solves the copy
+(HFSS solver licence) and saves it; use that when the job's project holds no saved solution (runs
+made before the runner saved right after its solve, baseline1 and baseline2 among them). Debug QOS:
 
     sbatch -A golwala -p expansion -q debug -N 1 -c 4 --mem=16G -t 00:30:00 \
       -o /home/rshenoy/BBRSim/outputs/diag-%j.out \
-      --wrap 'bash -lc "source /home/rshenoy/BBRSim/bb_env.sh && cd /home/rshenoy/BBRSim/Blackbody-Simulations && python hpc/diagnose_calculator.py --job /home/rshenoy/BBRSim/outputs/InfParallelPlate_crack1Rohan_500GHz/job_baseline1"'
+      --wrap 'bash -lc "source /home/rshenoy/BBRSim/bb_env.sh && cd /home/rshenoy/BBRSim/Blackbody-Simulations && python hpc/diagnose_calculator.py --solve --job /home/rshenoy/BBRSim/outputs/InfParallelPlate_crack1Rohan_500GHz/job_baseline2"'
 
-Expected in `/home/rshenoy/BBRSim/outputs/diag-<id>.out`: `FIELDS: present`, one `T=` line per
-polarization, and `EXTRACTION PASS`; the tables are in `<job>/diagnose_<utc>/`. `FIELDS: not
-confirmed (solved variations: [])` with a results folder of a few kilobytes means the solve itself
-produced nothing (baseline1, RESULTS.md step 4); the solver's reason is in the results folder's
-`opti*.profile` and in the job's `slurm-<id>.out`, both printed by the diagnostic or readable with
-`cat` on the login node.
+Expected at the end of `/home/rshenoy/BBRSim/outputs/diag-<id>.out`: a summary with one OK or FAILED
+line per probe, `FIELDS: present`, `WORKING POWER VARIANTS: [...]` naming the argument forms that
+evaluate (each with T near 1.054 at normal incidence), and `EXTRACTION PASS` or `FAIL`. The AEDT
+message printed under a failed probe is the reason.
 
 ## 5. Full reference run (batch) and comparison
 

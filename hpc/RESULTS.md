@@ -157,8 +157,39 @@ out and in twice between 13:10:24 and 13:10:42 and shut down at 13:10:43; the fi
 before writing anything: a meshing or validation error, or a failure to launch the solver's worker
 processes on the node; the reason was in AEDT's message window, which nothing recorded.
 
-Open: that reason. Next: step 4 as `baseline2`, whose log now carries AEDT's messages and which fails
-fast when the solve produces nothing.
+`baseline2` (2026-10-06, job 4065548, hpc-24-18, code at `29cd12a`): **the solve completed.** AEDT's
+messages, now logged by the runner:
+
+    [warning] Excitation 'plane_wave_500GHz' is an analytical incident wave with geometry assignment and
+              it requires total field formulation. (09:05:03, at creation; the runner then selects total fields)
+    [info]    Normal completion of simulation on server: hpc-24-18. (09:05:45)
+    [info]    Parametric Analysis on E_phi_sweep_500GHz has been started. (09:05:45)
+    [info]    A variation (Ephi='0') has been requested using the following machines: hpc-24-18. (09:05:50)
+    [info]    A variation (Ephi='1') has been requested using the following machines: hpc-24-18. (09:05:51)
+    [info]    Parametric Analysis is done. (09:06:09)
+    solved variations of 500GHz : LastAdaptive: ["Ephi='0'", "Ephi='1'"]
+
+Then the first `CalculatorWrite` of `outgoing_power` failed with a bare
+`GrpcApiError: Failed to execute gRPC AEDT command: CalculatorWrite`, and the run closed the project
+unsaved again (the runner saved it only before the solve).
+
+**Correction to the entries above** (2026-10-06). baseline1 solved as well: the same 42 s nominal
+solve and 24 s sweep, the same licence pattern, and baseline2's messages for an identical setup. The
+step 4a copy of baseline1 held no solution because the runner saved the project only before the solve
+and the failed run closed it unsaved; AEDT evidently puts solution data into the results folder when
+the project is saved (the `--solve` diagnostic lists the folder before and after a save to confirm).
+Withdrawn: "the solve produced no solution", and "ClcEval does not work over gRPC" as the established
+cause (the gRPC limitation is documented by pyEPR but our evidence does not show it: the step 4a probes
+ran on a copy without a solution). What is established: evaluating `outgoing_power` with the runner's
+arguments fails on a solved design by both `ClcEval` (baseline1) and `CalculatorWrite` (baseline2).
+Candidates: the variation arguments (`Ephi` passed as an integer, the incident-angle intrinsics
+`IWavePhi`/`IWaveTheta` of a single-direction plane wave) or the expression's inputs (the face list
+`outgoing`, `Vector_RealPoynting` after `ClearAllNamedExpr`).
+
+Runner changes (this entry's commit): the project is saved right after the verified solve, so a failed
+extraction keeps the solve; any failure after the solve logs AEDT's new messages before the session
+closes. Next: step 4a with `--solve` on `job_baseline2`: solves a copy of its saved pre-solve project,
+saves it, and evaluates `outgoing_power` with the runner's arguments and with variants in one session.
 
 ## 5. Full reference run and comparison
 

@@ -8,9 +8,11 @@ import os
 import shutil
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -68,6 +70,24 @@ def _axis_summary(values, step: float) -> dict[str, float | int]:
 def _setup_logging(logfile: Path, level: str) -> None:
     logging.basicConfig(level=level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s",
                         handlers=[logging.FileHandler(logfile), logging.StreamHandler()])
+
+
+@contextmanager
+def aedt_messages_on_error(hfss: Any, seen: set[str]) -> Iterator[None]:
+    """On an exception in the block, log AEDT's message-manager entries not in ``seen``, then re-raise.
+
+    PyAEDT turns a failed AEDT command into a bare "Failed to execute gRPC AEDT command"; AEDT's reason is
+    only in its message manager (HPC step 4, baseline2).
+    """
+    from bbsim.hfss_setup import aedt_messages
+
+    try:
+        yield
+    except Exception:
+        new = [m for m in aedt_messages(hfss) if m not in seen]
+        for message in new or ["(no new AEDT messages)"]:
+            log.warning("aedt: %s", message)
+        raise
 
 
 def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
@@ -181,41 +201,44 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
                 f"no solved variations for Ephi={missing} in {ctx.solution!r}: AEDT holds {variations}; "
                 f"the solve ran for {solve_s:.1f} s without producing them. AEDT messages: " + " | ".join(messages)
             )
-
-        exit_point_counts: dict[int, dict] = {}
-        for ephi in cfg.output.polarizations:
-            waveguide = extract_waveguide(hfss, ctx, ephi, face_geometry)
-            far_field = extract_far_field(hfss, ctx, ephi)
-            out_dir = dirs.dataset_dir(cfg.project.dataset_id, freq, ephi)
-            out_dir.mkdir(parents=True, exist_ok=False)
-            for name, table in (("waveguide.csv", waveguide), ("far_field.csv", far_field)):
-                path = out_dir / name
-                table.to_csv(path, index=False)
-                files[f"{out_dir.name}/{name}"] = {"sha256": sha256_file(path), "bytes": path.stat().st_size,
-                                                   "rows": len(table)}
-            outputs[str(ephi)] = str(out_dir)
-            exit_point_counts[ephi] = waveguide.groupby(KEY_COLUMNS).size().to_dict()
-            convergence[str(ephi)] = export_convergence_text(hfss, setup, f"Ephi='{ephi}'", dirs.logs / f"convergence_Ephi{ephi}.txt")
-            log.info("wrote %s (%d waveguide rows, %d far-field rows)", out_dir, len(waveguide), len(far_field))
-        # Geant4 pairs the Ephi=0 and Ephi=1 exit points of each incident angle by row index.
-        first_ephi, first_counts = next(iter(exit_point_counts.items()))
-        for ephi, counts in exit_point_counts.items():
-            if counts != first_counts:
-                raise RuntimeError(
-                    f"exit-point counts per incident angle differ between polarization Ephi={first_ephi} and "
-                    f"Ephi={ephi}; Geant4 pairs them by row index. Ephi={first_ephi}: {first_counts}; Ephi={ephi}: {counts}"
-                )
-        retained = int(next(iter(first_counts.values())))
-        lattice_points = lattice.lattice_points if lattice is not None else None
-        if lattice_points is not None and retained > lattice_points:
-            # HFSS can omit lattice points outside the solid but never add any: the lattice model is wrong,
-            # and so would be the grid recorded in the manifest and the sidecar.
-            raise RuntimeError(
-                f"exit field has {retained} points per incident angle, more than the {lattice_points} points of "
-                f"the ExportOnGrid lattice {lattice.counts}; the lattice model disagrees with the HFSS export"
-            )
-        outside_points = "omitted" if lattice_points is not None and retained < lattice_points else "none"
+        # AEDT writes solution data into the project's results folder only when the project is saved; a run
+        # that fails during extraction closes the project unsaved (HPC steps 4 and 4a lost their solves that way).
         hfss.save_project()
+        with aedt_messages_on_error(hfss, set(messages)):
+            exit_point_counts: dict[int, dict] = {}
+            for ephi in cfg.output.polarizations:
+                waveguide = extract_waveguide(hfss, ctx, ephi, face_geometry)
+                far_field = extract_far_field(hfss, ctx, ephi)
+                out_dir = dirs.dataset_dir(cfg.project.dataset_id, freq, ephi)
+                out_dir.mkdir(parents=True, exist_ok=False)
+                for name, table in (("waveguide.csv", waveguide), ("far_field.csv", far_field)):
+                    path = out_dir / name
+                    table.to_csv(path, index=False)
+                    files[f"{out_dir.name}/{name}"] = {"sha256": sha256_file(path), "bytes": path.stat().st_size,
+                                                       "rows": len(table)}
+                outputs[str(ephi)] = str(out_dir)
+                exit_point_counts[ephi] = waveguide.groupby(KEY_COLUMNS).size().to_dict()
+                convergence[str(ephi)] = export_convergence_text(hfss, setup, f"Ephi='{ephi}'", dirs.logs / f"convergence_Ephi{ephi}.txt")
+                log.info("wrote %s (%d waveguide rows, %d far-field rows)", out_dir, len(waveguide), len(far_field))
+            # Geant4 pairs the Ephi=0 and Ephi=1 exit points of each incident angle by row index.
+            first_ephi, first_counts = next(iter(exit_point_counts.items()))
+            for ephi, counts in exit_point_counts.items():
+                if counts != first_counts:
+                    raise RuntimeError(
+                        f"exit-point counts per incident angle differ between polarization Ephi={first_ephi} and "
+                        f"Ephi={ephi}; Geant4 pairs them by row index. Ephi={first_ephi}: {first_counts}; Ephi={ephi}: {counts}"
+                    )
+            retained = int(next(iter(first_counts.values())))
+            lattice_points = lattice.lattice_points if lattice is not None else None
+            if lattice_points is not None and retained > lattice_points:
+                # HFSS can omit lattice points outside the solid but never add any: the lattice model is wrong,
+                # and so would be the grid recorded in the manifest and the sidecar.
+                raise RuntimeError(
+                    f"exit field has {retained} points per incident angle, more than the {lattice_points} points of "
+                    f"the ExportOnGrid lattice {lattice.counts}; the lattice model disagrees with the HFSS export"
+                )
+            outside_points = "omitted" if lattice_points is not None and retained < lattice_points else "none"
+            hfss.save_project()
 
     exit_cs_z = [float(v) + 0.0 for v in np.cross(cfg.geometry.exit_cs_x, cfg.geometry.exit_cs_y)]
     manifest = build_manifest(
