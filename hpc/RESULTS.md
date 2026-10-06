@@ -191,6 +191,39 @@ extraction keeps the solve; any failure after the solve logs AEDT's new messages
 closes. Next: step 4a with `--solve` on `job_baseline2`: solves a copy of its saved pre-solve project,
 saves it, and evaluates `outgoing_power` with the runner's arguments and with variants in one session.
 
+Step 4a with `--solve` (2026-10-06, job 4066881, code at `e9ea19a`) on a copy of `job_baseline2`:
+**root cause found.** The copy solved (Ephi=0 converged in 4 passes, Ephi=1 in 2) and saved. Then:
+
+| Probe | Result |
+|---|---|
+| constant 1, Freq and Phase only | OK, 1.0 |
+| constant 1, the runner's arguments (with IWavePhi, IWaveTheta) | FAILED |
+| outgoing_power with the incident angles, any form (Ephi int or text, 0.0deg or 0deg) | FAILED |
+| outgoing_power without the incident angles (Ephi int or text, or Freq and Phase only) | OK, 6.6471e-10 W, T = 1.00167 |
+| outgoing_power, Ephi=1, without the incident angles | OK, 1.08e-19 W, T = 1.6e-10 |
+| ExportOnGrid with the incident angles | FAILED |
+| ExportOnGrid without the incident angles | OK, 5151 points |
+| ExportFieldsToFile with the runner's keys, and with Freq only | OK, 19388 points each |
+| named expressions `outgoing_power`, `Vector_RealPoynting`; face list `outgoing` = [7] | present |
+| PyAEDT's own `fields_calculator.evaluate` | FAILED (its variation lists every design variable) |
+
+A plane wave with a single incident direction (PhiPoints = ThetaPoints = 1) defines no incident-wave
+variables, so naming `IWavePhi`/`IWaveTheta` fails every calculator evaluation and grid export, even a
+constant; the one direction is then implied. The legacy script always swept 15 directions, which is why
+this never appeared on Windows. `Ephi` as an integer is fine, so neither gRPC marshalling nor the
+read-back method was the cause. Fix (this entry's commit): `field_variation` names the angles only when
+the plane wave has more than one direction; the far-field key is unchanged (AEDT accepts it either way).
+A sweep along one axis only is unverified.
+
+Transmission at (0 deg, 180 deg), Ephi=0: 1.00167 here (single-direction solve, 2025 R2) against 1.05451
+in the Windows reference (15-direction solve, 2023 R2): -5.0 %. The reference itself gives 0.99607 at
+(90 deg, 180 deg) for Ephi=1, the physically identical incident field (E along the gap, normal incidence),
+because each polarization is a separate parametric variation with its own adaptive mesh: its internal
+spread between the two is 5.9 %, so this baseline lies within the method's mesh noise at MaxDeltaE 0.02.
+`compare_hfss_exports.py` allows |dT| <= max(1e-3, 0.05 T), which this key misses by 0.0001; step 5 is a
+15-direction solve with its own mesh, so the tolerance is left unchanged and taken to Rohan as a decision
+if step 5 misses it.
+
 ## 5. Full reference run and comparison
 
 ## 5b. Incident-direction check

@@ -52,6 +52,12 @@ class ExtractionContext:
     def freq_label(self) -> str:
         return frequency_label(self.frequency_ghz)
 
+    @property
+    def swept_incidence(self) -> bool:
+        """True when the plane wave has more than one incident direction; only then does AEDT define the
+        incident-wave variables IWavePhi and IWaveTheta (see ``field_variation``)."""
+        return len(self.phi_values) * len(self.theta_values) > 1
+
 
 @dataclass(frozen=True)
 class ExitFaceGeometry:
@@ -93,6 +99,19 @@ class ExitGrid:
 
 def intrinsics(ephi: int, freq_label: str, phi_deg: float, theta_deg: float) -> list:
     return ["Ephi:=", ephi, "Freq:=", freq_label, "IWavePhi:=", f"{phi_deg}deg", "IWaveTheta:=", f"{theta_deg}deg"]
+
+
+def field_variation(ctx: ExtractionContext, ephi: int, phi_deg: float, theta_deg: float) -> list:
+    """Variation arguments of a calculator evaluation or a grid export at one incidence key and polarization.
+
+    AEDT defines the incident-wave variables IWavePhi and IWaveTheta only when the plane wave sweeps more
+    than one direction. With a single direction (PhiPoints = ThetaPoints = 1) naming them fails every
+    evaluation and export, a constant included (HPC step 4a with --solve, 2026-10-06); the one direction is
+    then implied. The legacy script always swept 15 directions. A sweep along one axis only is unverified.
+    """
+    if ctx.swept_incidence:
+        return intrinsics(ephi, ctx.freq_label, phi_deg, theta_deg)
+    return ["Ephi:=", ephi, "Freq:=", ctx.freq_label]
 
 
 def intrinsic_variation_key(freq_label: str, phi_deg: float, theta_deg: float) -> str:
@@ -259,11 +278,10 @@ def describe_exit_face(hfss: Any, ctx: ExtractionContext) -> ExitFaceGeometry:
 def evaluate_outgoing_power(hfss: Any, ctx: ExtractionContext, ephi: int) -> dict[tuple[float, float], float]:
     """The named expression ``outgoing_power`` (real Poynting flux through the exit face) per incident direction.
 
-    Each value is written to a scratch file with ``CalculatorWrite`` and read back. The legacy script read
-    the calculator stack instead (``ClcEval`` then ``GetTopEntryValue``); that read-back is stateful GUI
-    behaviour which fails over the gRPC transport AEDT uses on Linux (HPC step 4, job baseline1: every
-    variation failed, a bare constant included). PyAEDT 1.7.0 evaluates expressions through a file for the
-    same reason, and like it we pass ``Phase`` with the intrinsics.
+    Each value is written to a scratch file with ``CalculatorWrite`` and read back, as PyAEDT 1.7.0 evaluates
+    expressions, with ``Phase`` among the intrinsics. The legacy script read the calculator stack instead
+    (``ClcEval`` then ``GetTopEntryValue``); over gRPC on HPC that failed in every form tried, each time
+    with the incident-angle keys of a single-direction plane wave, which ``field_variation`` now omits.
     """
     fields = hfss.odesign.GetModule("FieldsReporter")
     path = ctx.scratch_dir / f"outgoing_power_{ctx.freq_label}_Ephi{ephi}.fld"
@@ -273,7 +291,7 @@ def evaluate_outgoing_power(hfss: Any, ctx: ExtractionContext, ephi: int) -> dic
         for theta in ctx.theta_values:
             if path.exists():
                 path.unlink()
-            args = intrinsics(ephi, ctx.freq_label, float(phi), float(theta)) + ["Phase:=", "0deg"]
+            args = field_variation(ctx, ephi, float(phi), float(theta)) + ["Phase:=", "0deg"]
             fields.CalcStack("clear")
             fields.CopyNamedExprToStack("outgoing_power")
             fields.CalculatorWrite(str(path), ["Solution:=", ctx.solution], args)
@@ -310,7 +328,7 @@ def extract_waveguide(hfss: Any, ctx: ExtractionContext, ephi: int, face: ExitFa
         for theta in ctx.theta_values:
             if path.exists():
                 path.unlink()
-            args = intrinsics(ephi, ctx.freq_label, float(phi), float(theta))
+            args = field_variation(ctx, ephi, float(phi), float(theta))
             if ctx.exit_field.manual:
                 fields.ExportOnGrid(
                     str(path), range_min, range_max, resolution, ctx.solution, args + ["Phase:=", "0deg"],
