@@ -262,6 +262,39 @@ keys (step 4). At Ephi=1, phi=0 the candidate exceeds the 1e-6 noise floor where
 1e-12 to 1e-10 (E along the long side, below the TE01 cutoff). The field minima are aggregates over all
 15 keys, cut-off ones included. Per-key detail: `hpc/compare_detail.py` (next).
 
+Per-key detail (`hpc/compare_detail.py`, 2026-10-06, login node):
+
+    convergence  Ephi=0: 7 passes, last delta 0.032014, 0.030064, 0.015993 (26008 elements)
+                 Ephi=1: 7 passes, last delta 0.036096, 0.022741, 0.0056319 (23001 elements); solve 189.5 s
+    T (phi, theta)   ref E0      cand E0     ref E1      cand E1
+      (0, 45)       2.236e-02   2.112e-02   2.963e-12   2.112e-02
+      (0, 90)       2.577e-01   2.434e-01   3.467e-11   2.434e-01
+      (0, 135)      7.595e-01   7.174e-01   1.006e-10   7.174e-01
+      (0, 180)      1.0545      0.99605     1.367e-10   0.99605
+      (45, 45)      1.199e-02   1.160e-02   1.160e-02   1.160e-02
+      (45, 90)      1.337e-01   1.312e-01   1.311e-01   1.312e-01
+      (45, 135)     4.073e-01   3.941e-01   3.939e-01   3.941e-01
+      (45, 180)     0.52725     0.49802     0.49803     0.49802
+      (90, 45..180) ~1e-11      ~1e-11      2.276e-02 .. 0.99607   ~1e-11
+    fields at the transmitting keys: exit |E| correlation 0.9990 (E0) and 0.9999 (E1), far field 0.9999 / 1.0000
+
+**Bug found: the candidate's Ephi=1 OutgoingPower is a copy of its Ephi=0 OutgoingPower** at all 15 keys,
+to every printed digit, while its Ephi=1 exit and far fields match the reference's Ephi=1 fields
+(correlation 0.9999 at the transmitting keys). The runner passed the polarization as an integer
+(`"Ephi:=", 1`); over gRPC, CalculatorWrite evidently ignored it and evaluated the nominal Ephi=0 without
+an error, while ExportOnGrid honoured the same integer (step 4a: text "1" gave the Ephi=1 value).
+Fix (this entry's commit): `field_variation` passes the polarization as text, as PyAEDT passes design
+variables; the fake AEDT now ignores an integer Ephi in CalculatorWrite, and the existing test that
+each polarization carries its own power reproduced the bug before the fix. The reference1 dataset must
+not be used. The diagnostic gained an integer-versus-text probe sequence at a chosen key to confirm the
+mechanism on the saved reference1 solution.
+
+Against the reference, the candidate's Ephi=0 agrees with the reference's Ephi=1 at the physically
+identical keys (normal incidence: 0.99605 against 0.99607; (45, theta): within 0.05 %), and both lie a
+constant 5.54 % below the reference's Ephi=0 at phi = 0: the reference's Ephi=0 variation is the
+outlier. Once the Ephi=1 column is right, the Ephi=0 keys at phi = 0 and (45, 180) will still miss the
+5 % tolerance by 0.5 %; that is Rohan's decision, with this evidence.
+
 ## 5b. Incident-direction check
 
 ## 6. Round-gap project

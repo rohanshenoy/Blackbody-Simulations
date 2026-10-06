@@ -104,14 +104,19 @@ def intrinsics(ephi: int, freq_label: str, phi_deg: float, theta_deg: float) -> 
 def field_variation(ctx: ExtractionContext, ephi: int, phi_deg: float, theta_deg: float) -> list:
     """Variation arguments of a calculator evaluation or a grid export at one incidence key and polarization.
 
+    The polarization goes to AEDT as text ("1"), as PyAEDT passes design variables: over gRPC, CalculatorWrite
+    ignored an integer Ephi and silently evaluated the nominal Ephi=0, so the Ephi=1 table of HPC step 5
+    (job 4069263) carried Ephi=0's OutgoingPower while ExportOnGrid honoured the same integer.
+
     AEDT defines the incident-wave variables IWavePhi and IWaveTheta only when the plane wave sweeps more
     than one direction. With a single direction (PhiPoints = ThetaPoints = 1) naming them fails every
     evaluation and export, a constant included (HPC step 4a with --solve, 2026-10-06); the one direction is
     then implied. The legacy script always swept 15 directions. A sweep along one axis only is unverified.
     """
+    args = ["Ephi:=", str(int(ephi)), "Freq:=", ctx.freq_label]
     if ctx.swept_incidence:
-        return intrinsics(ephi, ctx.freq_label, phi_deg, theta_deg)
-    return ["Ephi:=", ephi, "Freq:=", ctx.freq_label]
+        args += ["IWavePhi:=", f"{phi_deg}deg", "IWaveTheta:=", f"{theta_deg}deg"]
+    return args
 
 
 def intrinsic_variation_key(freq_label: str, phi_deg: float, theta_deg: float) -> str:

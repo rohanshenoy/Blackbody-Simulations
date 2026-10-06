@@ -164,6 +164,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--solve", action="store_true",
                    help="solve the copy before probing (uses the HFSS solver licence); needed when the job's "
                         "project holds no saved solution")
+    p.add_argument("--key", nargs=2, type=float, metavar=("PHI", "THETA"), default=None,
+                   help="incidence key for the probes, in degrees (default: the config's first key)")
+    p.add_argument("--out", default=None,
+                   help="name of the copy folder inside the job directory (default: diagnose_<utc>); must not exist")
     p.add_argument("--aedt-version", default="2025.2")
     args = p.parse_args(argv)
 
@@ -192,11 +196,17 @@ def main(argv: list[str] | None = None) -> int:
     print("== 1. results folder of the job (no AEDT)")
     report["meta"]["job_results_folder"] = list_results(results)
 
-    dest = job / f"diagnose_{utc_stamp()}"
-    n = 0
-    while dest.exists():  # a second diagnostic within the same second
-        n += 1
-        dest = job / f"diagnose_{utc_stamp()}_{n}"
+    if args.out:
+        dest = job / args.out
+        if dest.exists():
+            print(f"{dest} exists; choose another --out")
+            return 2
+    else:
+        dest = job / f"diagnose_{utc_stamp()}"
+        n = 0
+        while dest.exists():  # a second diagnostic within the same second
+            n += 1
+            dest = job / f"diagnose_{utc_stamp()}_{n}"
     dest.mkdir()
     scratch = dest / "scratch"
     scratch.mkdir()
@@ -224,7 +234,8 @@ def main(argv: list[str] | None = None) -> int:
     ff = cfg.far_field
     phi_values = incident_angle_values(exc.phi_lower_deg, exc.phi_upper_deg, exc.phi_step_deg)
     theta_values = incident_angle_values(exc.theta_lower_deg, exc.theta_upper_deg, exc.theta_step_deg)
-    phi0, theta0 = float(phi_values[0]), float(theta_values[0])
+    phi0, theta0 = (float(args.key[0]), float(args.key[1])) if args.key else (float(phi_values[0]), float(theta_values[0]))
+    swept = len(phi_values) * len(theta_values) > 1
     solved = None
     extraction_ok = False
     working_power: list[str] = []
@@ -271,9 +282,31 @@ def main(argv: list[str] | None = None) -> int:
             ingoing = incoming_power_w(exc.ei_v_per_m, faces[0].area_mm2) if faces else None
             report["meta"]["incoming_power_w"] = ingoing
 
-            print("== 4. calculator evaluations, each written with CalculatorWrite and read back")
             phase = ["Phase:=", "0deg"]
             ang = ["IWavePhi:=", f"{phi0}deg", "IWaveTheta:=", f"{theta0}deg"]
+            print(f"== 3b. polarization as integer or text, outgoing_power at key ({phi0}, {theta0})"
+                  f"{' with the incident angles' if swept else ''}")
+            # The order separates "an integer is ignored" (every integer 1 gives the integer-0 value) from "the last
+            # evaluated variation is reused" (an integer 1 after a text 1 gives the Ephi=1 value).
+            sequence = [("int 0", 0), ("int 1", 1), ("text 1", "1"), ("int 1 after text 1", 1), ("text 0", "0"),
+                        ("int 1 after text 0", 1)]
+            for i, (text, value) in enumerate(sequence):
+                path = dest / f"pol_{i:02d}.fld"
+                variation = ["Ephi:=", value, "Freq:=", label] + (ang if swept else []) + phase
+
+                def evaluate_pol(variation=variation, path=path):
+                    if path.exists():
+                        path.unlink()
+                    fields.CalcStack("clear")
+                    fields.CopyNamedExprToStack(OUTGOING_POWER_EXPRESSION)
+                    fields.CalculatorWrite(str(path), ["Solution:=", solution], variation)
+                    wait_for_file(path, PROBE_WAIT_S)
+                    value = read_calculator_scalar(path)
+                    return {"value": value, "T": value / ingoing} if ingoing else {"value": value}
+
+                print(f"  arguments: {variation}")
+                P(f"pol_{i}", f"outgoing_power, Ephi {text}", evaluate_pol)
+            print("== 4. calculator evaluations, each written with CalculatorWrite and read back")
             ang_int = ["IWavePhi:=", f"{int(phi0)}deg", "IWaveTheta:=", f"{int(theta0)}deg"]
             matrix = [
                 ("const_freq_phase", "constant 1, Freq and Phase only", "scalar", ["Freq:=", label] + phase),
@@ -339,6 +372,8 @@ def main(argv: list[str] | None = None) -> int:
                     range_min, range_max = lattice.range_strings(hfss.modeler.model_units)
                     resolution = [f"{v}mm" for v in cfg.exit_field.resolution_mm]
                     grid_variants = [
+                        ("grid_int1", "ExportOnGrid, Ephi integer 1", ["Ephi:=", 1, "Freq:=", label] + (ang if swept else []) + phase),
+                        ("grid_text1", "ExportOnGrid, Ephi text 1", ["Ephi:=", "1", "Freq:=", label] + (ang if swept else []) + phase),
                         ("grid_runner", "ExportOnGrid, the runner's arguments", intrinsics(0, label, phi0, theta0) + phase),
                         ("grid_ephi_text", "ExportOnGrid, Ephi as text", ["Ephi:=", "0", "Freq:=", label] + ang + phase),
                         ("grid_no_angles", "ExportOnGrid, Ephi as text, no incident angles", ["Ephi:=", "0", "Freq:=", label] + phase),
@@ -360,7 +395,8 @@ def main(argv: list[str] | None = None) -> int:
                             )
                             wait_for_file(path, cfg.output.export_timeout_s)
                             df = read_exit_field_fld(path)
-                            return f"{len(df)} points (lattice {lattice.lattice_points})"
+                            mag = (df[["Ex_real", "Ex_imag", "Ey_real", "Ey_imag", "Ez_real", "Ez_imag"]] ** 2).sum(axis=1) ** 0.5
+                            return f"{len(df)} points (lattice {lattice.lattice_points}), max |E| {float(mag.max()):.4e} V/m"
 
                         print(f"  arguments: {variation}")
                         P(key, text, export)

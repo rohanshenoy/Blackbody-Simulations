@@ -133,9 +133,9 @@ bytes as the Mac copies); `hpc/compare_reference.sbatch` checks their sha256 aga
 `configs/legacy_reference_500GHz.sha256` before comparing. One paste on the login node:
 
     cd /home/rshenoy/BBRSim/Blackbody-Simulations && git pull --ff-only fork linux-hpc-migration
-    A=$(sbatch --parsable -t 02:00:00 hpc/run_frequency.sbatch configs/crack1_500GHz_reference.toml --job-id reference1); A=${A%%;*}; echo "run job $A"
+    A=$(sbatch --parsable -t 02:00:00 hpc/run_frequency.sbatch configs/crack1_500GHz_reference.toml --job-id reference2); A=${A%%;*}; echo "run job $A"
     sbatch --dependency=afterok:$A --kill-on-invalid-dep=yes hpc/compare_reference.sbatch \
-        /home/rshenoy/BBRSim/outputs/InfParallelPlate_crack1Rohan_500GHz/job_reference1
+        /home/rshenoy/BBRSim/outputs/InfParallelPlate_crack1Rohan_500GHz/job_reference2
     squeue -u rshenoy
 
 When both jobs have left the queue:
@@ -143,10 +143,12 @@ When both jobs have left the queue:
     tail -8 /home/rshenoy/BBRSim/outputs/slurm-<run id>.out
     cat /home/rshenoy/BBRSim/outputs/slurm-<compare id>.out
 
-Expected: the run ends with `done; manifest at .../job_reference1/manifest.json`; the comparison prints
+Expected: the run ends with `done; manifest at .../job_reference2/manifest.json`; the comparison prints
 four reference files `OK`, a table and `RESULT: PASS` for each polarization, and
 `COMPARISON PASS`. The JSON records are `<job>/comparison_Ephi{0,1}.json`. If the run fails, Slurm
-cancels the comparison (`--kill-on-invalid-dep`).
+cancels the comparison (`--kill-on-invalid-dep`). For per-key detail on the login node:
+`python hpc/compare_detail.py <job>`. History: `reference1` (job 4069263) carried Ephi=0's power in its
+Ephi=1 table (RESULTS.md step 5); fixed, so the run is `reference2`.
 
 Transmission tolerance: |dT| <= max(1e-3, 0.05 T). The reference's own two physically identical keys,
 (0 deg, 180 deg) for Ephi=0 and (90 deg, 180 deg) for Ephi=1, differ by 5.9 % (separate adaptive meshes per

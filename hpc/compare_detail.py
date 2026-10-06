@@ -78,7 +78,10 @@ def main(argv: list[str] | None = None) -> int:
 
     print("== 1. convergence and solve time")
     for e in (0, 1):
-        print(f"  Ephi={e}: {convergence_summary(job / 'logs' / f'convergence_Ephi{e}.txt')}")
+        conv = job / "logs" / f"convergence_Ephi{e}.txt"
+        if not conv.is_file():  # a diagnostic copy folder keeps its convergence tables at its top level
+            conv = job / f"convergence_Ephi{e}.txt"
+        print(f"  Ephi={e}: {convergence_summary(conv)}")
     log = job / "logs" / "run.log"
     if log.is_file():
         for line in log.read_text(errors="replace").splitlines():
