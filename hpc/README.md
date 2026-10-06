@@ -233,6 +233,19 @@ the two polarizations at normal incidence stay equal. The tree then takes the be
 
 ## 6. Build the round-gap project (batch, debug QOS)
 
+Steps 6 to 8 can go in as one chain, each starting only when the previous one succeeded
+(`--kill-on-invalid-dep` cancels the rest after a failure). Both round-gap configs use the production
+convergence target, MaxDeltaE 0.005 with up to 20 passes (Rohan, 2026-10-06, ledger HF-027):
+
+    cd /home/rshenoy/BBRSim/Blackbody-Simulations && git pull --ff-only fork linux-hpc-migration
+    S6=$(sbatch --parsable -A golwala -p expansion -q debug -N 1 -c 4 --mem=16G -t 00:30:00 -o /home/rshenoy/BBRSim/outputs/slurm-%j.out \
+      --wrap 'bash -lc "source /home/rshenoy/BBRSim/bb_env.sh && cd /home/rshenoy/BBRSim/Blackbody-Simulations && python build_hfss_project.py --spec configs/geometries/round_gap_r50um.toml"'); S6=${S6%%;*}; echo "step 6 job $S6"
+    S7=$(sbatch --parsable --dependency=afterok:$S6 --kill-on-invalid-dep=yes -t 02:00:00 hpc/run_frequency.sbatch configs/round_gap_r50um_2000GHz_single_angle.toml --job-id roundgap1); S7=${S7%%;*}; echo "step 7 job $S7"
+    S8=$(sbatch --parsable --dependency=afterok:$S7 --kill-on-invalid-dep=yes -t 03:00:00 hpc/run_frequency.sbatch configs/round_gap_r50um_2000GHz_reference.toml --job-id reference1); S8=${S8%%;*}; echo "step 8 job $S8"
+    squeue -u rshenoy
+
+Each step's own command and its checks follow.
+
     sbatch -A golwala -p expansion -q debug -N 1 -c 4 --mem=16G -t 00:30:00 \
         -o /home/rshenoy/BBRSim/outputs/slurm-%j.out \
         --wrap 'bash -lc "source /home/rshenoy/BBRSim/bb_env.sh && cd /home/rshenoy/BBRSim/Blackbody-Simulations && python build_hfss_project.py --spec configs/geometries/round_gap_r50um.toml"'
@@ -271,20 +284,23 @@ delta E from `logs/convergence_Ephi0.txt`, and `sacct -j <id> --format=MaxRSS,El
 
 ## 8. Round gap, full sweep
 
-    sbatch hpc/run_frequency.sbatch configs/round_gap_r50um_2000GHz_reference.toml
+    sbatch -t 03:00:00 hpc/run_frequency.sbatch configs/round_gap_r50um_2000GHz_reference.toml --job-id reference1
 
-When it finishes, with `<job>` named in its `slurm-<id>.out`:
+When it finishes:
 
     python - <<'PY'
     import pandas as pd
-    job = "<job>"
+    job = "/home/rshenoy/BBRSim/outputs/RoundGap_r50um_2000GHz/job_reference1"
     for e in (0, 1):
         w = pd.read_csv(f"{job}/RoundGap_r50um_2000GHz_Ephi={e}/waveguide.csv")
-        r = w[(w.IWavePhi == 0) & (w.IWaveTheta == 180)].iloc[0]
-        print(e, r.OutgoingPower / r.IngoingPower, len(w))
+        k = w.drop_duplicates(["IWavePhi", "IWaveTheta"]).set_index(["IWavePhi", "IWaveTheta"])
+        t = k.OutgoingPower / k.IngoingPower
+        print(e, len(w), [round(float(t[(p, 180.0)]), 5) for p in (0.0, 45.0, 90.0)])
     PY
 
-Expected: two lines with 15 x N rows each (N as in step 7), and the two T values at normal incidence equal
-to within the convergence tolerance (a few percent at MaxDeltaE 0.02): a round gap cannot prefer a
-polarization at normal incidence. A large difference means a frame or polarization error; stop and
-report. Record memory and wall time; they size the job array (next-steps item 5).
+Expected: two lines with 15 x N rows each (N as in step 7), and the six T values at normal incidence
+(three azimuths, two polarizations) equal to within about 0.5 %: at normal incidence a round gap cannot
+prefer a polarization or an azimuth, and at MaxDeltaE 0.005 the two separately meshed polarizations of
+the cracks agreed to 0.1 % (step 5d). A large difference means a frame or polarization error; stop and
+report. Record memory and wall time (`sacct -j <id> -o JobID,State,Elapsed,MaxRSS`); they size the job
+array.

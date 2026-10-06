@@ -31,8 +31,8 @@ phi_step_deg = 45.0
 
 [solver]
 frequency_ghz = 2000
-max_delta_e = 0.02
-max_passes = 10
+max_delta_e = 0.005  # Rohan 2026-10-06 (HF-027): production target; was 0.02
+max_passes = 20
 cores = 4
 sweep = "discrete"
 
