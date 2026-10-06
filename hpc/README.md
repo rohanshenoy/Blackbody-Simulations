@@ -282,6 +282,31 @@ nine tokens; those points are still skipped and the run stands, but copy the war
 Record T as the first round-gap reference value (no Windows reference exists), the passes and final
 delta E from `logs/convergence_Ephi0.txt`, and `sacct -j <id> --format=MaxRSS,Elapsed`.
 
+## 7a. Exit-lattice diagnostic (batch, debug QOS)
+
+Step 7 (job 4077742, 2026-10-06) solved and then stopped at its first exit-field export: HFSS had written field
+values at 50 lattice points outside the declared 50 um disc, which the runner refuses, and the runner deletes
+each raw export after reading it. `hpc/diagnose_exit_grid.py` reruns the runner unchanged on the single-angle
+config with both polarizations (two separately adapted meshes), keeps every raw exit-field export, reports the
+containment check instead of raising, and maps the valued and nan lattice points against their distance from
+the rim:
+
+    cd /home/rshenoy/BBRSim/Blackbody-Simulations && git pull --ff-only fork linux-hpc-migration
+    D=$(sbatch --parsable -A golwala -p expansion -q debug -N 1 -c 4 --mem=16G -t 00:30:00 -o /home/rshenoy/BBRSim/outputs/slurm-%j.out \
+      --wrap 'bash -lc "source /home/rshenoy/BBRSim/bb_env.sh && cd /home/rshenoy/BBRSim/Blackbody-Simulations && python hpc/diagnose_exit_grid.py --config configs/round_gap_r50um_2000GHz_single_angle.toml --polarizations 0 1 --cores 4 --job-id diag_exitgrid1"'); D=${D%%;*}; echo "diagnostic job $D"
+
+When it has left the queue (same shell, or put the job number in place of `$D`):
+
+    sacct -j $D -o JobID,State,ExitCode,Elapsed,MaxRSS
+    grep -E "^containment" /home/rshenoy/BBRSim/outputs/slurm-$D.out
+    sed -n '/^== runner exit status/,$p' /home/rshenoy/BBRSim/outputs/slurm-$D.out
+
+Expected: one `containment` line per polarization; then per export the valued and nan lattice points inside
+and outside the disc (7845 lattice points lie inside it, 20 of them on the rim), how far beyond the rim the
+valued outside points lie, |E| there against the ring just inside the rim, and whether the two polarizations'
+valued points inside the disc are the same set; a closing `EXIT GRID:` line. The job directory
+`job_diag_exitgrid1` keeps the outside points in its tables and is not a dataset.
+
 ## 8. Round gap, full sweep
 
     sbatch -t 03:00:00 hpc/run_frequency.sbatch configs/round_gap_r50um_2000GHz_reference.toml --job-id reference1
