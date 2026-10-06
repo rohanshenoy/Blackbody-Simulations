@@ -224,6 +224,19 @@ spread between the two is 5.9 %, so this baseline lies within the method's mesh 
 15-direction solve with its own mesh, so the tolerance is left unchanged and taken to Rohan as a decision
 if step 5 misses it.
 
+**Step 4: PASS** (2026-10-06, job 4068495, hpc-22-11, code at `9b9f1db`, `--job-id baseline3`). The solve
+took 62.5 s (AnalyzeAll; "Normal completion of simulation"; parametric sweep done; solved variations
+Ephi='0' and Ephi='1'); the project was saved right after it; then:
+
+    [power 1/1] phi=0.0 theta=180.0 Ephi=0 -> 6.647119e-10 W        T = 1.001668
+    exit-field grid in outgoing_cs: 5151 lattice points; [exit 1/1] 5151 points
+    [far 1/1] 19388 points
+    wrote .../job_baseline3/InfParallelPlate_crack1Rohan_500GHz_Ephi=0 (5151 waveguide rows, 19388 far-field rows)
+    done; manifest at /home/rshenoy/BBRSim/outputs/InfParallelPlate_crack1Rohan_500GHz/job_baseline3/manifest.json
+
+T equals the step 4a value to every printed digit (same setup, same mesh). Wall time on the node about
+1 min 51 s, of which about 45 s AEDT start-up. MaxRSS and the results-folder size: recorded with step 5.
+
 ## 5. Full reference run and comparison
 
 ## 5b. Incident-direction check

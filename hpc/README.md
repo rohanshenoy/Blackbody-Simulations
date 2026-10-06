@@ -127,35 +127,36 @@ message printed under a failed probe is the reason.
 
 ## 5. Full reference run (batch) and comparison
 
-On the Mac, copy the reference datasets to HPC:
+The 15-direction crack1 run at 500 GHz, then the comparison with the Windows reference as a dependent
+job. The reference CSVs are the ones tracked in the HPC BBRSimulation checkout (`main` holds the same
+bytes as the Mac copies); `hpc/compare_reference.sbatch` checks their sha256 against
+`configs/legacy_reference_500GHz.sha256` before comparing. One paste on the login node:
 
-    scp -r /Users/rohanshenoy/BBRsim/BBRSimulation/data/waveguides/InfParallelPlate_crack1Rohan_500GHz_Ephi=* \
-        rshenoy@login.hpc.caltech.edu:/home/rshenoy/BBRSim/reference/
-
-(Create `/home/rshenoy/BBRSim/reference` on HPC first; use your usual login host if it differs.)
-
-On HPC:
-
-    mkdir -p /home/rshenoy/BBRSim/outputs      # Slurm cannot create its --output directory
-    sbatch hpc/run_frequency.sbatch configs/crack1_500GHz_reference.toml
+    cd /home/rshenoy/BBRSim/Blackbody-Simulations && git pull --ff-only fork linux-hpc-migration
+    A=$(sbatch --parsable -t 02:00:00 hpc/run_frequency.sbatch configs/crack1_500GHz_reference.toml --job-id reference1); A=${A%%;*}; echo "run job $A"
+    sbatch --dependency=afterok:$A --kill-on-invalid-dep=yes hpc/compare_reference.sbatch \
+        /home/rshenoy/BBRSim/outputs/InfParallelPlate_crack1Rohan_500GHz/job_reference1
     squeue -u rshenoy
 
-When it finishes, with `<job>` the job directory named in `/home/rshenoy/BBRSim/outputs/slurm-<id>.out`:
+When both jobs have left the queue:
 
-    for e in 0 1; do
-      python compare_hfss_exports.py "<job>/InfParallelPlate_crack1Rohan_500GHz_Ephi=$e" \
-          "/home/rshenoy/BBRSim/reference/InfParallelPlate_crack1Rohan_500GHz_Ephi=$e" \
-          --json "<job>/comparison_Ephi$e.json"
-    done
+    tail -8 /home/rshenoy/BBRSim/outputs/slurm-<run id>.out
+    cat /home/rshenoy/BBRSim/outputs/slurm-<compare id>.out
 
-Expected: `RESULT: PASS` for both polarizations. Paste both tables into RESULTS.md. If
-transmission fails only at a few angles, report the values and decide the tolerance
-explicitly rather than loosening it silently. Field-distribution lines are warnings only.
+Expected: the run ends with `done; manifest at .../job_reference1/manifest.json`; the comparison prints
+four reference files `OK`, a table and `RESULT: PASS` for each polarization, and
+`COMPARISON PASS`. The JSON records are `<job>/comparison_Ephi{0,1}.json`. If the run fails, Slurm
+cancels the comparison (`--kill-on-invalid-dep`).
 
-Memory (32G) and time (8h) in the batch script are first guesses. Record what this run used,
-the multi-frequency sizing rule depends on it:
+Transmission tolerance: |dT| <= max(1e-3, 0.05 T). The reference's own two physically identical keys,
+(0 deg, 180 deg) for Ephi=0 and (90 deg, 180 deg) for Ephi=1, differ by 5.9 % (separate adaptive meshes per
+polarization; RESULTS.md step 4), so a miss of a few percent at a few keys is within the method's noise.
+Report the values and decide the tolerance explicitly rather than loosening it silently. Field
+distribution lines are warnings only.
 
-    sacct -j <id> -o JobID,State,ExitCode,Elapsed,MaxRSS
+Record what this run used, the multi-frequency sizing rule depends on it:
+
+    sacct -j <run id> -o JobID,State,ExitCode,Elapsed,MaxRSS
     du -sh <job> <job>/project/*.aedtresults
 
 ## 5b. Incident-direction check (batch, no new solve)
