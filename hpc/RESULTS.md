@@ -328,6 +328,45 @@ normalizes a key only when the coherent T exceeds 1, so after loading the two da
 
 ## 5b. Incident-direction check
 
+2026-10-06, job 4073526 (`hpc/check_incident_direction.py` on a copy of `job_reference2`'s solved
+project, code at `ce9fd30`). **PASS.**
+
+    (IWavePhi, IWaveTheta) = (90, 135) deg, Ephi=0, 500 GHz
+    slope_y = 7409.05 rad/m, slope_z = -7408.35 rad/m, k0 = 10479.23 rad/m
+    ratio_ky_over_kz = -1.000095   magnitude_over_k0 = 0.999834
+    verdict: PASS: arrival direction, k = -r_hat(theta, phi)
+    slope_z_negative_as_expected: true
+
+HFSS applies one direction to both angles, and the incident wave travels along -r_hat(theta, phi): the
+incidence definition in the dataset sidecar and BBRsim's azimuth formula are confirmed by data. This
+was the frame contract's last unproven assumption (ledger G4-004, HF-012).
+
+## 5c. crack2 reference run and comparison
+
+2026-10-06, run job 4073527 (`configs/crack2_500GHz_reference.toml`, `--job-id reference1`, code at
+`ce9fd30`) and comparison job 4073528. Run done (solve 95.1 s; Ephi=0 and Ephi=1 converged in 4 passes,
+last delta 0.0087 and 0.0131, about 11.6k elements). Comparison against the Windows crack2 reference:
+
+    reference CSVs: all four sha256 OK; structure (columns, Freq, Ephi, 15 keys, ingoing power
+    1.327209365e-09 W, waveguide and far-field grids): PASS, both polarizations
+    Ephi=0: RESULT: PASS. Transmission 8 pass, 7 below noise floor; max rel diff 0.035 at (0, 90).
+    Ephi=1: RESULT: FAIL. Transmission 7 pass, 7 below noise floor, 1 fail at (90, 90): 0.02906 against
+            0.03169, -8.3 % (grazing incidence); elsewhere within +4.1 %.
+    Fields at the transmitting keys: exit |E| correlation >= 0.998 (0.994 at (90, 90)), far >= 0.998.
+
+    T (phi, theta)  ref E0    cand E0   ref E1    cand E1
+      (0, 45..180)  cand/ref = 1.03501 at every theta for Ephi=0
+      (0, 180)      1.00873   1.04403   7.2e-10   5.5e-09
+      (45, 180)     0.50436   0.52201   0.50140   0.52199
+      (90, 90)      6.1e-10   1.3e-09   0.03169   0.02906
+      (90, 180)     1.5e-09   5.5e-09   1.00280   1.04399
+
+Self-consistency at normal incidence: ours 1.04403 (Ephi=0, (0,180)) and 1.04399 (Ephi=1, (90,180)),
+ratio 1.0000; the Windows reference 1.00873 and 1.00280, ratio 1.0059. Our crack2 transmission is
+3.5 % to 4.1 % above the reference's, uniformly within each polarization, the opposite sign of crack1,
+where the Windows Ephi=0 was 5.54 % high. Per-variation offsets of a few percent in both directions
+point at the convergence target: Delta Mag Energy 0.02 leaves T uncertain by several percent per solve.
+
 ## 6. Round-gap project
 
 ## 7. Round gap, single angle at 2000 GHz
