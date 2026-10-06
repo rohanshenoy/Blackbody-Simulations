@@ -17,7 +17,11 @@
 CONFIG=${1:?config path required}
 shift || true
 
-source /home/rshenoy/BBRSim/bb_env.sh || { echo "ERROR: sourcing /home/rshenoy/BBRSim/bb_env.sh failed" >&2; exit 1; }
+BBSIM_ENV=${BBSIM_ENV:-/home/rshenoy/BBRSim/bb_env.sh}
+source "$BBSIM_ENV" || { echo "ERROR: sourcing $BBSIM_ENV failed" >&2; exit 1; }
+# Slurm exports the submitting shell: a stale PYAEDT_DESKTOP_PORT or PYAEDT_PROCESS_ID would make PyAEDT
+# attach to another desktop instead of starting its own, and the runner refuses to start with them set.
+unset "${!PYAEDT_@}"
 set -eo pipefail
 cd /home/rshenoy/BBRSim/Blackbody-Simulations
 

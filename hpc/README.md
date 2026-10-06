@@ -143,8 +143,11 @@ Expected: `RESULT: PASS` for both polarizations. Paste both tables into RESULTS.
 transmission fails only at a few angles, report the values and decide the tolerance
 explicitly rather than loosening it silently. Field-distribution lines are warnings only.
 
-Memory (32G) and time (8h) in the batch script are first guesses; set them from the
-baseline's `sacct -j <id> --format=MaxRSS,Elapsed` before larger runs.
+Memory (32G) and time (8h) in the batch script are first guesses. Record what this run used,
+the multi-frequency sizing rule depends on it:
+
+    sacct -j <id> -o JobID,State,ExitCode,Elapsed,MaxRSS
+    du -sh <job> <job>/project/*.aedtresults
 
 ## 5b. Incident-direction check (batch, no new solve)
 
