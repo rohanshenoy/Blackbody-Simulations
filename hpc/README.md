@@ -205,6 +205,32 @@ Expected: the four crack2 reference files `OK`, structure checks PASS for both p
 transmission within 5 % wherever light passes; a constant offset of one Windows polarization, as for
 crack1, is the case to look for in the detail. Record `sacct` and `du` as in step 5.
 
+## 5d. Convergence check: both cracks at MaxDeltaE 0.005 (batch)
+
+Steps 5 and 5c showed per-solve offsets of 3.5 % to 5.5 % in T at the reference target (Delta Mag
+Energy 0.02), in both directions. Rohan decided on 2026-10-06 to rerun both cracks once at 0.005
+(`configs/crack{1,2}_500GHz_reference_tight.toml`, up to 20 passes; nothing else differs) before the
+two-crack data tree is built. One paste:
+
+    cd /home/rshenoy/BBRSim/Blackbody-Simulations && git pull --ff-only fork linux-hpc-migration
+    A=$(sbatch --parsable -t 03:00:00 hpc/run_frequency.sbatch configs/crack1_500GHz_reference_tight.toml --job-id tight1); A=${A%%;*}; echo "crack1 run job $A"
+    B=$(sbatch --parsable -t 03:00:00 hpc/run_frequency.sbatch configs/crack2_500GHz_reference_tight.toml --job-id tight1); B=${B%%;*}; echo "crack2 run job $B"
+    squeue -u rshenoy
+
+When both have left the queue, on the login node (each tight run against its 0.02 run, then against
+the Windows reference; sections 1 to 3 of the detail report):
+
+    D=/home/rshenoy/BBRSim/outputs; C1=InfParallelPlate_crack1Rohan_500GHz; C2=InfParallelPlate_crack2_500GHz
+    python hpc/compare_detail.py $D/$C1/job_tight1 --reference-root $D/$C1/job_reference2 | sed -n '/== 1/,/== 4/p'
+    python hpc/compare_detail.py $D/$C1/job_tight1 | sed -n '/== 2/,/== 4/p'
+    python hpc/compare_detail.py $D/$C2/job_tight1 --stem $C2 --reference-root $D/$C2/job_reference1 | sed -n '/== 1/,/== 4/p'
+    python hpc/compare_detail.py $D/$C2/job_tight1 --stem $C2 | sed -n '/== 2/,/== 4/p'
+    sacct -j <crack1 run job>,<crack2 run job> -o JobID,State,ExitCode,Elapsed,MaxRSS
+
+Expected: both runs end `done`; passes completed below 20 with a last delta under 0.005; the T change
+from the 0.02 run to the 0.005 run at the transmitting keys is the 0.02 run's convergence error, and
+the two polarizations at normal incidence stay equal. The tree then takes the better-converged runs.
+
 ## 6. Build the round-gap project (batch, debug QOS)
 
     sbatch -A golwala -p expansion -q debug -N 1 -c 4 --mem=16G -t 00:30:00 \

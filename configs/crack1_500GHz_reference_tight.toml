@@ -1,0 +1,58 @@
+# Convergence check (HPC step 5d, Rohan 2026-10-06): crack1_500GHz_reference.toml with a tighter
+# adaptive target, MaxDeltaE 0.005 instead of 0.02, and up to 20 passes. Nothing else differs
+# (tests/test_config.py pins that), so a comparison with the 0.02 run isolates the convergence target.
+
+# Reproduces InfParallelPlate_crack1Rohan_500GHz_Ephi={0,1} (Windows baseline, AEDT 2023 R2)
+# on Linux with AEDT 2025 R2. Values taken from design crack1Rohan_500GHz in InfParallelPlate.aedt.
+
+[project]
+path = "/home/rshenoy/BBRSim/projects/ParallelPlateGaps.aedt"
+design = "parallel_plate_gap_50um"
+dataset_id = "InfParallelPlate_crack1Rohan"
+aedt_version = "2025.2"
+
+[geometry]
+object = "gap"
+entrance_face = { axis = "z", side = "min" }   # legacy face ID 8, plane wave origin (0.025, 0, 0) mm
+exit_face = { axis = "z", side = "max" }       # legacy face ID 7
+exit_cs_x = [0.0, 0.0, 1.0]
+exit_cs_y = [0.0, 1.0, 0.0]
+expected_box_size_mm = [0.05, 10.0, 1.0]
+expected_face_area_mm2 = 0.5
+symmetry = ["mirror_l", "mirror_g", "end_to_end"]
+
+[excitation]
+ei_v_per_m = 1.0
+theta_lower_deg = 0.0
+theta_upper_deg = 180.0
+theta_step_deg = 45.0
+phi_lower_deg = 0.0
+phi_upper_deg = 90.0
+phi_step_deg = 45.0
+
+[solver]
+frequency_ghz = 500
+max_delta_e = 0.005
+max_passes = 20
+cores = 4
+sweep = "discrete"
+
+[far_field]
+theta_lower_deg = 0.0
+theta_upper_deg = 180.0
+phi_lower_deg = -90.0
+phi_upper_deg = 90.0
+a_mm = 10.0
+b_mm = 0.05
+fineness = 10.0
+min_coarseness_deg = 0.1
+max_coarseness_deg = 5.0
+
+[exit_field]
+manual = true
+resolution_mm = [0.0, 0.1, 0.001]
+
+[output]
+root = "/home/rshenoy/BBRSim/outputs"
+polarizations = [0, 1]
+export_timeout_s = 300.0
