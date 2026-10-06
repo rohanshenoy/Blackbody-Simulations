@@ -367,6 +367,36 @@ ratio 1.0000; the Windows reference 1.00873 and 1.00280, ratio 1.0059. Our crack
 where the Windows Ephi=0 was 5.54 % high. Per-variation offsets of a few percent in both directions
 point at the convergence target: Delta Mag Energy 0.02 leaves T uncertain by several percent per solve.
 
+## 5d. Convergence check (MaxDeltaE 0.005)
+
+2026-10-06, jobs 4075000 (crack1, `configs/crack1_500GHz_reference_tight.toml`) and 4075001 (crack2,
+`configs/crack2_500GHz_reference_tight.toml`), `--job-id tight1`, code at `c465069`. Both COMPLETED.
+
+    crack1: Elapsed 00:08:42, MaxRSS 2.84 GB, solve 340.8 s
+            Ephi=0 9 passes, last delta 0.0036596 (38898 elements); Ephi=1 11 passes, 0.0037117 (64396)
+    crack2: Elapsed 00:14:25, MaxRSS 4.84 GB, solve 613.2 s
+            Ephi=0 13 passes, last delta 0.004126 (107406 elements); Ephi=1 12 passes, 0.00434 (81044)
+
+    T, E along the gap at normal incidence      Ephi=0 (0,180)   Ephi=1 (90,180)   ratio
+      crack1 tight                              0.99234          0.99120           1.0011
+      crack1 at 0.02 (reference2)               0.99605          0.99937           0.9967
+      crack1 Windows (2023 R2)                  1.05451          0.99607           1.0587
+      crack2 tight                              0.99226          0.99305           0.9992
+      crack2 at 0.02 (reference1)               1.04403          1.04399           1.0000
+      crack2 Windows (2023 R2)                  1.00873          1.00280           1.0059
+
+    tight against the 0.02 run, transmitting keys: crack1 -0.82 % to +0.13 %; crack2 -4.96 % to -1.47 %,
+      except the grazing key (90, 90) Ephi=1, +10.3 %
+    tight against Windows, transmitting keys: crack1 Ephi=1 -0.49 % to +0.18 %, crack1 Ephi=0 -5.90 % at
+      phi = 0 (the Windows Ephi=0 offset) and -3.5 % to -2.0 % at phi = 45; crack2 -1.63 % to +1.19 %
+
+At the reference target 0.02 a solve can carry about 5 % error in T (crack2 at 0.02, and the Windows
+crack1 Ephi=0 set); at 0.005 both cracks converge, the two separately meshed polarizations agree to
+0.1 %, and the 2025 R2 data agree with the Windows data within 1.6 % everywhere except the Windows crack1
+Ephi=0 set. Both cracks give T = 0.992 at normal incidence. Cost at 500 GHz against 0.02: crack1 1.5x
+the wall time and 1.4x the memory, crack2 about 3.5x and 2.4x. Per HF-025 the two-crack tree takes the
+tight runs.
+
 ## 6. Round-gap project
 
 ## 7. Round gap, single angle at 2000 GHz
