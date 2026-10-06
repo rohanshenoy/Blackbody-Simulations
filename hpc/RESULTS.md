@@ -147,9 +147,17 @@ progress 1.0) and was marked `Finished` at 13:10:42 without solving a variation.
 holds no AEDT message at all: PyAEDT prints "Non-graphical mode detected. Disabling Desktop logs." at
 startup and stops forwarding AEDT's message window, so the solver's reason was never written down.
 
-Open: why both the nominal solve and the sweep aborted before starting (the HFSS solver licence or the
-solver launch are the candidates; the physics setup was saved as intended). Next: the Ansys licensing
-client logs under `~/.ansys`, then step 4 as `baseline2`, which now records AEDT's messages and fails
+Licensing client log `~/.ansys/ansyscl.hpc-25-06.1731008.39413.log` (2026-10-06): the licence is not
+the cause. At 13:09:42 the solver engine (`HFSSCOMENGINE.EXE`, pid 1732508, "Using HPC Parametric
+context") checked out `elec_solve_hfss` (1/1/1/25: granted, 1 of 25 in use) and the HPC pack features
+`elec_solve_level2` and `elec_solve_level1` (1 of 30 each); it checked them in at 13:10:19 after 37 s,
+having produced no mesh and no pass. A second engine (pid 1735543, the sweep) checked the same features
+out and in twice between 13:10:24 and 13:10:42 and shut down at 13:10:43; the final check-ins show
+0 in use. No `DENIED` anywhere. So the solver started twice with its licences and aborted each time
+before writing anything: a meshing or validation error, or a failure to launch the solver's worker
+processes on the node; the reason was in AEDT's message window, which nothing recorded.
+
+Open: that reason. Next: step 4 as `baseline2`, whose log now carries AEDT's messages and which fails
 fast when the solve produces nothing.
 
 ## 5. Full reference run and comparison
