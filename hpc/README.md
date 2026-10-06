@@ -185,6 +185,26 @@ exit code: the ratio cannot tell k from -k, and under HFSS's e^{+jwt} a wave ent
 negative z slope. `false` means the wave runs out of the gap or the phasors use e^{-jwt}: stop and
 tell the BBRsim side, as for `ALTERNATIVE`.
 
+## 5c. crack2 reference run and comparison (batch)
+
+The 15-direction crack2 run at 500 GHz (`configs/crack2_500GHz_reference.toml`, the Windows baseline's
+settings), compared with the Windows crack2 reference exactly as in step 5. Rohan decided on 2026-10-06
+that BBRsim moves both cracks to 2025 R2 data in one commit if crack2 compares cleanly. One paste:
+
+    cd /home/rshenoy/BBRSim/Blackbody-Simulations && git pull --ff-only fork linux-hpc-migration
+    B=$(sbatch --parsable -t 02:00:00 hpc/run_frequency.sbatch configs/crack2_500GHz_reference.toml --job-id reference1); B=${B%%;*}; echo "crack2 run job $B"
+    sbatch --dependency=afterok:$B --kill-on-invalid-dep=yes hpc/compare_reference.sbatch \
+        /home/rshenoy/BBRSim/outputs/InfParallelPlate_crack2_500GHz/job_reference1 InfParallelPlate_crack2_500GHz
+
+When both jobs have left the queue:
+
+    grep -v "^ \|^Loading" /home/rshenoy/BBRSim/outputs/slurm-<compare id>.out
+    python hpc/compare_detail.py /home/rshenoy/BBRSim/outputs/InfParallelPlate_crack2_500GHz/job_reference1 --stem InfParallelPlate_crack2_500GHz
+
+Expected: the four crack2 reference files `OK`, structure checks PASS for both polarizations, and
+transmission within 5 % wherever light passes; a constant offset of one Windows polarization, as for
+crack1, is the case to look for in the detail. Record `sacct` and `du` as in step 5.
+
 ## 6. Build the round-gap project (batch, debug QOS)
 
     sbatch -A golwala -p expansion -q debug -N 1 -c 4 --mem=16G -t 00:30:00 \
