@@ -320,6 +320,12 @@ the reference's Ephi=1 within 0.33 %. The five failing keys are the Windows Ephi
 this documented exception, a tolerance change, or a convergence study first: Rohan's decision.
 Comparison records: `/home/rshenoy/BBRSim/outputs/InfParallelPlate_crack1Rohan_500GHz/job_reference2/comparison_Ephi{0,1}.json`.
 
+**Step 5: PASS with a recorded exception** (decided by Rohan, 2026-10-06). The five Ephi=0 keys at
+phi = 0 and (45, 180) differ from the Windows reference by its own constant 5.54 % Ephi=0 offset; the
+transmission tolerance stays at 5 % for later comparisons. Note from the BBRsim side: its loader
+normalizes a key only when the coherent T exceeds 1, so after loading the two datasets differ at
+(0, 180) by 0.4 %, not zero (legacy 1.05451 becomes 1; reference2's 0.99605 stays).
+
 ## 5b. Incident-direction check
 
 ## 6. Round-gap project

@@ -163,11 +163,16 @@ Record what this run used, the multi-frequency sizing rule depends on it:
 
 ## 5b. Incident-direction check (batch, no new solve)
 
-After step 5, with `<job>` the step-5 job directory named in its `slurm-<id>.out`:
+After step 5, on a copy of its solved project (the script switches the field type while exporting and
+never saves, but the job's own project stays untouched this way). One paste on the login node:
 
+    J=/home/rshenoy/BBRSim/outputs/InfParallelPlate_crack1Rohan_500GHz/job_reference2
+    mkdir $J/incident_check && cp -r $J/project/ParallelPlateGaps.aedt $J/project/ParallelPlateGaps.aedtresults $J/incident_check/
     sbatch -A golwala -p expansion -q debug -N 1 -c 4 --mem=16G -t 00:30:00 \
         -o /home/rshenoy/BBRSim/outputs/slurm-%j.out \
-        --wrap 'bash -lc "source /home/rshenoy/BBRSim/bb_env.sh && cd /home/rshenoy/BBRSim/Blackbody-Simulations && python hpc/check_incident_direction.py --project <job>/project/ParallelPlateGaps.aedt --design parallel_plate_gap_50um_500GHz --out <job>/incident_direction.json"'
+        --wrap "bash -lc 'source /home/rshenoy/BBRSim/bb_env.sh && cd /home/rshenoy/BBRSim/Blackbody-Simulations && python hpc/check_incident_direction.py --project $J/incident_check/ParallelPlateGaps.aedt --design parallel_plate_gap_50um_500GHz --out $J/incident_direction.json'"
+
+Then `cat $J/incident_direction.json`.
 
 Expected: exit 0, `"verdict": "PASS: arrival direction, k = -r_hat(theta, phi)"`, `ratio_ky_over_kz`
 near -1 and `magnitude_over_k0` near 1. `ALTERNATIVE` (ratio near +1) means HFSS uses the other
