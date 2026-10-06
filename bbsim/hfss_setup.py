@@ -157,6 +157,28 @@ def solve(hfss: Any, cores: int) -> bool:
     return bool(hfss.analyze(cores=cores))
 
 
+def aedt_messages(hfss: Any) -> list[str]:
+    """Every entry of AEDT's message manager for the open design (all severities), or one line saying why not.
+
+    The solver's own reasons (licence, validation, mesh) live only here; PyAEDT's analyze() does not
+    surface them and reports "solved correctly" from the elapsed time alone.
+    """
+    try:
+        return [str(m) for m in hfss.odesktop.GetMessages(hfss.project_name, hfss.design_name, 0)]
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not fail the run
+        return [f"(AEDT message manager unavailable: {type(exc).__name__}: {exc})"]
+
+
+def solved_variations(hfss: Any, solution: str) -> list[str]:
+    """AEDT's solved-variation strings for a solution, e.g. ``["Ephi='0'", "Ephi='1'"]``; empty when nothing was solved."""
+    return [str(v) for v in hfss.odesign.GetModule("Solutions").GetAvailableVariations(solution)]
+
+
+def missing_polarizations(variations: Collection[str], polarizations: Collection[int]) -> list[int]:
+    """Requested Ephi values with no solved variation (``Ephi='n'`` appears in none of the strings)."""
+    return [int(p) for p in polarizations if not any(f"Ephi='{int(p)}'" in v for v in variations)]
+
+
 def export_convergence_text(hfss: Any, setup: str, variation: str, path: Path) -> str:
     """Convergence table for one variation (e.g. ``"Ephi='0'"``); never fails the run."""
     try:

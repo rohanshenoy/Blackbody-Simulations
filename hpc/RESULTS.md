@@ -116,9 +116,33 @@ Fix (this branch, with this entry): `evaluate_outgoing_power` writes each value 
 (the intrinsics plus `Phase='0deg'`, as PyAEDT passes them) and reads it with `read_calculator_scalar`.
 The fake AEDT used by the tests now refuses `ClcEval` and `GetTopEntryValue` the way gRPC does.
 
-Open: whether the 66.6 s solve left complete field data for both polarizations (step 4a answers it on
-`job_baseline1` without a new solve), and why the Slurm job stayed alive after Python released the
-desktop at 13:10:47 (`sacct` end time to record). Next: step 4a, then step 4 as `baseline2`.
+Step 4a (2026-10-06, job 4064670, hpc-22-18, code at `893f4f6`), the extraction diagnostic on a copy
+of `job_baseline1`: **the solve produced no solution.** The results folder holds 20 files, 0.0 MB
+(bookkeeping `.asol` files, geometry caches, one `opti906_0.profile` of 1 KB written at 13:10:42, no
+mesh, no fields); `Solutions.GetAvailableVariations("500GHz : LastAdaptive")` is empty; the Ephi=0
+convergence table reads `Completed : N/A` with no pass rows; the profile is empty ("There is no profile
+data to be exported"). `AnalyzeAll(blocking)` returned after 66 s without having run an adaptive pass,
+and PyAEDT logged "solved correctly" from the elapsed time alone. The setup (`500GHz`, MaxDeltaE 0.02,
+10 passes) and the parametric sweep (`E_phi_sweep_500GHz`, SaveFields true, enabled) were saved as
+intended. So the ClcEval failure of baseline1 followed from having no data; whether the stack
+read-back also fails over gRPC with data present (what PyAEDT and pyEPR document) is untested, and the
+`CalculatorWrite` path stays as the sanctioned one. `sacct`: job 4005538 `FAILED 1:0`, 13:08:22 to
+13:10:49, MaxRSS 1.72 GB; it ended two seconds after Python did (the "still running" impression was
+those seconds).
+
+Two defects in the diagnostic itself: a PyAEDT-wrapped `export_mesh_stats` call raised, and PyAEDT's
+default `settings.release_on_exception` then closed the desktop, so the extraction test never ran; and
+`.profile` files were not printed. Fixed with the runner change below.
+
+Runner change (this entry's commit): after the solve the runner reads AEDT's message manager into
+the log, asks the Solutions module for the solved variations, and stops with a RuntimeError naming the
+missing polarizations and quoting AEDT's messages when any requested `Ephi='n'` is absent; the manifest
+records `solver.solved_variations`; `aedt_session` sets `settings.release_on_exception = False` so
+PyAEDT never closes the desktop behind the runner's back.
+
+Open: why AEDT solved nothing (first use of the HFSS solver licence; the solver's reason should be in
+`opti906_0.profile` and in `slurm-4005538.out`). Next: read those two files, then step 4 as `baseline2`,
+which now fails fast with AEDT's messages if the solve produces nothing.
 
 ## 5. Full reference run and comparison
 

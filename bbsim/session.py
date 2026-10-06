@@ -49,8 +49,12 @@ def aedt_session(project_path: Path | None, design: str | None, version: str = "
     ``project_path=None`` starts with a new empty project (used by the smoke test).
     ``new_desktop=True`` guarantees we never attach to someone else's AEDT process.
     """
-    from ansys.aedt.core import Hfss  # lazy: the pure modules must import without PyAEDT
+    from ansys.aedt.core import Hfss, settings  # lazy: the pure modules must import without PyAEDT
 
+    # On an exception inside one of its own methods PyAEDT releases every desktop it knows (HPC step 4a lost
+    # its session to a failed mesh-statistics export). This session owns the desktop; it is released here.
+    if hasattr(settings, "release_on_exception"):
+        settings.release_on_exception = False
     wanted = dict(
         project=str(project_path) if project_path is not None else None,
         design=design,

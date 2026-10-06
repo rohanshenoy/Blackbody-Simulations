@@ -77,6 +77,7 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
         EXIT_CS,
         EXIT_FACE_LIST,
         add_outgoing_power_expression,
+        aedt_messages,
         assign_radiation_boundaries,
         clear_boundaries_and_excitations,
         create_plane_wave,
@@ -84,9 +85,11 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
         export_convergence_text,
         initialize_variables,
         insert_far_field_sphere,
+        missing_polarizations,
         reset_initial_mesh_settings,
         set_total_fields,
         solve,
+        solved_variations,
     )
     from bbsim.inventory import object_record
     from bbsim.session import aedt_session, aedt_versions
@@ -163,6 +166,21 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
             raise RuntimeError("hfss.analyze returned False")
         solve_s = time.perf_counter() - t_solve
         log.info("solve finished in %.1f s", solve_s)
+        # analyze() returning True proves nothing (HPC step 4, baseline1: 66 s, no adaptive pass, no fields).
+        # Ask AEDT what it solved, and keep its own messages: the solver's reason lives only there.
+        messages = aedt_messages(hfss)
+        for message in messages:
+            # AEDT tags its entries [info], [warning], [error]; its errors are warnings here because the
+            # runner decides below what is fatal.
+            (log.warning if "[error]" in message or "[warning]" in message else log.info)("aedt: %s", message)
+        variations = solved_variations(hfss, ctx.solution)
+        log.info("solved variations of %s: %s", ctx.solution, variations)
+        missing = missing_polarizations(variations, cfg.output.polarizations)
+        if missing:
+            raise RuntimeError(
+                f"no solved variations for Ephi={missing} in {ctx.solution!r}: AEDT holds {variations}; "
+                f"the solve ran for {solve_s:.1f} s without producing them. AEDT messages: " + " | ".join(messages)
+            )
 
         exit_point_counts: dict[int, dict] = {}
         for ephi in cfg.output.polarizations:
@@ -221,7 +239,7 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
                 "max_delta_e": cfg.solver.max_delta_e, "max_passes": cfg.solver.max_passes, "cores": cfg.solver.cores,
                 "initial_mesh_settings": {"requested": mesh_requested, "inherited_from_base_design": mesh_inherited},
                 "boundaries": {"rbin": "Radiation on entrance", "rbout": "Radiation on exit", "other faces": "default PEC"},
-                "convergence": convergence},
+                "solved_variations": variations, "convergence": convergence},
         far_field={"sphere": sphere, "theta_step_deg": grid.theta_step_deg, "phi_step_deg": grid.phi_step_deg,
                    "points_per_angle": grid.points_per_angle, "coordinate_system": EXIT_CS, "radiation_surface": EXIT_FACE_LIST,
                    "theta_deg": _axis_summary(grid.theta_values, grid.theta_step_deg),

@@ -114,7 +114,11 @@ writing the CSV tables beside it. Debug QOS, no solver licence:
       --wrap 'bash -lc "source /home/rshenoy/BBRSim/bb_env.sh && cd /home/rshenoy/BBRSim/Blackbody-Simulations && python hpc/diagnose_calculator.py --job /home/rshenoy/BBRSim/outputs/InfParallelPlate_crack1Rohan_500GHz/job_baseline1"'
 
 Expected in `/home/rshenoy/BBRSim/outputs/diag-<id>.out`: `FIELDS: present`, one `T=` line per
-polarization, and `EXTRACTION PASS`; the tables are in `<job>/diagnose_<utc>/`.
+polarization, and `EXTRACTION PASS`; the tables are in `<job>/diagnose_<utc>/`. `FIELDS: not
+confirmed (solved variations: [])` with a results folder of a few kilobytes means the solve itself
+produced nothing (baseline1, RESULTS.md step 4); the solver's reason is in the results folder's
+`opti*.profile` and in the job's `slurm-<id>.out`, both printed by the diagnostic or readable with
+`cat` on the login node.
 
 ## 5. Full reference run (batch) and comparison
 

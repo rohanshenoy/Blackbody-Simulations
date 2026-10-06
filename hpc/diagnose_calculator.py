@@ -46,7 +46,7 @@ from bbsim.naming import (  # noqa: E402
 from bbsim.readers import read_exit_field_fld, wait_for_file  # noqa: E402
 from bbsim.sampling import far_field_grid, incident_angle_values, incoming_power_w  # noqa: E402
 
-TEXT_SUFFIXES = {".log", ".txt", ".prof", ".err", ".out"}
+TEXT_SUFFIXES = {".log", ".txt", ".prof", ".err", ".out", ".profile", ".asol"}
 MAX_TEXT_BYTES = 200_000
 PROBE_WAIT_S = 60.0
 
@@ -83,7 +83,7 @@ def list_results(results: Path, limit: int = 80) -> dict:
     tails: dict[str, list[str]] = {}
     for p in files:
         if p.suffix.lower() in TEXT_SUFFIXES and p.stat().st_size <= MAX_TEXT_BYTES:
-            tail = p.read_text(errors="replace").splitlines()[-25:]
+            tail = p.read_text(errors="replace").splitlines()[-40:]
             tails[str(p.relative_to(results))] = tail
             print(f"-- tail of {p.relative_to(results)}")
             for line in tail:
@@ -93,11 +93,8 @@ def list_results(results: Path, limit: int = 80) -> dict:
 
 def messages(hfss, seen: set) -> list[str]:
     """AEDT message-manager entries not printed before (all severities)."""
-    try:
-        new = [str(m) for m in hfss.odesktop.GetMessages(hfss.project_name, hfss.design_name, 0)]
-    except Exception as exc:  # noqa: BLE001
-        return [f"(GetMessages failed: {type(exc).__name__}: {exc})"]
-    out = [m for m in new if m not in seen]
+    from bbsim.hfss_setup import aedt_messages
+    out = [m for m in aedt_messages(hfss) if m not in seen]
     seen.update(out)
     return out
 
@@ -214,6 +211,10 @@ def main(argv: list[str] | None = None) -> int:
     report["results_folder"] = list_results(results)
 
     dest = job / f"diagnose_{utc_stamp()}"
+    n = 0
+    while dest.exists():  # a second diagnostic within the same second
+        n += 1
+        dest = job / f"diagnose_{utc_stamp()}_{n}"
     dest.mkdir()
     scratch = dest / "scratch"
     scratch.mkdir()
@@ -233,11 +234,11 @@ def main(argv: list[str] | None = None) -> int:
         extract_waveguide,
     )
     from bbsim.geometry import select_faces
-    from bbsim.hfss_setup import EXIT_CS, export_convergence_text
+    from bbsim.hfss_setup import EXIT_CS, aedt_messages, export_convergence_text, solved_variations
     from bbsim.session import aedt_session, aedt_versions  # lazy PyAEDT import
 
     seen: set = set()
-    solved_variations = None
+    solved = None
     extraction_ok = False
     try:
         with aedt_session(dest / src.name, design, args.aedt_version) as hfss:
@@ -250,8 +251,8 @@ def main(argv: list[str] | None = None) -> int:
             probe("designs", "designs", lambda: list(hfss.design_list))
             probe("setups", "setups", lambda: list(hfss.odesign.GetModule("AnalysisSetup").GetSetups()))
             probe("solutions", "solutions", lambda: list(hfss.existing_analysis_sweeps))
-            solved_variations = probe("solved_variations", f"solved variations of {solution} (Solutions.GetAvailableVariations)",
-                                      lambda: [str(v) for v in hfss.osolution.GetAvailableVariations(solution)])
+            solved = probe("solved_variations", f"solved variations of {solution} (Solutions.GetAvailableVariations)",
+                           lambda: solved_variations(hfss, solution))
             probe("available_variations", "PyAEDT available_variations.variations",
                   lambda: hfss.available_variations.variations(solution))
             probe("simulations_running", "simulations running", lambda: hfss.are_there_simulations_running)
@@ -277,10 +278,6 @@ def main(argv: list[str] | None = None) -> int:
                 if text:
                     for line in text.splitlines()[-6:]:
                         print("     " + line)
-                probe(f"profile_{ephi}", f"solver profile {variation}",
-                      lambda v=variation, e=ephi: file_tail(Path(hfss.export_profile(setup, v, str(dest / f"profile_Ephi{e}.prof")))))
-                probe(f"mesh_stats_{ephi}", f"mesh statistics {variation}",
-                      lambda v=variation, e=ephi: file_tail(Path(hfss.export_mesh_stats(setup, v, str(dest / f"mesh_Ephi{e}.ms")))))
 
             print("== 3. the runner's extraction on the solved copy")
             exc = cfg.excitation
@@ -343,6 +340,14 @@ def main(argv: list[str] | None = None) -> int:
                     else:
                         extraction_ok = False
 
+            print("== 3b. solver profile and mesh statistics (after the extraction: a failing export must not pre-empt it)")
+            for ephi in (0, 1):
+                variation = f"Ephi='{ephi}'"
+                probe(f"profile_{ephi}", f"solver profile {variation}",
+                      lambda v=variation, e=ephi: file_tail(Path(hfss.export_profile(setup, v, str(dest / f"profile_Ephi{e}.prof")))))
+                probe(f"mesh_stats_{ephi}", f"mesh statistics {variation}",
+                      lambda v=variation, e=ephi: file_tail(Path(hfss.export_mesh_stats(setup, v, str(dest / f"mesh_Ephi{e}.ms")))))
+
             print("== 4. legacy read-back, for the record (expected to fail over gRPC)")
             fields = hfss.odesign.GetModule("FieldsReporter")
             legacy_args = intrinsics(0, label, float(phi_values[0]), float(theta_values[0]))
@@ -363,8 +368,9 @@ def main(argv: list[str] | None = None) -> int:
         (dest / "diagnose.json").write_text(json.dumps(report, indent=2, default=str) + "\n")
         print(f"report written to {dest / 'diagnose.json'}")
 
-    fields_present = bool(solved_variations) or any(report.get(f"power_{e}", {}).get("ok") for e in (0, 1))
-    print(f"FIELDS: {'present' if fields_present else 'not confirmed'} (solved variations: {solved_variations})")
+    power_ok = [e for e in (0, 1) if report.get(f"power_{e}", {}).get("ok")]
+    verdict = "present" if solved else ("evaluated but AEDT lists no solved variation" if power_ok else "not confirmed")
+    print(f"FIELDS: {verdict} (solved variations: {solved}; power evaluated for Ephi={power_ok})")
     print(f"EXTRACTION {'PASS' if extraction_ok else 'FAIL'}: tables in {dest}")
     return 0 if extraction_ok else 1
 
