@@ -140,9 +140,17 @@ missing polarizations and quoting AEDT's messages when any requested `Ephi='n'` 
 records `solver.solved_variations`; `aedt_session` sets `settings.release_on_exception = False` so
 PyAEDT never closes the desktop behind the runner's back.
 
-Open: why AEDT solved nothing (first use of the HFSS solver licence; the solver's reason should be in
-`opti906_0.profile` and in `slurm-4005538.out`). Next: read those two files, then step 4 as `baseline2`,
-which now fails fast with AEDT's messages if the solve produces nothing.
+`opti906_0.profile` (2026-10-06): the Optimetrics run's record. Host hpc-25-06, HFSS 2025.2.0; the
+sweep started at 13:10:19 PDT, ran two phases (13:10:19 to 13:10:24, progress 0; 13:10:24 to 13:10:42,
+progress 1.0) and was marked `Finished` at 13:10:42 without solving a variation. Between 13:09:37 and
+13:10:19 `Analyze All` spent 42 s on the nominal setup and left no mesh and no pass. `slurm-4005538.out`
+holds no AEDT message at all: PyAEDT prints "Non-graphical mode detected. Disabling Desktop logs." at
+startup and stops forwarding AEDT's message window, so the solver's reason was never written down.
+
+Open: why both the nominal solve and the sweep aborted before starting (the HFSS solver licence or the
+solver launch are the candidates; the physics setup was saved as intended). Next: the Ansys licensing
+client logs under `~/.ansys`, then step 4 as `baseline2`, which now records AEDT's messages and fails
+fast when the solve produces nothing.
 
 ## 5. Full reference run and comparison
 
