@@ -499,4 +499,27 @@ a single-angle 2.5 deg check that 5 deg has converged.
 
 ## 8. Round gap, full sweep
 
+2026-10-07, code `18ff009`, both at MaxDeltaE 0.005 and both polarizations: job 4176305 (`reference1`, the
+15-direction sweep at 5 deg facets) and job 4176308 (`roundgap3_facets2p5`, single angle at 2.5 deg). Both
+COMPLETED. PASS: the round gap's first dataset, `/home/rshenoy/BBRSim/outputs/RoundGap_r50um_2000GHz/job_reference1`.
+
+    step 8: 00:04:16, MaxRSS 2.47 GB, solve 171 s; wall facets 5 deg (read back)
+    sidecar: 7845 per key, disc radius 5e-05 m, TE11, 1 propagating mode
+    Ephi=0: 117675 rows, 15 keys x 7845; T at theta 180, phi 0/45/90: 0.51013 0.51031 0.51001;
+            rim zeroed <= 1, dropped <= 58 per key; 5 passes, last delta 0.0025 (21999 tets)
+    Ephi=1: 117675 rows, 15 keys x 7845; T at theta 180, phi 0/45/90: 0.50977 0.50976 0.50986;
+            rim zeroed <= 1, dropped <= 61 per key; 5 passes, last delta 0.0029 (21956 tets)
+    spread of the six normal-incidence T: 0.108 %
+
+    faceting check, single angle: 5 deg (step 7b) T 0.50958 / 0.50969, 97 s;
+                                  2.5 deg 00:05:03, MaxRSS 3.14 GB, T 0.51139 / 0.51111, 216 s, 4 passes,
+                                  last delta 0.0010 (33559 tets)
+    FACETS: T 2.5 deg / 5 deg = 1.00354 (Ephi=0), 1.00278 (Ephi=1)
+
+At normal incidence the round gap prefers no polarization and no azimuth: the six values agree to 0.11 %, and
+the sweep's normal-incidence T matches the single-angle 5 deg run to 0.1 %. 2.5 deg moves T by 0.3 %, inside the
+0.5 % criterion, so 5 deg stands (HF-032); the change from the default (+7.0 %) to 5 deg and on to 2.5 deg
+(+0.3 %) is consistent with an error falling as the square of the facet angle, which puts 5 deg about 0.3 to
+0.5 % below the converged T, within the 1 % that MaxDeltaE 0.005 aims for (HF-027).
+
 ## Discrepancies and decisions
