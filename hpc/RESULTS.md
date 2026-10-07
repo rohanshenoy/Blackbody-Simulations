@@ -397,9 +397,82 @@ Ephi=0 set. Both cracks give T = 0.992 at normal incidence. Cost at 500 GHz agai
 the wall time and 1.4x the memory, crack2 about 3.5x and 2.4x. Per HF-025 the two-crack tree takes the
 tight runs.
 
+## 5e. Two-crack 500 GHz data tree
+
+2026-10-06, login node, from the step 5d runs (`job_tight1` of both cracks), per Rohan's data decisions
+(ledger G4-016, HF-023, HF-025; record HF-028): `/resnick/groups/golwala/rshenoy/bbsim/trees/cracks_500GHz_2025r2`,
+the data root BBRsim reads through `/bbr/dataDir` or `BBRSIMDATA`.
+
+    sha256sum: all OK
+    waveguides/: InfParallelPlate_crack1Rohan_500GHz{.dataset.json, _Ephi=0, _Ephi=1}
+                 InfParallelPlate_crack2_500GHz{.dataset.json, _Ephi=0, _Ephi=1}
+    SHA256SUMS: 14 files; du -sh 252M (108.6 + 143.0 MiB, the per-crack sizes measured before)
+
+The tight runs against the Windows reference (jobs 4077456 crack1 and 4077457 crack2, each writing
+`comparison_Ephi{0,1}.json` into its `job_tight1`):
+
+    crack1 Ephi=0: FAIL, transmission 3 pass, 7 below noise floor, 5 fail at (0,45) (0,90) (0,135) (0,180)
+                   (45,180), max rel diff 0.059 at (0,135); fields WARN only
+    crack1 Ephi=1: PASS (fields WARN only)
+    crack2 Ephi=0 and Ephi=1: PASS (fields WARN only)
+
+The five crack1 Ephi=0 failures are the keys of step 5's accepted exception, the Windows Ephi=0 set's constant
+offset (HF-021); the field warnings come from the keys below the noise floor, as in step 5. The tree went to the
+BBRsim side (HF-028), whose HPC validation is `g4_full_check.sbatch` followed by `g4_tree_check.sbatch` (G4-018).
+
 ## 6. Round-gap project
 
+2026-10-06, job 4077741 (debug QOS, chained with steps 7 and 8, code `c8519be`): COMPLETED in 00:01:18,
+MaxRSS 1.42 GB. PASS.
+
+    Build verified: /resnick/home/rshenoy/BBRSim/projects/RoundGap.aedt
+    RoundGap.build.json: verification_differences [], error None
+    RoundGap.inventory.json: design round_gap_r50um, units mm, object gap [vacuum],
+                             bounding box [-0.05, -0.05, 0.0, 0.05, 0.05, 0.4], 3 faces
+
 ## 7. Round gap, single angle at 2000 GHz
+
+2026-10-06, job 4077742 (`roundgap1`, Ephi=0): FAILED after 00:02:12 (MaxRSS 1.84 GB) at the first exit-field
+export after the solve:
+
+    FieldFileError: exit field for phi=0.0 theta=180.0 Ephi=0: 50 exit points lie outside the declared disc
+    cross-section; HFSS must write nan, not values, outside the solid
+
+Step 8 (job 4077743) was cancelled by its dependency, as designed. The runner had already deleted the raw
+export; step 7a found the cause.
+
+## 7a. Exit-lattice diagnostic
+
+2026-10-06, job 4089551 (`diag_exitgrid1`, code `e173f1e`): the runner unchanged on the single-angle config
+with both polarizations, every raw export kept, the containment check reported instead of raised. COMPLETED
+in 00:02:12, MaxRSS 1.81 GB.
+
+                                              Ephi=0           Ephi=1
+    lattice rows (101 x 101)                  10201            10201
+    lattice points inside the disc            7845 (20 on the rim)
+    inside with field                         7783             7786
+    inside without field (holes)              62, to 756 nm    59, to 523 nm inside the rim
+    outside with field (spill)                50, to 912 nm    56, to 1078 nm beyond it
+    rim points with field                     7 of 20          7 of 20
+    |E| at spill / median within 2 um inside  0.999 (0.03-1.38) 0.984 (0.03-1.46)
+
+The two exports share the lattice but not the pattern (3 holes and 8 spill points differ). HFSS meshes the
+circle as a polygon (the runner keeps curvilinear elements off, as in the crack reference designs), so its
+wall cuts up to about 0.76 um inside the circle, and the export gives points up to about 1 um beyond it the
+field of the edge elements: the spill is the field, not junk. Even without the containment check the run
+could not have been written: the polarizations' valued counts differ (7833 and 7842), and BBRsim pairs their
+rows by position.
+
+Decisions (Rohan, 2026-10-06):
+- Rim rule (ledger HF-029): for a disc, every lattice point inside it is kept for every key and both
+  polarizations (7845 at R = 50 um and a 1 um step), in export order; valued points outside are dropped;
+  inside points without field get zero field, which BBRsim never samples (its loader accepts them, confirmed
+  by the Geant4 session); anything more than 5 % of R beyond or inside the rim stops the run; `manifest.json`
+  `exit_field.rim` records the counts per key and polarization. Rectangles are unchanged.
+- Wall facets (ledger HF-030): measure first (step 7b), the single-angle run as configured and with
+  `solver.wall_normal_deviation_deg = 5.0`, both polarizations; then choose for step 8.
+
+## 7b. Wall facets
 
 ## 8. Round gap, full sweep
 

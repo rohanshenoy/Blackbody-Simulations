@@ -258,6 +258,10 @@ non-planar face" are expected: the two vertex-free end caps and the curved side 
 
 ## 7. Round gap, single angle at 2000 GHz
 
+The first run (job 4077742, `roundgap1`, 2026-10-06) solved and then stopped at the rim of the disc; step 7a
+found why, and the rim rule (ledger HF-029) fixed it. Step 7b runs this config again beside a fine-facet
+variant; this section keeps the single-run check.
+
     sbatch -t 02:00:00 hpc/run_frequency.sbatch configs/round_gap_r50um_2000GHz_single_angle.toml --job-id roundgap1
 
 When it finishes:
@@ -273,9 +277,10 @@ When it finishes:
     print(sum("all-nan rows" in line for line in open(f"{job}/logs/run.log")))
     PY
 
-Expected: `N 1369 <T>` with N from 7825 to 7845 (twenty lattice points lie exactly on the rim, four on
-the axes and sixteen off them; 7845 means HFSS kept them all, 7825 none; record the exact N), T strictly
-between 0 and 1, then the same N,
+Expected: `7845 1369 <T>`, T strictly between 0 and 1: every lattice point inside the disc, twenty of them
+exactly on the rim (rim rule, Rohan 2026-10-06, ledger HF-029: HFSS meshes the circle as a polygon, so some
+inside points get no field and are written with zero field, and some just outside get field and are dropped;
+`manifest.json` `exit_field.rim` counts both per key and polarization). Then the same 7845,
 `{'shape': 'disc', 'radius_m': 5e-05}` (to rounding), `TE11 1`, then `0`. A non-zero last line means
 `logs/run.log` holds the reader's warning that HFSS wrote outside lattice points as rows other than
 nine tokens; those points are still skipped and the run stands, but copy the warning into RESULTS.md.
@@ -298,7 +303,7 @@ the rim:
 When it has left the queue (same shell, or put the job number in place of `$D`):
 
     sacct -j $D -o JobID,State,ExitCode,Elapsed,MaxRSS
-    grep -E "^containment" /home/rshenoy/BBRSim/outputs/slurm-$D.out
+    grep -E "^(containment|rim rule)" /home/rshenoy/BBRSim/outputs/slurm-$D.out
     sed -n '/^== runner exit status/,$p' /home/rshenoy/BBRSim/outputs/slurm-$D.out
 
 Expected: one `containment` line per polarization; then per export the valued and nan lattice points inside
@@ -306,6 +311,65 @@ and outside the disc (7845 lattice points lie inside it, 20 of them on the rim),
 valued outside points lie, |E| there against the ring just inside the rim, and whether the two polarizations'
 valued points inside the disc are the same set; a closing `EXIT GRID:` line. The job directory
 `job_diag_exitgrid1` keeps the outside points in its tables and is not a dataset.
+
+## 7b. Wall facets: the round gap as configured and with fine facets (batch)
+
+Step 7a showed HFSS's default faceting puts the wall up to 0.76 um inside the 50 um circle, and 2000 GHz is
+only 14 % above the TE11 cutoff, where T may depend on the effective radius. Rohan, 2026-10-06 (ledger
+HF-030): measure it before step 8. Two single-angle runs at normal incidence with both polarizations,
+identical except `solver.wall_normal_deviation_deg = 5.0` (72 facets around the circle) in the second:
+
+    cd /home/rshenoy/BBRSim/Blackbody-Simulations && git pull --ff-only fork linux-hpc-migration
+    A=$(sbatch --parsable -t 02:00:00 hpc/run_frequency.sbatch configs/round_gap_r50um_2000GHz_single_angle.toml --polarizations 0 1 --job-id roundgap2); A=${A%%;*}; echo "default facets job $A"
+    B=$(sbatch --parsable -t 02:00:00 hpc/run_frequency.sbatch configs/round_gap_r50um_2000GHz_single_angle_facets5.toml --polarizations 0 1 --job-id roundgap2_facets5); B=${B%%;*}; echo "fine facets job $B"
+    squeue -u rshenoy
+
+When both have left the queue (same shell, or put the job numbers in place of `$A` and `$B`):
+
+    sacct -j $A,$B -o JobID,State,ExitCode,Elapsed,MaxRSS
+    python - <<'PY'
+    import json, re
+    from pathlib import Path
+    import pandas as pd
+
+    root = Path("/home/rshenoy/BBRSim/outputs/RoundGap_r50um_2000GHz")
+    FIELDS = ["Ex_real", "Ey_real", "Ez_real", "Ex_imag", "Ey_imag", "Ez_imag"]
+    T = {}
+    for name in ("roundgap2", "roundgap2_facets5"):
+        job = root / f"job_{name}"
+        print("==", name)
+        if not (job / "manifest.json").is_file():
+            log = job / "logs" / "run.log"
+            lines = log.read_text(errors="replace").splitlines() if log.is_file() else ["no logs/run.log"]
+            print("   no manifest; last lines of run.log:", *lines[-4:], sep="\n   ")
+            continue
+        m = json.loads((job / "manifest.json").read_text())
+        print(f"   wall facets {m['solver']['wall_facets']}; solve {m['job']['solve_time_s']:.0f} s")
+        for e in (0, 1):
+            wg = pd.read_csv(job / f"RoundGap_r50um_2000GHz_Ephi={e}" / "waveguide.csv")
+            T[name, e] = float(wg.OutgoingPower.iloc[0] / wg.IngoingPower.iloc[0])
+            zero = int(wg[FIELDS].eq(0.0).all(axis=1).sum())
+            rim = m["exit_field"]["rim"]["per_key"][str(e)][0]
+            conv = (job / "logs" / f"convergence_Ephi{e}.txt").read_text(errors="replace")
+            done = re.search(r"Completed\s*:\s*(\S+)", conv)
+            rows = [line.strip() for line in conv.splitlines() if re.match(r"^\s*\d+\s*\|", line)]
+            print(f"   Ephi={e}: T {T[name, e]:.5f}; {len(wg)} rows, {zero} zero; rim {rim['unsolved_inside_zeroed']} zeroed "
+                  f"(deepest {rim['deepest_unsolved_inside_m'] * 1e9:.0f} nm), {rim['valued_outside_dropped']} dropped "
+                  f"(farthest {rim['farthest_valued_outside_m'] * 1e9:.0f} nm); passes {done.group(1) if done else '?'}, "
+                  f"last {rows[-1] if rows else '-'}")
+        print(f"   T Ephi=1 / Ephi=0: {T[name, 1] / T[name, 0]:.5f}")
+    for e in (0, 1):
+        if ("roundgap2", e) in T and ("roundgap2_facets5", e) in T:
+            print(f"FACETS Ephi={e}: T fine / default = {T['roundgap2_facets5', e] / T['roundgap2', e]:.5f}")
+    PY
+
+Expected: both COMPLETED; per run a `wall facets` line (None, then the `wall_facets` operation at 5 deg); per
+polarization 7845 rows, as many zero rows as the rim line zeroed, at most 2.5 um deep or beyond (5 % of R),
+passes under 20 with a last delta under 0.005; within each run `T Ephi=1 / Ephi=0` within about 0.5 % of 1
+(normal incidence: a round gap cannot prefer a polarization). With fine facets the rim counts should fall
+sharply. The `FACETS` lines are the result: a ratio within about 0.5 % of 1 means HFSS's default faceting
+is good enough; a larger one means step 8 and the round-gap production configs need the fine facets.
+Rohan chooses; record both runs, their memory and wall time.
 
 ## 8. Round gap, full sweep
 
@@ -323,7 +387,9 @@ When it finishes:
         print(e, len(w), [round(float(t[(p, 180.0)]), 5) for p in (0.0, 45.0, 90.0)])
     PY
 
-Expected: two lines with 15 x N rows each (N as in step 7), and the six T values at normal incidence
+Run it with the wall facets Rohan chooses after step 7b (a reference config with
+`solver.wall_normal_deviation_deg` if the fine facets win). Expected: two lines with 15 x 7845 rows each,
+and the six T values at normal incidence
 (three azimuths, two polarizations) equal to within about 0.5 %: at normal incidence a round gap cannot
 prefer a polarization or an azimuth, and at MaxDeltaE 0.005 the two separately meshed polarizations of
 the cracks agreed to 0.1 % (step 5d). A large difference means a frame or polarization error; stop and
