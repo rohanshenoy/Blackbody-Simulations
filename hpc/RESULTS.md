@@ -523,3 +523,22 @@ the sweep's normal-incidence T matches the single-angle 5 deg run to 0.1 %. 2.5 
 0.5 % below the converged T, within the 1 % that MaxDeltaE 0.005 aims for (HF-027).
 
 ## Discrepancies and decisions
+
+Index of the decisions taken during these steps; the evidence is in the step named, and the ledger rows are in
+`/Users/rohanshenoy/BBRsim/cross-repo-ledger.md`.
+
+| Date | Decision (Rohan unless noted) | Step | Ledger |
+|---|---|---|---|
+| 2026-10-06 | Step 5 accepted, with the Windows crack1 Ephi=0 set's constant 5.5 % offset as an exception; tolerance stays 5 % | 5 | HF-021 |
+| 2026-10-06 | The incidence definition stands: HFSS's wave travels along -r_hat(theta, phi) (a finding, not a choice) | 5b | HF-024 |
+| 2026-10-06 | Both cracks rerun at MaxDeltaE 0.005 before the data tree, which takes those runs | 5c, 5d | HF-025, HF-026 |
+| 2026-10-06 | Production convergence target MaxDeltaE 0.005 with up to 20 passes, per grid config | 5d | HF-027 |
+| 2026-10-06 | 2025 R2 data stay on the HPC as trees BBRsim reads there; no CSVs in BBRsim's git | 5e | G4-016, HF-023, HF-028 |
+| 2026-10-06 | Rim rule for curved exit faces: every lattice point inside the disc kept, holes zero-filled, values outside dropped | 7a | HF-029 |
+| 2026-10-06 | Measure the round gap's wall faceting before step 8 | 7a | HF-030 |
+| 2026-10-06 | Frequency grids per geometry, uniform in log frequency plus points bracketing each cutoff | (none yet) | HF-031 |
+| 2026-10-07 | Round gap at 5 deg wall facets (default faceting put T 7.0 % low) | 7b | HF-032 |
+| 2026-10-07 | 5 deg converged (2.5 deg moves T 0.3 %); step 8 is the round gap's first dataset | 8 | HF-033 |
+
+No discrepancy is open on the HFSS side. Open on the consumer side and Rohan's to decide: whether the per-photon
+transmission divides by |cos theta| (G4-020, OR-019) and the Geant4 openings' 1 um margin (OR-018).
