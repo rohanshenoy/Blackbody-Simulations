@@ -102,8 +102,14 @@ def assign_wall_facets(hfss: Any, object_name: str, normal_deviation_deg: float)
                                               name=WALL_FACETS)
     if not op:
         raise RuntimeError(f"assign_surface_mesh_manual returned {op!r} for {object_name!r}")
-    return {"object": object_name, "normal_deviation_deg": normal_deviation_deg,
-            "mesh_operation": str(getattr(op, "name", WALL_FACETS))}
+    # PyAEDT returns the operation object whether or not AEDT created it, so read the design's mesh tree:
+    # a silent failure would solve the "fine facets" run on default facets and fake an HF-030 ratio of 1.
+    name = str(getattr(op, "name", WALL_FACETS))
+    present = [str(n) for n in hfss.mesh.meshoperation_names]
+    if name not in present:
+        raise RuntimeError(f"mesh operation {name!r} is not in the design after assign_surface_mesh_manual; "
+                           f"its mesh operations are {present}")
+    return {"object": object_name, "normal_deviation_deg": normal_deviation_deg, "mesh_operation": name}
 
 
 def reset_initial_mesh_settings(hfss: Any) -> tuple[Any, dict[str, Any]]:

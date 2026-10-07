@@ -258,17 +258,14 @@ non-planar face" are expected: the two vertex-free end caps and the curved side 
 
 ## 7. Round gap, single angle at 2000 GHz
 
-The first run (job 4077742, `roundgap1`, 2026-10-06) solved and then stopped at the rim of the disc; step 7a
-found why, and the rim rule (ledger HF-029) fixed it. Step 7b runs this config again beside a fine-facet
-variant; this section keeps the single-run check.
-
-    sbatch -t 02:00:00 hpc/run_frequency.sbatch configs/round_gap_r50um_2000GHz_single_angle.toml --job-id roundgap1
-
-When it finishes:
+The first run (job 4077742, 2026-10-06) solved and then stopped at the rim of the disc; step 7a found why,
+and the rim rule (ledger HF-029) fixed it. Its job directory `job_roundgap1` exists and holds no data, so the
+runner refuses that job id again. Step 7b runs this config as `roundgap2`, beside a fine-facet variant, and its
+check prints the facts below; this section keeps the single-run check, pointed at `roundgap2`:
 
     python - <<'PY'
     import json, pandas as pd
-    job = "/home/rshenoy/BBRSim/outputs/RoundGap_r50um_2000GHz/job_roundgap1"
+    job = "/home/rshenoy/BBRSim/outputs/RoundGap_r50um_2000GHz/job_roundgap2"
     d = f"{job}/RoundGap_r50um_2000GHz_Ephi=0"
     w = pd.read_csv(f"{d}/waveguide.csv"); f = pd.read_csv(f"{d}/far_field.csv")
     s = json.load(open(f"{job}/RoundGap_r50um_2000GHz.dataset.json"))
@@ -282,8 +279,9 @@ exactly on the rim (rim rule, Rohan 2026-10-06, ledger HF-029: HFSS meshes the c
 inside points get no field and are written with zero field, and some just outside get field and are dropped;
 `manifest.json` `exit_field.rim` counts both per key and polarization). Then the same 7845,
 `{'shape': 'disc', 'radius_m': 5e-05}` (to rounding), `TE11 1`, then `0`. A non-zero last line means
-`logs/run.log` holds the reader's warning that HFSS wrote outside lattice points as rows other than
-nine tokens; those points are still skipped and the run stands, but copy the warning into RESULTS.md.
+`logs/run.log` holds the reader's warning that HFSS wrote unsolved lattice points as rows other than nine
+tokens; under the rim rule those inside the disc are kept with zero field (counted in `exit_field.rim`) and
+those outside dropped, so the run stands, but copy the warning into RESULTS.md.
 Record T as the first round-gap reference value (no Windows reference exists), the passes and final
 delta E from `logs/convergence_Ephi0.txt`, and `sacct -j <id> --format=MaxRSS,Elapsed`.
 
@@ -345,6 +343,10 @@ When both have left the queue (same shell, or put the job numbers in place of `$
             continue
         m = json.loads((job / "manifest.json").read_text())
         print(f"   wall facets {m['solver']['wall_facets']}; solve {m['job']['solve_time_s']:.0f} s")
+        s = json.loads((job / "RoundGap_r50um_2000GHz.dataset.json").read_text())
+        short = sum("all-nan rows" in line for line in (job / "logs" / "run.log").read_text(errors="replace").splitlines())
+        print(f"   sidecar: {s['exit_field']['points_per_key_retained']} per key, {s['exit_field']['cross_section']}, "
+              f"{s['modes']['mode']} {s['modes']['propagating_count']}; short-row warnings {short}")
         for e in (0, 1):
             wg = pd.read_csv(job / f"RoundGap_r50um_2000GHz_Ephi={e}" / "waveguide.csv")
             T[name, e] = float(wg.OutgoingPower.iloc[0] / wg.IngoingPower.iloc[0])
@@ -363,7 +365,9 @@ When both have left the queue (same shell, or put the job numbers in place of `$
             print(f"FACETS Ephi={e}: T fine / default = {T['roundgap2_facets5', e] / T['roundgap2', e]:.5f}")
     PY
 
-Expected: both COMPLETED; per run a `wall facets` line (None, then the `wall_facets` operation at 5 deg); per
+Expected: both COMPLETED; per run a `wall facets` line (None, then the `wall_facets` operation at 5 deg, which
+the runner has read back from the design's mesh tree before the solve), a sidecar line `7845 per key,
+{'shape': 'disc', 'radius_m': 5e-05}, TE11 1; short-row warnings 0` (a non-zero count: see step 7); per
 polarization 7845 rows, as many zero rows as the rim line zeroed, at most 2.5 um deep or beyond (5 % of R),
 passes under 20 with a last delta under 0.005; within each run `T Ephi=1 / Ephi=0` within about 0.5 % of 1
 (normal incidence: a round gap cannot prefer a polarization). With fine facets the rim counts should fall

@@ -72,9 +72,11 @@ def read_exit_field_fld(path: Path, keep_unsolved: bool = False) -> pd.DataFrame
         rows.append(values)
     if odd_outside:
         counts = dict(sorted(Counter(n for _, n in odd_outside).items()))
-        log.warning("%s: %d all-nan rows with a token count other than %d (counts %s, first at line %d) skipped as "
-                    "outside points; HFSS writes outside points in another form, or the export was cut short",
-                    path, len(odd_outside), len(EXIT_FIELD_COLUMNS), counts, odd_outside[0][0])
+        fate = ("kept as unsolved lattice points (nan field) for the caller's rim rule" if keep_unsolved
+                else "skipped as outside points")
+        log.warning("%s: %d all-nan rows with a token count other than %d (counts %s, first at line %d) %s; HFSS "
+                    "writes unsolved points in another form, or the export was cut short",
+                    path, len(odd_outside), len(EXIT_FIELD_COLUMNS), counts, odd_outside[0][0], fate)
     if len(rows) == len(unsolved):
         raise FieldFileError(f"{path}: no numeric data rows")
     return pd.DataFrame(rows, columns=EXIT_FIELD_COLUMNS)
