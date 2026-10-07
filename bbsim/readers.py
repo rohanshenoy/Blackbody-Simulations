@@ -27,7 +27,7 @@ class ExportTimeoutError(RuntimeError):
     """An export file did not appear and settle within the timeout."""
 
 
-def read_exit_field_fld(path: Path) -> pd.DataFrame:
+def read_exit_field_fld(path: Path, keep_unsolved: bool = False) -> pd.DataFrame:
     """Read an ExportOnGrid/CalculatorWrite .fld: two header lines, then 9 floats per line.
 
     A row whose tokens after the three coordinates are all ``nan`` is a grid point outside the solved
@@ -35,9 +35,13 @@ def read_exit_field_fld(path: Path) -> pd.DataFrame:
     unverified, and the legacy reader skipped any row ending in ``nan``. Skipped rows without the full
     9 tokens are reported in one warning per file. Any other non-finite value is an error: BBRsim
     rejects non-finite fields at load (BBR013).
+
+    With ``keep_unsolved`` those rows are returned instead, in file order, with nan field values and
+    finite coordinates, for a caller that maps every lattice point (``retain_disc_lattice``).
     """
     lines = Path(path).read_text().splitlines()
     rows: list[list[float]] = []
+    unsolved: list[int] = []                 # indices into rows of the all-nan rows kept with keep_unsolved
     odd_outside: list[tuple[int, int]] = []  # (line number, token count) of all-nan rows without 9 tokens
     for lineno, line in enumerate(lines[2:], start=3):
         parts = line.split()
@@ -47,6 +51,15 @@ def read_exit_field_fld(path: Path) -> pd.DataFrame:
         if field_tokens and all(token.lower() == "nan" for token in field_tokens):
             if len(parts) != len(EXIT_FIELD_COLUMNS):
                 odd_outside.append((lineno, len(parts)))
+            if keep_unsolved:
+                try:
+                    point = [float(token) for token in parts[:3]]
+                except ValueError:
+                    raise FieldFileError(f"{path}: line {lineno} has a non-numeric coordinate: {line.strip()!r}") from None
+                if not all(math.isfinite(v) for v in point):
+                    raise FieldFileError(f"{path}: line {lineno} has a non-finite coordinate: {line.strip()!r}")
+                unsolved.append(len(rows))
+                rows.append(point + [math.nan] * (len(EXIT_FIELD_COLUMNS) - 3))
             continue
         if len(parts) != len(EXIT_FIELD_COLUMNS):
             raise FieldFileError(f"{path}: line {lineno} has {len(parts)} fields, expected {len(EXIT_FIELD_COLUMNS)}")
@@ -62,7 +75,7 @@ def read_exit_field_fld(path: Path) -> pd.DataFrame:
         log.warning("%s: %d all-nan rows with a token count other than %d (counts %s, first at line %d) skipped as "
                     "outside points; HFSS writes outside points in another form, or the export was cut short",
                     path, len(odd_outside), len(EXIT_FIELD_COLUMNS), counts, odd_outside[0][0])
-    if not rows:
+    if len(rows) == len(unsolved):
         raise FieldFileError(f"{path}: no numeric data rows")
     return pd.DataFrame(rows, columns=EXIT_FIELD_COLUMNS)
 

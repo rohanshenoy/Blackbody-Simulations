@@ -1,0 +1,64 @@
+# Round-gap baseline with fine wall facets (Rohan, 2026-10-06, ledger HF-030): identical to
+# round_gap_r50um_2000GHz_single_angle.toml except solver.wall_normal_deviation_deg, so its T measures what HFSS's
+# default faceting of the 50 um circle costs (HPC step 7a: wall up to 0.76 um inside the circle).
+#
+# One incident angle (normal incidence), one polarization.
+# Round gap: vacuum cylinder r = 50 um, length 0.4 mm along +z (built by build_hfss_project.py from
+# configs/geometries/round_gap_r50um.toml). Solved at 2000 GHz, just above the TE11 cutoff (1757 GHz),
+# like Jason's cylindrical2. Jason's incident sweep; phi stays {0, 45, 90} because BBRsim folds by
+# mirrors and never rotates a table.
+
+[project]
+path = "/home/rshenoy/BBRSim/projects/RoundGap.aedt"
+design = "round_gap_r50um"
+dataset_id = "RoundGap_r50um"
+aedt_version = "2025.2"
+
+[geometry]
+object = "gap"
+entrance_face = { axis = "z", side = "min" }
+exit_face = { axis = "z", side = "max" }
+exit_cs_x = [0.0, 0.0, 1.0]
+exit_cs_y = [0.0, 1.0, 0.0]
+expected_box_size_mm = [0.1, 0.1, 0.4]
+expected_face_area_mm2 = 0.007853982
+pose = "canonical-z"
+symmetry = ["rotational", "mirror_l", "mirror_g", "end_to_end"]
+
+[excitation]
+ei_v_per_m = 1.0
+theta_lower_deg = 180.0
+theta_upper_deg = 180.0
+theta_step_deg = 45.0
+phi_lower_deg = 0.0
+phi_upper_deg = 0.0
+phi_step_deg = 45.0
+
+[solver]
+frequency_ghz = 2000
+max_delta_e = 0.005  # Rohan 2026-10-06 (HF-027): production target; was 0.02
+max_passes = 20
+wall_normal_deviation_deg = 5.0  # HF-030: 72 facets around the circle, wall within 0.05 um of it
+cores = 4
+sweep = "discrete"
+
+[far_field]
+theta_lower_deg = 0.0
+theta_upper_deg = 180.0
+phi_lower_deg = -90.0
+phi_upper_deg = 90.0
+a_mm = 0.1
+b_mm = 0.1
+fineness = 10.0
+min_coarseness_deg = 0.1
+max_coarseness_deg = 5.0
+
+[exit_field]
+manual = true
+resolution_mm = [0.0, 0.001, 0.001]
+edge_samples = 64
+
+[output]
+root = "/home/rshenoy/BBRSim/outputs"
+polarizations = [0]
+export_timeout_s = 300.0

@@ -91,13 +91,21 @@ def aedt_messages_on_error(hfss: Any, seen: set[str]) -> Iterator[None]:
 
 
 def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
-    from bbsim.extract import ExtractionContext, describe_exit_face, exit_grid, extract_far_field, extract_waveguide
+    from bbsim.extract import (
+        RIM_BAND_REL,
+        ExtractionContext,
+        describe_exit_face,
+        exit_grid,
+        extract_far_field,
+        extract_waveguide,
+    )
     from bbsim.geometry import create_exit_coordinate_system, create_exit_face_list, select_faces
     from bbsim.hfss_setup import (
         EXIT_CS,
         EXIT_FACE_LIST,
         add_outgoing_power_expression,
         aedt_messages,
+        assign_wall_facets,
         assign_radiation_boundaries,
         clear_boundaries_and_excitations,
         create_plane_wave,
@@ -148,6 +156,10 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
         # GUI-made base designs); the legacy script solved a fresh design with Auto. Restore the reference settings.
         mesh_inherited, mesh_requested = reset_initial_mesh_settings(hfss)
         log.info("initial mesh settings reset to %s (inherited: %s)", mesh_requested, mesh_inherited)
+        wall_facets = None
+        if cfg.solver.wall_normal_deviation_deg is not None:
+            wall_facets = assign_wall_facets(hfss, cfg.geometry.object, cfg.solver.wall_normal_deviation_deg)
+            log.info("wall facets: %s", wall_facets)
 
         # Same order as legacy main(): variables, faces/boundaries, exit CS, calculator, setup, sphere, plane wave.
         clear_boundaries_and_excitations(hfss)
@@ -206,8 +218,9 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
         hfss.save_project()
         with aedt_messages_on_error(hfss, set(messages)):
             exit_point_counts: dict[int, dict] = {}
+            rim_log: dict[str, list] = {}
             for ephi in cfg.output.polarizations:
-                waveguide = extract_waveguide(hfss, ctx, ephi, face_geometry)
+                waveguide = extract_waveguide(hfss, ctx, ephi, face_geometry, rim_log)
                 far_field = extract_far_field(hfss, ctx, ephi)
                 out_dir = dirs.dataset_dir(cfg.project.dataset_id, freq, ephi)
                 out_dir.mkdir(parents=True, exist_ok=False)
@@ -261,6 +274,7 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
         solver={"setup": setup, "parametric_sweep": parametric, "frequency_label": label, "formulation": "TotalFields",
                 "max_delta_e": cfg.solver.max_delta_e, "max_passes": cfg.solver.max_passes, "cores": cfg.solver.cores,
                 "initial_mesh_settings": {"requested": mesh_requested, "inherited_from_base_design": mesh_inherited},
+                "wall_facets": wall_facets,
                 "boundaries": {"rbin": "Radiation on entrance", "rbout": "Radiation on exit", "other faces": "default PEC"},
                 "solved_variations": variations, "convergence": convergence},
         far_field={"sphere": sphere, "theta_step_deg": grid.theta_step_deg, "phi_step_deg": grid.phi_step_deg,
@@ -270,7 +284,10 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
         exit_field={"manual": cfg.exit_field.manual, "resolution_mm": list(cfg.exit_field.resolution_mm),
                     "points_in_si": True, "field_in_ref_cs": False, "coordinate_system": EXIT_CS,
                     "grid": lattice.axis_record() if lattice is not None else None, "lattice_points": lattice_points,
-                    "retained_points_per_key": retained, "outside_points": outside_points},
+                    "retained_points_per_key": retained, "outside_points": outside_points,
+                    "rim": {"rule": "every lattice point inside the disc kept; inside points without field set to zero; "
+                                    "points outside dropped (ledger HF-029)",
+                            "band_rel": RIM_BAND_REL, "per_key": rim_log} if rim_log else None},
         outputs=outputs,
         versions=versions,
     )

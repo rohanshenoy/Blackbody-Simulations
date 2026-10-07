@@ -105,10 +105,15 @@ class SolverConfig:
     max_passes: int
     cores: int
     sweep: str = "discrete"
+    # A curved wall's facets: the normal deviation of a manual surface approximation on the geometry object
+    # (Rohan, 2026-10-06, ledger HF-030). None keeps HFSS's own faceting, as every config did before.
+    wall_normal_deviation_deg: float | None = None
 
     def __post_init__(self) -> None:
         if self.frequency_ghz <= 0:
             raise ConfigError("frequency_ghz must be positive")
+        if self.wall_normal_deviation_deg is not None and not 0 < self.wall_normal_deviation_deg < 90:
+            raise ConfigError("wall_normal_deviation_deg must lie strictly between 0 and 90 degrees")
         if self.max_passes < 1:
             raise ConfigError("max_passes must be at least 1")
         if self.cores < 1:

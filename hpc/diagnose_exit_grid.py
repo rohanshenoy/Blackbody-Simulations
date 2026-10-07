@@ -8,8 +8,8 @@ it is read, so those points are lost.
 
 This script runs the runner unchanged (bbsim.run_frequency.main, with run_hfss_frequency.py's arguments)
 with two instruments: every raw exit-field export is copied to <job>/diagnose_exit_grid/ before it is read,
-and the containment check prints its verdict instead of raising, so the run continues through both
-polarizations. Each polarization is a separate parametric variation with its own adaptive mesh. Then, for
+and the containment check, and since the rim rule (ledger HF-029) also that rule, print their verdicts
+instead of raising, so the run continues through both polarizations. Each polarization is a separate parametric variation with its own adaptive mesh. Then, for
 every kept export, it maps which lattice points HFSS filled and which it left nan against their distance
 from the declared rim:
 
@@ -56,9 +56,10 @@ declared: list[dict] = []
 _exports: Counter = Counter()
 _read = extract.read_exit_field_fld
 _check = extract.check_points_within
+_retain = extract.retain_disc_lattice
 
 
-def keeping_read(path):
+def keeping_read(path, **kwargs):
     """Copy the raw export to <job>/diagnose_exit_grid/ (the runner deletes it after reading), then read it."""
     path = Path(path)
     keep = path.parent.parent / KEEP_DIR
@@ -67,7 +68,17 @@ def keeping_read(path):
     dest = keep / f"{path.stem}_{_exports[path.stem]:02d}.fld"
     shutil.copy2(path, dest)
     kept.append(dest)
-    return _read(path)
+    return _read(path, **kwargs)
+
+
+def reporting_retain(df, cross_section, where, **kwargs):
+    """The rim rule (ledger HF-029), reported instead of raised: on a refusal the run goes on with no band."""
+    declared.append(dict(cross_section))
+    try:
+        return _retain(df, cross_section, where, **kwargs)
+    except FieldFileError as exc:
+        print(f"rim rule FAIL (reported, not raised): {exc}", flush=True)
+        return _retain(df, cross_section, where, **{**kwargs, "band_rel": float("inf")})
 
 
 def reporting_check(df, cross_section, where, **kwargs):
@@ -177,6 +188,7 @@ def main(argv: list[str] | None = None) -> int:
     if stale:
         print(f"removed from the environment: {stale}", flush=True)
     extract.read_exit_field_fld = keeping_read
+    extract.retain_disc_lattice = reporting_retain
     extract.check_points_within = reporting_check
     status = run_frequency.main(argv)
     sys.stderr.flush()

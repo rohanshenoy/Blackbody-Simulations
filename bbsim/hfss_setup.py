@@ -87,6 +87,25 @@ def initial_mesh_settings_kwargs() -> dict[str, Any]:
                 fallback=True, phi=True, auto_model_resolution=True)
 
 
+WALL_FACETS = "wall_facets"
+
+
+def assign_wall_facets(hfss: Any, object_name: str, normal_deviation_deg: float) -> dict[str, Any]:
+    """Facet the object's curved surfaces to ``normal_deviation_deg`` with a manual surface approximation.
+
+    HFSS otherwise meshes the round gap's 50 um circle as a coarse polygon: HPC step 7a (2026-10-06) found its
+    wall up to 0.76 um inside the circle. 5 deg gives 72 facets around a circle, the wall within 0.05 um of it.
+    Rohan, 2026-10-06 (ledger HF-030): measured against the default before step 8.
+    """
+    op = hfss.mesh.assign_surface_mesh_manual(assignment=[object_name], surface_deviation=None,
+                                              normal_dev=f"{normal_deviation_deg}deg", aspect_ratio=None,
+                                              name=WALL_FACETS)
+    if not op:
+        raise RuntimeError(f"assign_surface_mesh_manual returned {op!r} for {object_name!r}")
+    return {"object": object_name, "normal_deviation_deg": normal_deviation_deg,
+            "mesh_operation": str(getattr(op, "name", WALL_FACETS))}
+
+
 def reset_initial_mesh_settings(hfss: Any) -> tuple[Any, dict[str, Any]]:
     """Apply the reference global mesh settings; return (inherited settings, requested kwargs) for the manifest."""
     try:

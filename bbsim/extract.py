@@ -29,6 +29,8 @@ log = logging.getLogger(__name__)
 GUARD_MM = 1e-9           # floating-noise guard when rounding lattice bounds outward
 CONTAIN_REL_TOL = 1e-6    # retained exit points may exceed the declared cross-section by this fraction
 PLANE_TOL_M = 1e-9        # retained exit points must lie on the exit plane x_e = 0 to this
+RIM_BAND_REL = 0.05       # a disc's faceted rim: export disagreements tolerated within this fraction of the radius
+FIELD_COLUMNS = ["Ex_real", "Ey_real", "Ez_real", "Ex_imag", "Ey_imag", "Ez_imag"]
 
 
 @dataclass(frozen=True)
@@ -251,6 +253,48 @@ def check_points_within(df: pd.DataFrame, cross_section: dict, where: str,
                              "cross-section; HFSS must write nan, not values, outside the solid")
 
 
+def retain_disc_lattice(df: pd.DataFrame, cross_section: dict, where: str, band_rel: float = RIM_BAND_REL,
+                        rel_tol: float = CONTAIN_REL_TOL) -> tuple[pd.DataFrame, dict]:
+    """Every lattice point inside a declared disc, in export order, with zero field where HFSS gave none.
+
+    ``df`` is the whole lattice as read with ``keep_unsolved``. HFSS meshes a circle as a polygon (the runner
+    keeps curvilinear elements off, as in the crack reference designs), so at the rim the export disagrees with
+    the declared circle, and differently for each polarization's adaptive mesh: HPC step 7a (2026-10-06, R = 50
+    um at 2000 GHz) left about 60 points inside the disc without field, up to 0.76 um in, and gave field to
+    about 50 outside it, up to 1.08 um out. Rim rule (Rohan, 2026-10-06, ledger HF-029): every lattice point
+    inside the disc is kept, so all keys and both polarizations share one grid, which Geant4 pairs by row;
+    valued points outside are dropped; inside points without field get zero field, which BBRsim never
+    samples. A valued point more than ``band_rel`` of the radius beyond the rim, or an unsolved one more than
+    that inside it, is an error: values written outside the solid, or a cross-section that does not match it.
+    Returns the kept rows and the counts and extreme distances, in metres, for the manifest.
+    """
+    x, y, z = (df[c].to_numpy(dtype=float) for c in ("X", "Y", "Z"))
+    if len(x) and float(np.max(np.abs(x))) > PLANE_TOL_M:
+        raise FieldFileError(f"{where}: exit points off the plane x_e = 0 (max |X| = {np.max(np.abs(x)):.3e} m)")
+    radius = float(cross_section["radius_m"])
+    band = band_rel * radius
+    r = np.hypot(y, z)
+    inside = y * y + z * z <= radius ** 2 * (1 + rel_tol)
+    solved = df[FIELD_COLUMNS].notna().all(axis=1).to_numpy()
+    spill, holes = solved & ~inside, ~solved & inside
+    beyond, depth = r[spill] - radius, np.maximum(radius - r[holes], 0.0)
+    if np.any(beyond > band):
+        raise FieldFileError(
+            f"{where}: {int(np.sum(beyond > band))} points with field lie outside the declared disc more than "
+            f"{band:.3g} m ({band_rel:.0%} of the radius) beyond its rim, the farthest {beyond.max():.3g} m; "
+            "HFSS must write nan, not values, outside the solid")
+    if np.any(depth > band):
+        raise FieldFileError(
+            f"{where}: {int(np.sum(depth > band))} points inside the declared disc have no field more than "
+            f"{band:.3g} m ({band_rel:.0%} of the radius) inside its rim, the deepest {depth.max():.3g} m; "
+            "the export does not cover the exit face")
+    kept = df[inside].reset_index(drop=True)
+    kept.loc[holes[inside], FIELD_COLUMNS] = 0.0
+    return kept, {"unsolved_inside_zeroed": int(holes.sum()), "valued_outside_dropped": int(spill.sum()),
+                  "deepest_unsolved_inside_m": float(depth.max()) if depth.size else 0.0,
+                  "farthest_valued_outside_m": float(beyond.max()) if beyond.size else 0.0}
+
+
 def describe_exit_face(hfss: Any, ctx: ExtractionContext) -> ExitFaceGeometry:
     """Outline of the exit face in the exit frame: its vertices, or samples along its edges when it has
     fewer than 3 vertices (a circle has none or one)."""
@@ -310,7 +354,10 @@ def evaluate_outgoing_power(hfss: Any, ctx: ExtractionContext, ephi: int) -> dic
     return power
 
 
-def extract_waveguide(hfss: Any, ctx: ExtractionContext, ephi: int, face: ExitFaceGeometry) -> pd.DataFrame:
+def extract_waveguide(hfss: Any, ctx: ExtractionContext, ephi: int, face: ExitFaceGeometry,
+                      rim_log: dict | None = None) -> pd.DataFrame:
+    """The waveguide table of one polarization. For a disc, ``retain_disc_lattice`` keeps the whole lattice inside
+    it; its per-key counts are appended to ``rim_log[str(ephi)]`` for the manifest."""
     power = evaluate_outgoing_power(hfss, ctx, ephi)
 
     fields = hfss.odesign.GetModule("FieldsReporter")
@@ -328,6 +375,7 @@ def extract_waveguide(hfss: Any, ctx: ExtractionContext, ephi: int, face: ExitFa
         fields.CalcOp("Value")
 
     path = ctx.scratch_dir / f"exitfield_{ctx.freq_label}_Ephi{ephi}.fld"
+    disc = ctx.exit_field.manual and face.cross_section["shape"] == "disc"
     frames = []
     for phi in ctx.phi_values:
         for theta in ctx.theta_values:
@@ -344,10 +392,17 @@ def extract_waveguide(hfss: Any, ctx: ExtractionContext, ephi: int, face: ExitFa
             else:
                 fields.CalculatorWrite(str(path), ["Solution:=", ctx.solution], args)
             wait_for_file(path, ctx.timeout_s)
-            df = read_exit_field_fld(path)
+            df = read_exit_field_fld(path, keep_unsolved=disc)
             path.unlink()
-            check_points_within(df, face.cross_section, f"exit field for phi={phi} theta={theta} Ephi={ephi}",
-                                polygon_tol_m=face.sagitta_mm * 1e-3)
+            where = f"exit field for phi={phi} theta={theta} Ephi={ephi}"
+            if disc:
+                df, rim = retain_disc_lattice(df, face.cross_section, where)
+                log.info("%s: rim: %d unsolved inside points set to zero (deepest %.3g m), %d valued outside points "
+                         "dropped (farthest %.3g m)", where, rim["unsolved_inside_zeroed"], rim["deepest_unsolved_inside_m"],
+                         rim["valued_outside_dropped"], rim["farthest_valued_outside_m"])
+                if rim_log is not None:
+                    rim_log.setdefault(str(ephi), []).append({"key": [float(phi), float(theta)], **rim})
+            check_points_within(df, face.cross_section, where, polygon_tol_m=face.sagitta_mm * 1e-3)
             if frames and len(df) != len(frames[0]):
                 # Geant4 pairs exit points across polarizations by row index; every angle must have the same grid.
                 raise FieldFileError(
