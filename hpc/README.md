@@ -312,6 +312,11 @@ valued points inside the disc are the same set; a closing `EXIT GRID:` line. The
 
 ## 7b. Wall facets: the round gap as configured and with fine facets (batch)
 
+Ran 2026-10-07 (jobs 4155776 and 4155777, RESULTS 7b): with 5 deg facets T came out 1.0698 times the default
+for both polarizations, so the round gap's production configs now carry `wall_normal_deviation_deg = 5.0`
+(Rohan, ledger HF-032) and `round_gap_r50um_2000GHz_single_angle_facets5.toml` was removed. The commands below
+reproduce the step at commit `fa6669d`.
+
 Step 7a showed HFSS's default faceting puts the wall up to 0.76 um inside the 50 um circle, and 2000 GHz is
 only 14 % above the TE11 cutoff, where T may depend on the effective radius. Rohan, 2026-10-06 (ledger
 HF-030): measure it before step 8. Two single-angle runs at normal incidence with both polarizations,
@@ -375,27 +380,87 @@ sharply. The `FACETS` lines are the result: a ratio within about 0.5 % of 1 mean
 is good enough; a larger one means step 8 and the round-gap production configs need the fine facets.
 Rohan chooses; record both runs, their memory and wall time.
 
-## 8. Round gap, full sweep
+## 8. Round gap, full sweep (5 deg facets) and the faceting check
 
-    sbatch -t 03:00:00 hpc/run_frequency.sbatch configs/round_gap_r50um_2000GHz_reference.toml --job-id reference1
+Both round-gap configs carry the fine wall facets (Rohan, 2026-10-07, ledger HF-032). Alongside the sweep, a
+single-angle run at 2.5 deg checks that 5 deg has converged, against step 7b's 5 deg run `roundgap2_facets5`:
 
-When it finishes:
+    cd /home/rshenoy/BBRSim/Blackbody-Simulations && git pull --ff-only fork linux-hpc-migration
+    C=$(sbatch --parsable -t 03:00:00 hpc/run_frequency.sbatch configs/round_gap_r50um_2000GHz_reference.toml --job-id reference1); C=${C%%;*}; echo "step 8 job $C"
+    F=$(sbatch --parsable -t 02:00:00 hpc/run_frequency.sbatch configs/round_gap_r50um_2000GHz_single_angle_facets2p5.toml --polarizations 0 1 --job-id roundgap3_facets2p5); F=${F%%;*}; echo "2.5 deg check job $F"
+    squeue -u rshenoy
 
+When both have left the queue (same shell, or put the job numbers in place of `$C` and `$F`):
+
+    sacct -j $C,$F -o JobID,State,ExitCode,Elapsed,MaxRSS
     python - <<'PY'
+    import json, re
+    from pathlib import Path
     import pandas as pd
-    job = "/home/rshenoy/BBRSim/outputs/RoundGap_r50um_2000GHz/job_reference1"
+
+    root = Path("/home/rshenoy/BBRSim/outputs/RoundGap_r50um_2000GHz")
+    KEYS = ["IWavePhi", "IWaveTheta"]
+
+
+    def converged(job, e):
+        text = (job / "logs" / f"convergence_Ephi{e}.txt").read_text(errors="replace")
+        done = re.search(r"Completed\s*:\s*(\S+)", text)
+        rows = [line.strip() for line in text.splitlines() if re.match(r"^\s*\d+\s*\|", line)]
+        return f"passes {done.group(1) if done else '?'}, last {rows[-1] if rows else '-'}"
+
+
+    def manifest(job):
+        if (job / "manifest.json").is_file():
+            return json.loads((job / "manifest.json").read_text())
+        log = job / "logs" / "run.log"
+        lines = log.read_text(errors="replace").splitlines() if log.is_file() else ["no logs/run.log"]
+        print("   no manifest; last lines of run.log:", *lines[-4:], sep="\n   ")
+        return None
+
+
+    job = root / "job_reference1"
+    print("== step 8:", job.name)
+    m = manifest(job)
+    if m:
+        s = json.loads((job / "RoundGap_r50um_2000GHz.dataset.json").read_text())
+        print(f"   wall facets {m['solver']['wall_facets']}; solve {m['job']['solve_time_s']:.0f} s")
+        print(f"   sidecar: {s['exit_field']['points_per_key_retained']} per key, {s['exit_field']['cross_section']}, "
+              f"{s['modes']['mode']} {s['modes']['propagating_count']}")
+        six = []
+        for e in (0, 1):
+            wg = pd.read_csv(job / f"RoundGap_r50um_2000GHz_Ephi={e}" / "waveguide.csv")
+            k = wg.drop_duplicates(KEYS).set_index(KEYS)
+            t = k.OutgoingPower / k.IngoingPower
+            vals = [float(t[(p, 180.0)]) for p in (0.0, 45.0, 90.0)]
+            six += vals
+            rim = m["exit_field"]["rim"]["per_key"][str(e)]
+            print(f"   Ephi={e}: {len(wg)} rows, {len(k)} keys x {sorted(set(wg.groupby(KEYS).size()))}; "
+                  f"T at theta 180, phi 0/45/90: {[round(v, 5) for v in vals]}; rim zeroed <= "
+                  f"{max(r['unsolved_inside_zeroed'] for r in rim)}, dropped <= {max(r['valued_outside_dropped'] for r in rim)}; "
+                  f"{converged(job, e)}")
+        print(f"   spread of the six normal-incidence T: {max(six) / min(six) - 1:.3%}")
+
+    print("== faceting check: 2.5 deg against 5 deg (step 7b's roundgap2_facets5)")
+    T = {}
+    for name in ("roundgap2_facets5", "roundgap3_facets2p5"):
+        job = root / f"job_{name}"
+        m = manifest(job)
+        if not m:
+            continue
+        for e in (0, 1):
+            wg = pd.read_csv(job / f"RoundGap_r50um_2000GHz_Ephi={e}" / "waveguide.csv")
+            T[name, e] = float(wg.OutgoingPower.iloc[0] / wg.IngoingPower.iloc[0])
+        print(f"   {name}: {m['solver']['wall_facets']['normal_deviation_deg']} deg, T {T[name, 0]:.5f} / {T[name, 1]:.5f}, "
+              f"solve {m['job']['solve_time_s']:.0f} s; {converged(job, 0)}")
     for e in (0, 1):
-        w = pd.read_csv(f"{job}/RoundGap_r50um_2000GHz_Ephi={e}/waveguide.csv")
-        k = w.drop_duplicates(["IWavePhi", "IWaveTheta"]).set_index(["IWavePhi", "IWaveTheta"])
-        t = k.OutgoingPower / k.IngoingPower
-        print(e, len(w), [round(float(t[(p, 180.0)]), 5) for p in (0.0, 45.0, 90.0)])
+        if ("roundgap2_facets5", e) in T and ("roundgap3_facets2p5", e) in T:
+            print(f"FACETS Ephi={e}: T 2.5 deg / 5 deg = {T['roundgap3_facets2p5', e] / T['roundgap2_facets5', e]:.5f}")
     PY
 
-Run it with the wall facets Rohan chooses after step 7b (a reference config with
-`solver.wall_normal_deviation_deg` if the fine facets win). Expected: two lines with 15 x 7845 rows each,
-and the six T values at normal incidence
-(three azimuths, two polarizations) equal to within about 0.5 %: at normal incidence a round gap cannot
-prefer a polarization or an azimuth, and at MaxDeltaE 0.005 the two separately meshed polarizations of
-the cracks agreed to 0.1 % (step 5d). A large difference means a frame or polarization error; stop and
-report. Record memory and wall time (`sacct -j <id> -o JobID,State,Elapsed,MaxRSS`); they size the job
-array.
+Expected: both COMPLETED. Step 8: the 5 deg `wall_facets` operation; the sidecar line `7845 per key, disc, TE11
+1`; per polarization 15 x 7845 = 117675 rows, 15 keys of 7845; the six T values at normal incidence (three
+azimuths, two polarizations) near step 7b's 0.5096 and equal to within about 0.5 %: at normal incidence a round
+gap cannot prefer a polarization or an azimuth, and step 7b's polarizations agreed to 0.02 %. A large spread
+means a frame or polarization error; stop and report. The `FACETS` lines: 2.5 deg against 5 deg within about
+0.5 % of 1 means 5 deg has converged and step 8 is the round gap's first dataset; a larger change means step 8
+reruns at 2.5 deg. Record memory and wall time; they size the job array.

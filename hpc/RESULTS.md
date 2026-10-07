@@ -474,6 +474,29 @@ Decisions (Rohan, 2026-10-06):
 
 ## 7b. Wall facets
 
+2026-10-07, code `fa6669d`, single angle at 2000 GHz with both polarizations, MaxDeltaE 0.005: job 4155776
+(`roundgap2`, HFSS's default faceting) and job 4155777 (`roundgap2_facets5`, `wall_normal_deviation_deg = 5.0`,
+read back from the design before the solve). Both COMPLETED.
+
+                                        default facets          5 deg facets
+    T, Ephi=0 / Ephi=1                  0.47632 / 0.47639       0.50958 / 0.50969
+    T Ephi=1 / Ephi=0                   1.00015                 1.00021
+    rows per polarization               7845                    7845
+    holes zeroed (deepest)              62 / 59 (756 / 523 nm)  1 / 1 (0 nm, on the rim)
+    outside values dropped (farthest)   50 / 56 (912 / 1078 nm) 57 / 61 (606 nm)
+    passes, last delta                  3, 0.0049 (6911 tets)   4, 0.0025 / 0.0031 (15258 / 15058 tets)
+    solve, wall time, MaxRSS            57 s, 00:02:19, 1.78 GB 97 s, 00:02:59, 2.09 GB
+
+    FACETS: T 5 deg / default = 1.06983 (Ephi=0), 1.06989 (Ephi=1)
+
+HFSS's default faceting makes the guide effectively narrower: 2000 GHz is only 14 % above the TE11 cutoff, so
+the raised cutoff, and the smaller faceted exit face over which the outgoing power is integrated, put T 7 %
+low. The default run reproduced step 7a's rim counts exactly (the meshing is deterministic). The holes came from
+the polygonal wall and vanish at 5 deg; the values beyond the rim persist at 5 deg (up to 0.6 um, with the wall
+within 0.05 um of the circle), so they come from the export's point location, and the rim rule (HF-029) stays.
+Decision (Rohan, 2026-10-07, ledger HF-032): both round-gap configs carry 5 deg; step 8 runs at 5 deg alongside
+a single-angle 2.5 deg check that 5 deg has converged.
+
 ## 8. Round gap, full sweep
 
 ## Discrepancies and decisions

@@ -1,6 +1,6 @@
-# Round-gap baseline with fine wall facets (Rohan, 2026-10-06, ledger HF-030): identical to
-# round_gap_r50um_2000GHz_single_angle.toml except solver.wall_normal_deviation_deg, so its T measures what HFSS's
-# default faceting of the 50 um circle costs (HPC step 7a: wall up to 0.76 um inside the circle).
+# Faceting check (Rohan, 2026-10-07, ledger HF-032): identical to round_gap_r50um_2000GHz_single_angle.toml
+# except the wall facets, 2.5 deg against the production 5 deg, to show that 5 deg has converged
+# (HPC step 7b: HFSS's default facets put T 7.0 % below 5 deg).
 #
 # One incident angle (normal incidence), one polarization.
 # Round gap: vacuum cylinder r = 50 um, length 0.4 mm along +z (built by build_hfss_project.py from
@@ -38,7 +38,7 @@ phi_step_deg = 45.0
 frequency_ghz = 2000
 max_delta_e = 0.005  # Rohan 2026-10-06 (HF-027): production target; was 0.02
 max_passes = 20
-wall_normal_deviation_deg = 5.0  # HF-030: 72 facets around the circle, wall within 0.05 um of it
+wall_normal_deviation_deg = 2.5  # HF-032: 144 facets around the circle, against 5.0 in production
 cores = 4
 sweep = "discrete"
 
