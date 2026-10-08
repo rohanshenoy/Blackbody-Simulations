@@ -522,6 +522,21 @@ the sweep's normal-incidence T matches the single-angle 5 deg run to 0.1 %. 2.5 
 (+0.3 %) is consistent with an error falling as the square of the facet angle, which puts 5 deg about 0.3 to
 0.5 % below the converged T, within the 1 % that MaxDeltaE 0.005 aims for (HF-027).
 
+## 8a. Test-world tree, both cracks and the round gap
+
+2026-10-08, login node, from the step 5d crack runs (`job_tight1`) and the step 8 round-gap run
+(`job_reference1`), for BBRsim runs of the test world with `/bbr/testworld/roundGap` (ledger HF-035; the
+BBRsim side agreed the layout, HF-033): `/resnick/groups/golwala/rshenoy/bbsim/trees/testworld_2025r2`.
+`cracks_500GHz_2025r2` stays untouched while BBRsim's checks still point at it.
+
+    sha256sum: all OK
+    waveguides/: for each of InfParallelPlate_crack1Rohan_500GHz, InfParallelPlate_crack2_500GHz and
+                 RoundGap_r50um_2000GHz: {.dataset.json, _Ephi=0, _Ephi=1}
+    SHA256SUMS: 21 files; du -sh 310M
+
+The HPC checkout was pulled to `d04945b` the same morning, and the Python environment's package versions were
+captured to `requirements-hpc.txt` (PyAEDT 1.7.0, NumPy 2.4.6, SciPy 1.17.1, pandas 3.0.6).
+
 ## Discrepancies and decisions
 
 Index of the decisions taken during these steps; the evidence is in the step named, and the ledger rows are in
