@@ -72,7 +72,7 @@ def read_exit_field_fld(path: Path, keep_unsolved: bool = False) -> pd.DataFrame
         rows.append(values)
     if odd_outside:
         counts = dict(sorted(Counter(n for _, n in odd_outside).items()))
-        fate = ("kept as unsolved lattice points (nan field) for the caller's rim rule" if keep_unsolved
+        fate = ("kept as unsolved lattice points (nan field) for the caller to zero-fill or drop" if keep_unsolved
                 else "skipped as outside points")
         log.warning("%s: %d all-nan rows with a token count other than %d (counts %s, first at line %d) %s; HFSS "
                     "writes unsolved points in another form, or the export was cut short",

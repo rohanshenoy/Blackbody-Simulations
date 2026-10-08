@@ -392,9 +392,16 @@ def extract_waveguide(hfss: Any, ctx: ExtractionContext, ephi: int, face: ExitFa
             else:
                 fields.CalculatorWrite(str(path), ["Solution:=", ctx.solution], args)
             wait_for_file(path, ctx.timeout_s)
-            df = read_exit_field_fld(path, keep_unsolved=disc)
+            # HFSS writes one row per lattice point, nan where it has no field, so the raw row count is exact:
+            # the .fld carries no count of its own, and a uniformly short export (every key) or a single-key run
+            # would otherwise pass the per-key consistency check below and reach the sidecar as "omitted" points.
+            df = read_exit_field_fld(path, keep_unsolved=ctx.exit_field.manual)
             path.unlink()
             where = f"exit field for phi={phi} theta={theta} Ephi={ephi}"
+            if ctx.exit_field.manual and len(df) != grid.lattice_points:
+                raise FieldFileError(
+                    f"{where}: the export has {len(df)} rows but the lattice has {grid.lattice_points} points "
+                    f"{grid.counts}; the export was cut short, or the lattice model disagrees with HFSS")
             if disc:
                 df, rim = retain_disc_lattice(df, face.cross_section, where)
                 log.info("%s: rim: %d unsolved inside points set to zero (deepest %.3g m), %d valued outside points "
@@ -402,6 +409,9 @@ def extract_waveguide(hfss: Any, ctx: ExtractionContext, ephi: int, face: ExitFa
                          rim["valued_outside_dropped"], rim["farthest_valued_outside_m"])
                 if rim_log is not None:
                     rim_log.setdefault(str(ephi), []).append({"key": [float(phi), float(theta)], **rim})
+            elif ctx.exit_field.manual:
+                # Legacy rule for every other outline: a lattice point HFSS left without field is outside the solid.
+                df = df[df[FIELD_COLUMNS].notna().all(axis=1)].reset_index(drop=True)
             check_points_within(df, face.cross_section, where, polygon_tol_m=face.sagitta_mm * 1e-3)
             if frames and len(df) != len(frames[0]):
                 # Geant4 pairs exit points across polarizations by row index; every angle must have the same grid.

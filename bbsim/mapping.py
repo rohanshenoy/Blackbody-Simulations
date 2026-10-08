@@ -35,6 +35,11 @@ def load_mapping(path: Path) -> DesignMapping:
     renames = tuple(DesignRename(**entry) for entry in data["renames"])
     if not renames:
         raise ValueError(f"{path}: no renames")
+    ids = [r.dataset_id for r in renames]
+    repeated = sorted({i for i in ids if ids.count(i) > 1})
+    if repeated:
+        # Two designs sharing a dataset_id would write into one dataset directory and tree entry.
+        raise ValueError(f"{path}: dataset_id repeated across renames: {repeated}")
     return DesignMapping(renames)
 
 
