@@ -464,3 +464,39 @@ gap cannot prefer a polarization or an azimuth, and step 7b's polarizations agre
 means a frame or polarization error; stop and report. The `FACETS` lines: 2.5 deg against 5 deg within about
 0.5 % of 1 means 5 deg has converged and step 8 is the round gap's first dataset; a larger change means step 8
 reruns at 2.5 deg. Record memory and wall time; they size the job array.
+
+## 8b. Power diagnostic on the solved projects (batch, no solve)
+
+The power normalization is under review (Codex queue CDX-009, 013, 014, 015; ledger G4-020, OR-019). This step
+measures what the tables' T is made of, on copies of the three solved projects: the exit integrals of |Re S|,
+Re S_z, |Re S_z| and Re S . n; the entrance flux with total and with scattered fields; the incident amplitude
+|E_total - E_scattered| just inside the entrance; and the far-field power over both hemispheres, with total and
+with scattered fields. No solve and no solver licence, one AEDT session per job. Each job gets
+`diagnose_poynting/poynting.json`; nothing else in the job changes, and the copy is removed after a successful
+run. One paste:
+
+    cd /home/rshenoy/BBRSim/Blackbody-Simulations && git pull --ff-only fork linux-hpc-migration
+    O=/home/rshenoy/BBRSim/outputs
+    for J in $O/InfParallelPlate_crack1Rohan_500GHz/job_tight1 $O/InfParallelPlate_crack2_500GHz/job_tight1 $O/RoundGap_r50um_2000GHz/job_reference1; do
+      du -sh $J/project/*.aedtresults
+      sbatch -A golwala -p expansion -q normal -N 1 -c 4 --mem=16G -t 02:00:00 -o $O/slurm-%j.out \
+        --wrap "bash -lc 'source /home/rshenoy/BBRSim/bb_env.sh && cd /home/rshenoy/BBRSim/Blackbody-Simulations && python hpc/diagnose_poynting.py --job $J'"
+    done
+    squeue -u rshenoy
+
+When the three jobs have left the queue, for each job id:
+
+    sed -n '/== diagnose_poynting/,/POYNTING:/p' /home/rshenoy/BBRSim/outputs/slurm-<id>.out
+    sacct -j <id> -o JobID,State,ExitCode,Elapsed,MaxRSS
+
+Expected: exit 0 and `POYNTING: ok` for each, which means the exit |Re S| integral reproduced the recorded
+OutgoingPower at every key (the copy, the variation and the expression are the run's). `out/in`, the exit flux
+over the entrance flux with total fields, is 1.00 at every transmitting key to the mesh's accuracy (about 1 %),
+since the walls are PEC. `|E_inc|` is 1.000 V/m at every key, as IngoingPower assumes. `|S|/S_z` is 1.000 at
+normal incidence. Measured rather than predicted: `|S|/S_z` at the oblique keys (CDX-009); `in/geom`, the power
+entering per unit of geometric incident flux I A |cos alpha| (above 1 means capture beyond the geometric
+opening; blank at 90 deg); `scat/geom`; and `ff/flux`, `ff_fwd/flux`, `ff_scat/flux`, the far field against the
+exit flux (Codex found 0.18 and 0.34 on the stored outward hemisphere, CDX-015). Exit 2 with "nothing started"
+names its reason; exit 1 lists what failed in the table's header and keeps the copy under
+`diagnose_poynting/project` for inspection (remove it after reporting). Paste the three blocks and the `sacct`
+lines.
