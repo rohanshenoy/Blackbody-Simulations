@@ -130,48 +130,66 @@ def main(argv: list[str] | None = None) -> int:
 
     from bbsim.session import aedt_session, aedt_versions  # lazy PyAEDT import
 
-    with temporary_copy(input_path) as work:
-        with aedt_session(work, design=None, version=args.aedt_version) as hfss:
-            versions = aedt_versions(hfss)
-            source_inv = inventory_project(hfss)
-            source_inv["project_file"] = str(input_path)   # inventoried via a temporary copy of this file
-            source_inv["source_sha256"] = source_sha
-            write_json(output_path.with_suffix(".inventory.source.json"), source_inv)
-            errors = validate_mapping(mapping, source_inv)
-            deletions = plan_deletions(mapping, source_inv)
-            print(_report(source_inv, mapping, deletions, errors))
-            if errors:
-                return 2
-            if args.dry_run:
-                print("\nDry run: no project written.")
-                return 0
+    saved, actions, error, prepared_inv = False, [], None, None
+    try:
+        with temporary_copy(input_path) as work:
+            with aedt_session(work, design=None, version=args.aedt_version) as hfss:
+                versions = aedt_versions(hfss)
+                source_inv = inventory_project(hfss)
+                source_inv["project_file"] = str(input_path)   # inventoried via a temporary copy of this file
+                source_inv["source_sha256"] = source_sha
+                write_json(output_path.with_suffix(".inventory.source.json"), source_inv)
+                errors = validate_mapping(mapping, source_inv)
+                deletions = plan_deletions(mapping, source_inv)
+                print(_report(source_inv, mapping, deletions, errors))
+                if errors:
+                    return 2
+                if args.dry_run:
+                    print("\nDry run: no project written.")
+                    return 0
 
-            hfss.save_project(file_name=str(output_path), overwrite=True)  # 2023 R2 -> 2025 R2 on this copy only
-            actions = [{"save_as": str(output_path)}] + apply_cleanup(hfss, mapping, deletions)
+                hfss.save_project(file_name=str(output_path), overwrite=True)  # 2023 R2 -> 2025 R2 on this copy only
+                saved = True
+                actions = [{"save_as": str(output_path)}]
+                actions += apply_cleanup(hfss, mapping, deletions)
 
-    with aedt_session(output_path, design=None, version=args.aedt_version) as hfss:
-        prepared_inv = inventory_project(hfss)
-    write_json(output_path.with_suffix(".inventory.json"), prepared_inv)
+        with aedt_session(output_path, design=None, version=args.aedt_version) as hfss:
+            prepared_inv = inventory_project(hfss)
+        write_json(output_path.with_suffix(".inventory.json"), prepared_inv)
+    except Exception as exc:  # noqa: BLE001 - after the SaveAs the output exists and its records must say what happened
+        if not saved:
+            raise
+        error = f"{type(exc).__name__}: {exc}"
+        log.exception("preparation failed after the output was written")
+        # The previous run's inventory would describe a file this run has overwritten.
+        output_path.with_suffix(".inventory.json").unlink(missing_ok=True)
 
-    diffs = compare_retained_designs(source_inv, prepared_inv, mapping.design_map, mapping.object_map)
-    expected, actual = set(mapping.design_map.values()), set(prepared_inv["designs"])
-    if expected != actual:
-        diffs.append(f"prepared project designs {sorted(actual)} != expected {sorted(expected)}")
-    for d in prepared_inv["designs"].values():
-        if d["boundaries"] or d["excitations"] or d["setups"]:
-            diffs.append(f"{d['name']} carries boundaries/excitations/setups; base designs must be bare")
+    diffs: list[str] = []
+    if prepared_inv is not None:
+        diffs = compare_retained_designs(source_inv, prepared_inv, mapping.design_map, mapping.object_map)
+        expected, actual = set(mapping.design_map.values()), set(prepared_inv["designs"])
+        if expected != actual:
+            diffs.append(f"prepared project designs {sorted(actual)} != expected {sorted(expected)}")
+        for d in prepared_inv["designs"].values():
+            if d["boundaries"] or d["excitations"] or d["setups"]:
+                diffs.append(f"{d['name']} carries boundaries/excitations/setups; base designs must be bare")
 
     record = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "source_project": str(input_path), "source_sha256": source_sha,
         "source_sha256_after": sha256_file(input_path),
-        "output_project": str(output_path), "output_sha256": sha256_file(output_path),
+        "output_project": str(output_path),
+        "output_sha256": sha256_file(output_path) if output_path.is_file() else None,
         "versions": versions, "renames": [asdict(r) for r in mapping.renames],
-        "deleted_designs": deletions, "actions": actions, "verification_differences": diffs,
+        "deleted_designs": deletions, "actions": actions, "error": error, "verification_differences": diffs,
     }
     if record["source_sha256_after"] != source_sha:
         diffs.append("source project hash changed during preparation")
+    # Written on failure too, so a record of an earlier run never sits beside a project it does not describe.
     write_json(output_path.with_suffix(".mapping.json"), record)
+    if error:
+        print(f"\nPREPARATION FAILED after the output was written: {error}\nRecord: {output_path.with_suffix('.mapping.json')}")
+        return 3
     if diffs:
         print("\nVERIFICATION FAILED:\n  " + "\n  ".join(diffs))
         return 3
