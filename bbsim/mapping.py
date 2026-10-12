@@ -70,3 +70,24 @@ def validate_mapping(mapping: DesignMapping, source_inventory: dict[str, Any], t
 def plan_deletions(mapping: DesignMapping, source_inventory: dict[str, Any]) -> list[str]:
     retained = set(mapping.design_map)
     return sorted(name for name in source_inventory["designs"] if name not in retained)
+
+
+def recorded_dataset_id(project_path: Path, design: str, obj: str) -> tuple[str | None, Path | None]:
+    """The dataset_id that the record beside a prepared or built project gives (design, object), and that record.
+
+    prepare_project writes ``<project>.mapping.json`` and build_project ``<project>.build.json``. Returns
+    ``(None, None)`` when neither exists and ``(None, record)`` when the record has no entry for the pair.
+    """
+    project_path = Path(project_path)
+    mapping, build = project_path.with_suffix(".mapping.json"), project_path.with_suffix(".build.json")
+    if mapping.is_file():
+        for r in json.loads(mapping.read_text()).get("renames", []):
+            if r.get("new_design") == design and r.get("new_object") == obj:
+                return str(r["dataset_id"]), mapping
+        return None, mapping
+    if build.is_file():
+        p = (json.loads(build.read_text()).get("spec") or {}).get("project") or {}
+        if p.get("design") == design and p.get("object") == obj:
+            return str(p["dataset_id"]), build
+        return None, build
+    return None, None

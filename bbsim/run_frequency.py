@@ -126,6 +126,16 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
     source = cfg.project.path
     if not source.is_file():
         raise FileNotFoundError(f"prepared project not found: {source}")
+    # The run config names the dataset; the record beside the project says which dataset its design is.
+    from bbsim.mapping import recorded_dataset_id
+    recorded_id, record = recorded_dataset_id(source, cfg.project.design, cfg.geometry.object)
+    if recorded_id is not None and recorded_id != cfg.project.dataset_id:
+        raise ValueError(f"config dataset_id {cfg.project.dataset_id!r} disagrees with {record}, which gives "
+                         f"{recorded_id!r} for design {cfg.project.design!r} object {cfg.geometry.object!r}")
+    if recorded_id is None:
+        log.warning("dataset_id %r not confirmed: %s", cfg.project.dataset_id,
+                    f"{record} has no entry for {cfg.project.design}/{cfg.geometry.object}" if record
+                    else f"no .mapping.json or .build.json beside {source}")
     job_project = dirs.project / source.name
     shutil.copy2(source, job_project)
     source_sha, job_sha = sha256_file(source), sha256_file(job_project)
@@ -258,6 +268,7 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
         config=config_to_dict(cfg),
         job={"id": job_id, "root": str(dirs.root), "wall_time_s": time.perf_counter() - t_start, "solve_time_s": solve_s},
         project={"source_path": str(source), "source_sha256": source_sha, "job_copy": str(job_project),
+                 "dataset_id_record": {"path": str(record) if record else None, "dataset_id": recorded_id},
                  "job_copy_sha256_before_run": job_sha, "base_design": cfg.project.design, "run_design": run_design},
         geometry={"object": cfg.geometry.object, "units": "mm", "material": solid["material"],
                   "bounding_box_mm": solid["bounding_box_mm"],
