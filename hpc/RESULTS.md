@@ -591,6 +591,35 @@ What the run settles (the keys that carry no power, theta 0 and the blocked pola
 
 The cracks' far-field fractions (CDX-015) wait for step 8c.
 
+## 8c. Power diagnostic, the cracks' far fields
+
+2026-10-12, code `e8efd33`, no solve: job 4394506 (crack1 `job_tight1`) and 4394507 (crack2 `job_tight1`), on
+fresh copies; run 1's records kept as `diagnose_poynting_run1/poynting.json`. Both COMPLETED, exit 0, `POYNTING:
+ok`; 8:58 and 10:29, MaxRSS 2.12 and 2.22 GB; each job's `diagnose_poynting/` holds only `poynting.json`. Every
+column of run 1 is reproduced to the printed digit; the far-field columns are new.
+
+The round gap's exit 1 in step 8b is explained by the end of its Slurm log: after `POYNTING: ok`, `shutil.rmtree`
+of the project copy raised `OSError: [Errno 39] Directory not empty` (AEDT's files still open on NFS). Since
+`9fccac4` that is reported and the run exits 0.
+
+Far field over the full sphere (ff) and over the outward hemisphere (fwd), against the exit flux Re S_z:
+
+    crack1  key (Ephi, IWavePhi, IWaveTheta)        ff      fwd       crack2   ff      fwd
+            IWavePhi 0, and normal incidence        0.1927  0.1786             0.3749  0.3483
+            (0 or 1, 45, 45 or 135)                 0.1782  0.1605             0.3487  0.3147
+            (0 or 1, 45, 90), (1, 90, 45 or 135)    0.1625  0.1397             0.3200  0.2756
+            (1, 90, 90)                             0.1239  0.0859             0.2336  0.1618
+    round gap (step 8b), every key                  0.730   0.664
+
+At normal incidence the far field holds 0.193 (crack1) and 0.375 (crack2) of the power that crosses the exit
+face, close to the narrow-slot estimate for equivalent currents radiating with no wall around the opening,
+3 k w / 8 = 0.196 and 0.393 (k w = 0.524 and 1.048 at 500 GHz). The outward hemisphere's share against the
+tables' OutgoingPower, 0.178 and 0.348, matches Codex's 0.176 and 0.345 on the Windows tables (CDX-015). The
+fraction is the same at every key tilted across the gap, where the exit field keeps one shape, and falls on the
+keys whose exit field carries higher modes along the long side. So the far-field tables give exit directions
+(a pattern) but not the transmitted power, and their integral is not an energy check. The physics review
+(ledger HF-036, HF-037) takes these numbers.
+
 ## Discrepancies and decisions
 
 Index of the decisions taken during these steps; the evidence is in the step named, and the ledger rows are in
