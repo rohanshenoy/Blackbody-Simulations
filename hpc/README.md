@@ -500,3 +500,39 @@ exit flux (Codex found 0.18 and 0.34 on the stored outward hemisphere, CDX-015).
 names its reason; exit 1 lists what failed in the table's header and keeps the copy under
 `diagnose_poynting/project` for inspection (remove it after reporting). Paste the three blocks and the `sacct`
 lines.
+
+## 8c. Power diagnostic: the cracks again, and the round gap's exit code (batch, no solve)
+
+Step 8b's crack jobs failed only on the far field, which the shared `.ffd` reader refused (RESULTS 8b; fixed in
+`9fccac4`). This reruns the two cracks and reads why the round-gap job exited 1 after printing `ok`. Each run 1
+record stays as `diagnose_poynting_run1/poynting.json`; its project copy and exports (the size of the job's
+`.aedtresults`) are removed first, and the jobs' own `project/` directories are not touched. One paste:
+
+    cd /home/rshenoy/BBRSim/Blackbody-Simulations && git pull --ff-only fork linux-hpc-migration
+    O=/home/rshenoy/BBRSim/outputs
+    tail -15 $O/slurm-4264788.out
+    R=$O/RoundGap_r50um_2000GHz/job_reference1/diagnose_poynting; ls $R; rm -rf "$R/project" "$R/scratch"
+    for J in $O/InfParallelPlate_crack1Rohan_500GHz/job_tight1 $O/InfParallelPlate_crack2_500GHz/job_tight1; do
+      D=$J/diagnose_poynting
+      test -f "$D/poynting.json" && rm -rf "$D/project" "$D/scratch" && mv "$D" "${D}_run1" && ls "${D}_run1"
+      sbatch -A golwala -p expansion -q normal -N 1 -c 4 --mem=16G -t 02:00:00 -o $O/slurm-%j.out \
+        --wrap "bash -lc 'source /home/rshenoy/BBRSim/bb_env.sh && cd /home/rshenoy/BBRSim/Blackbody-Simulations && python hpc/diagnose_poynting.py --job $J'"
+    done
+    squeue -u rshenoy
+
+When both jobs have left the queue, for each job id:
+
+    sed -n '/== diagnose_poynting/,/POYNTING:/p' /home/rshenoy/BBRSim/outputs/slurm-<id>.out
+    tail -3 /home/rshenoy/BBRSim/outputs/slurm-<id>.out
+    sacct -j <id> -o JobID,State,ExitCode,Elapsed,MaxRSS
+
+Expected: the round gap's log ends in a traceback from `shutil.rmtree` (an `OSError` such as "Directory not
+empty" or "Device or resource busy", from AEDT's `.nfs` files) after its `POYNTING: ok` line, and `ls` shows
+`project` beside `poynting.json`; anything else, stop and report. Each `ls ..._run1` shows only
+`poynting.json`. Both crack jobs: exit 0 and `POYNTING: ok`; the T, `|S|/S_z`, `out/in`, `in/geom` and
+`|E_inc|` columns equal run 1's (same project, same expressions); `ff/flux`, `ff_fwd/flux` and `ff_scat/flux`
+filled at every transmitting key and blank at the keys that carry no power. Predicted, not assumed: `ff/flux`
+near 0.2 for crack1 and 0.4 for crack2 at normal incidence, the fraction of the exit flux that equivalent
+currents on a slot about a tenth of a wavelength wide radiate (Codex found 0.18 and 0.34 on the outward
+hemisphere, CDX-015). If a copy cannot be removed, the run now says so and still exits 0; remove it by hand.
+Paste the round gap's `tail` and `ls`, the two blocks with their `tail` lines, and the `sacct` lines.

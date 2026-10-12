@@ -537,6 +537,60 @@ BBRsim side agreed the layout, HF-033): `/resnick/groups/golwala/rshenoy/bbsim/t
 The HPC checkout was pulled to `d04945b` the same morning, and the Python environment's package versions were
 captured to `requirements-hpc.txt` (PyAEDT 1.7.0, NumPy 2.4.6, SciPy 1.17.1, pandas 3.0.6).
 
+## 8b. Power diagnostic, run 1
+
+2026-10-08, code `8427097`, no solve, on copies of the three solved projects (ledger HF-036; Codex queue
+CDX-009, 013, 014, 015): job 4264786 (crack1 `job_tight1`), 4264787 (crack2 `job_tight1`), 4264788 (round gap
+`job_reference1`). All three FAILED with exit 1; 9:02, 10:06 and 5:11, MaxRSS 2.09, 2.10 and 1.52 GB.
+
+Neither failure touched the measurements; both were in our code:
+- crack1 and crack2: every total far-field export was refused by the shared `.ffd` reader, "header has 2048
+  phi points but step 0.17578125 gives 2047". AEDT printed the last phi, 179.82421875, as 179.824, and the
+  reader rebuilt the axis with `np.arange` up to the printed end. The runner uses the same reader, so a
+  job-array frequency whose far-field step does not print exactly would have failed after its solve. Fixed in
+  `9fccac4`; the cracks' far fields are rerun in step 8c.
+- round gap: printed `POYNTING: ok`, then exited 1. Probable cause: removing the project copy on NFS after the
+  report. That removal no longer fails the run (`9fccac4`); step 8c reads the end of the Slurm log to confirm.
+
+Selected keys (Ephi, IWavePhi, IWaveTheta); every key is in the Slurm outputs and in each job's
+`diagnose_poynting/poynting.json`. T_table is OutgoingPower/IngoingPower as in the tables (exit |Re S|);
+T_flux uses the exit flux Re S_z; out/in is exit flux over entrance net flux; in/geom is entrance net flux over
+the geometric incident power I A |cos alpha| (blank at theta 90); ff/flux is the far field over the full
+sphere against the exit flux.
+
+    crack1     key          T_table  T_flux  |S|/S_z  out/in  in/geom  |E_inc|
+               (0, 0,180)   0.9923   0.9904  1.0019   1.0028  0.9877   1.0000
+               (0, 0,135)   0.7147   0.7134  1.0019   1.0029  1.0059   1.0000
+               (0, 0, 90)   0.2425   0.2420  1.0019   1.0030  -        1.0000
+               (0,45,135)   0.3931   0.3555  1.1058   1.0024  0.5015   1.0000
+               (1,90,135)   0.7717   0.6522  1.1832   1.0011  0.9214   1.0000
+               (1,90, 90)   0.0377   0.0337  1.1176   1.0032  -        1.0000
+    crack2     (0, 0,180)   0.9923   0.9901  1.0022   1.0021  0.9880   1.0000
+               (0, 0,135)   0.6904   0.6889  1.0022   1.0023  0.9721   1.0000
+               (0,45,135)   0.3801   0.3457  1.0994   0.9987  0.4896   1.0000
+               (1,90,135)   0.7462   0.6426  1.1611   1.0015  0.9074   1.0000
+    round gap  (0, 0,180)   0.5101   0.5101  1.0001   1.0060  0.5070   1.0000   ff/flux 0.7303, forward 0.6642
+               (1, 0,135)   0.2595   0.2594  1.0000   1.0044  0.3653   1.0000   ff/flux 0.7302, forward 0.6641
+
+What the run settles (the keys that carry no power, theta 0 and the blocked polarization, give noise ratios):
+- `|E_inc|` is 1.0000 V/m at every key of all three projects: HFSS keeps the plane wave's amplitude at every
+  angle, as IngoingPower assumes. This closes the loophole left open on 2026-10-08.
+- `out/in` is 0.997 to 1.008 at every transmitting key: what enters through the entrance face leaves through the
+  exit face, as PEC walls require, to under 1 %.
+- `|S|/S_z` (CDX-009): 1.002 at normal incidence and for tilts across the gap (phi 0); 1.10 to 1.11 on the
+  diagonal (phi 45, theta 45 and 135) and 1.12 to 1.18 for tilts along the long side (phi 90) and at (45, 90).
+  The tables' T, from |Re S|, overstates the exit flux by up to 18 %: crack1 (1, 90, 135) is 0.7717 by |S| and
+  0.6522 by flux.
+- `in/geom` (CDX-013): for the transmitting polarization the power entering is close to the geometric
+  intercepted power at 45 deg, 1.006 (crack1) and 0.972 (crack2) across the gap and 0.92 and 0.91 along the long
+  side, against 0.988 at normal incidence. The tables divide by the normal-incidence reference, so T_table at
+  45 deg is about |cos alpha| times the probability per intercepted photon.
+- Round gap: 0.507 of the geometric power enters at normal incidence (about half is reflected at the entrance,
+  14 % above the TE11 cutoff); `|S|/S_z` is 1.000 (one mode); the far field over the full sphere holds 0.730 of
+  the exit flux, 0.664 forward, the same at every key.
+
+The cracks' far-field fractions (CDX-015) wait for step 8c.
+
 ## Discrepancies and decisions
 
 Index of the decisions taken during these steps; the evidence is in the step named, and the ledger rows are in
