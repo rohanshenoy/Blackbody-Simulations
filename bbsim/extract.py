@@ -225,6 +225,23 @@ def _outside_outline_hull(y: np.ndarray, z: np.ndarray, vertices_m: Sequence[Seq
     return np.any(distance > tol_m, axis=1)
 
 
+def outside_cross_section(df: pd.DataFrame, cross_section: dict, where: str, rel_tol: float = CONTAIN_REL_TOL,
+                          polygon_tol_m: float = 0.0) -> np.ndarray:
+    """Mask of the exit points (metres, exit frame) outside the declared cross-section, boundary included inside."""
+    y, z = (df[c].to_numpy(dtype=float) for c in ("Y", "Z"))
+    shape = cross_section["shape"]
+    if shape == "disc":
+        return y * y + z * z > cross_section["radius_m"] ** 2 * (1 + rel_tol)
+    if shape == "rectangle":
+        return ((np.abs(y) > cross_section["y_e_half_m"] * (1 + rel_tol))
+                | (np.abs(z) > cross_section["z_e_half_m"] * (1 + rel_tol)))
+    if shape == "polygon":
+        outline = np.asarray(cross_section["vertices_m"], dtype=float)
+        size = float(np.max(np.ptp(outline, axis=0))) if len(outline) else 0.0
+        return _outside_outline_hull(y, z, outline, rel_tol * size + polygon_tol_m)
+    raise FieldFileError(f"{where}: unknown cross-section shape {shape!r}")
+
+
 def check_points_within(df: pd.DataFrame, cross_section: dict, where: str,
                         rel_tol: float = CONTAIN_REL_TOL, plane_tol_m: float = PLANE_TOL_M,
                         polygon_tol_m: float = 0.0) -> None:
@@ -233,21 +250,11 @@ def check_points_within(df: pd.DataFrame, cross_section: dict, where: str,
     Catches an HFSS that writes values (for example zeros) instead of nan for lattice points outside the solid.
     ``polygon_tol_m`` widens a polygon outline built from edge samples, whose chords cut inside the true edge.
     """
-    x, y, z = (df[c].to_numpy(dtype=float) for c in ("X", "Y", "Z"))
+    x = df["X"].to_numpy(dtype=float)
     if len(x) and float(np.max(np.abs(x))) > plane_tol_m:
         raise FieldFileError(f"{where}: exit points off the plane x_e = 0 (max |X| = {np.max(np.abs(x)):.3e} m)")
     shape = cross_section["shape"]
-    if shape == "disc":
-        outside = y * y + z * z > cross_section["radius_m"] ** 2 * (1 + rel_tol)
-    elif shape == "rectangle":
-        outside = ((np.abs(y) > cross_section["y_e_half_m"] * (1 + rel_tol))
-                   | (np.abs(z) > cross_section["z_e_half_m"] * (1 + rel_tol)))
-    elif shape == "polygon":
-        outline = np.asarray(cross_section["vertices_m"], dtype=float)
-        size = float(np.max(np.ptp(outline, axis=0))) if len(outline) else 0.0
-        outside = _outside_outline_hull(y, z, outline, rel_tol * size + polygon_tol_m)
-    else:
-        raise FieldFileError(f"{where}: unknown cross-section shape {shape!r}")
+    outside = outside_cross_section(df, cross_section, where, rel_tol, polygon_tol_m)
     if np.any(outside):
         raise FieldFileError(f"{where}: {int(np.sum(outside))} exit points lie outside the declared {shape} "
                              "cross-section; HFSS must write nan, not values, outside the solid")
@@ -354,6 +361,41 @@ def evaluate_outgoing_power(hfss: Any, ctx: ExtractionContext, ephi: int) -> dic
     return power
 
 
+def _checked_exit_field(df: pd.DataFrame, ctx: ExtractionContext, face: ExitFaceGeometry, grid: ExitGrid | None,
+                        disc: bool, where: str, rim_log: dict | None, ephi: int, phi: float, theta: float,
+                        frames: list[pd.DataFrame]) -> pd.DataFrame:
+    """Apply the lattice, rim, containment and pairing rules to one raw exit-field export."""
+    if grid is not None and len(df) != grid.lattice_points:
+        raise FieldFileError(
+            f"{where}: the export has {len(df)} rows but the lattice has {grid.lattice_points} points "
+            f"{grid.counts}; the export was cut short, or the lattice model disagrees with HFSS")
+    if disc:
+        df, rim = retain_disc_lattice(df, face.cross_section, where)
+        log.info("%s: rim: %d unsolved inside points set to zero (deepest %.3g m), %d valued outside points "
+                 "dropped (farthest %.3g m)", where, rim["unsolved_inside_zeroed"], rim["deepest_unsolved_inside_m"],
+                 rim["valued_outside_dropped"], rim["farthest_valued_outside_m"])
+        if rim_log is not None:
+            rim_log.setdefault(str(ephi), []).append({"key": [float(phi), float(theta)], **rim})
+    elif grid is not None:
+        # Every other outline: a lattice point HFSS left without field may lie outside the solid, where the lattice
+        # is wider than the face, and is dropped; one inside the declared cross-section is a hole in the exit face.
+        unsolved = ~df[FIELD_COLUMNS].notna().all(axis=1).to_numpy()
+        polygon_tol_m = face.sagitta_mm * 1e-3
+        holes = unsolved & ~outside_cross_section(df, face.cross_section, where, polygon_tol_m=polygon_tol_m)
+        if np.any(holes):
+            ys, zs = df.loc[holes, "Y"], df.loc[holes, "Z"]
+            raise FieldFileError(
+                f"{where}: HFSS left {int(np.sum(holes))} lattice points inside the declared "
+                f"{face.cross_section['shape']} without field (Y {ys.min():.4g} to {ys.max():.4g} m, Z {zs.min():.4g} "
+                f"to {zs.max():.4g} m); a hole in the exit face cannot be dropped as an outside point")
+        df = df[~unsolved].reset_index(drop=True)
+    check_points_within(df, face.cross_section, where, polygon_tol_m=face.sagitta_mm * 1e-3)
+    if frames and len(df) != len(frames[0]):
+        # Geant4 pairs exit points across polarizations by row index; every angle must have the same grid.
+        raise FieldFileError(f"{where} has {len(df)} points, but the first angle had {len(frames[0])}")
+    return df
+
+
 def extract_waveguide(hfss: Any, ctx: ExtractionContext, ephi: int, face: ExitFaceGeometry,
                       rim_log: dict | None = None) -> pd.DataFrame:
     """The waveguide table of one polarization. For a disc, ``retain_disc_lattice`` keeps the whole lattice inside
@@ -396,29 +438,17 @@ def extract_waveguide(hfss: Any, ctx: ExtractionContext, ephi: int, face: ExitFa
             # the .fld carries no count of its own, and a uniformly short export (every key) or a single-key run
             # would otherwise pass the per-key consistency check below and reach the sidecar as "omitted" points.
             df = read_exit_field_fld(path, keep_unsolved=ctx.exit_field.manual)
-            path.unlink()
             where = f"exit field for phi={phi} theta={theta} Ephi={ephi}"
-            if ctx.exit_field.manual and len(df) != grid.lattice_points:
-                raise FieldFileError(
-                    f"{where}: the export has {len(df)} rows but the lattice has {grid.lattice_points} points "
-                    f"{grid.counts}; the export was cut short, or the lattice model disagrees with HFSS")
-            if disc:
-                df, rim = retain_disc_lattice(df, face.cross_section, where)
-                log.info("%s: rim: %d unsolved inside points set to zero (deepest %.3g m), %d valued outside points "
-                         "dropped (farthest %.3g m)", where, rim["unsolved_inside_zeroed"], rim["deepest_unsolved_inside_m"],
-                         rim["valued_outside_dropped"], rim["farthest_valued_outside_m"])
-                if rim_log is not None:
-                    rim_log.setdefault(str(ephi), []).append({"key": [float(phi), float(theta)], **rim})
-            elif ctx.exit_field.manual:
-                # Legacy rule for every other outline: a lattice point HFSS left without field is outside the solid.
-                df = df[df[FIELD_COLUMNS].notna().all(axis=1)].reset_index(drop=True)
-            check_points_within(df, face.cross_section, where, polygon_tol_m=face.sagitta_mm * 1e-3)
-            if frames and len(df) != len(frames[0]):
-                # Geant4 pairs exit points across polarizations by row index; every angle must have the same grid.
-                raise FieldFileError(
-                    f"exit field for phi={phi} theta={theta} Ephi={ephi} has {len(df)} points, "
-                    f"but the first angle had {len(frames[0])}"
-                )
+            try:
+                df = _checked_exit_field(df, ctx, face, grid if ctx.exit_field.manual else None, disc, where,
+                                         rim_log, ephi, phi, theta, frames)
+            except FieldFileError:
+                # The export is the only evidence of what HFSS wrote (HPC step 7 needed a second solve without it).
+                kept = path.with_name(f"failed_{path.stem}_phi{float(phi):g}_theta{float(theta):g}{path.suffix}")
+                path.replace(kept)
+                log.error("%s: the raw export is kept as %s", where, kept)
+                raise
+            path.unlink()
             df["Freq"] = ctx.freq_label
             df["Ephi"] = ephi
             df["IWavePhi"] = float(phi)
