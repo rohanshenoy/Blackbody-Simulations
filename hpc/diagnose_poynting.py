@@ -58,6 +58,7 @@ WORK_DIR = "diagnose_poynting"
 ENTRANCE_FACE_LIST = "incoming"
 SPHERE = "dg_full_sphere"
 CSV_TOLERANCE = 1e-4
+DARK_FRACTION = 1e-6      # keys whose exit flux is below this fraction of IngoingPower transmit nothing
 INSIDE_MM = 0.001        # the incident-field line lies this far inside the entrance face
 FIELD_COLUMNS = ["Ex_real", "Ey_real", "Ez_real", "Ex_imag", "Ey_imag", "Ez_imag"]
 
@@ -167,6 +168,8 @@ def derived(rec: dict[str, Any], ingoing_w: float) -> dict[str, float | None]:
     scattered_out = -ent["scattered"]["flux_z_w"] if ent["scattered"]["flux_z_w"] is not None else None
     ff = rec["far_field"]
     flux_out = exit_["flux_z_w"]
+    # Far-field ratios only where the gap transmits; elsewhere the exit flux is solver noise (round gap, theta 0: 1e37).
+    lit = flux_out if flux_out is not None and flux_out > DARK_FRACTION * ingoing_w else None
     return {
         "T_table": _ratio(exit_["mag_w"], ingoing_w),
         "T_flux": _ratio(flux_out, ingoing_w),
@@ -175,9 +178,9 @@ def derived(rec: dict[str, Any], ingoing_w: float) -> dict[str, float | None]:
         "exit_over_entrance_flux": _ratio(flux_out, ent["total"]["flux_z_w"]),
         "entrance_flux_over_geometric": _ratio(ent["total"]["flux_z_w"], geometric),
         "scattered_out_over_geometric": _ratio(scattered_out, geometric),
-        "far_total_over_exit_flux": _ratio((ff.get("TotalFields") or {}).get("total_w"), flux_out),
-        "far_forward_over_exit_flux": _ratio((ff.get("TotalFields") or {}).get("forward_w"), flux_out),
-        "far_scattered_total_over_exit_flux": _ratio((ff.get("ScatteredFields") or {}).get("total_w"), flux_out),
+        "far_total_over_exit_flux": _ratio((ff.get("TotalFields") or {}).get("total_w"), lit),
+        "far_forward_over_exit_flux": _ratio((ff.get("TotalFields") or {}).get("forward_w"), lit),
+        "far_scattered_total_over_exit_flux": _ratio((ff.get("ScatteredFields") or {}).get("total_w"), lit),
         "csv_relative_difference": (None if exit_["mag_w"] is None or not rec["csv_outgoing_power_w"]
                                     else exit_["mag_w"] / rec["csv_outgoing_power_w"] - 1.0),
     }
@@ -438,7 +441,10 @@ def main(argv: list[str] | None = None) -> int:
     if status == "ok":
         shutil.rmtree(scratch, ignore_errors=True)
         if not args.keep_copy:
-            shutil.rmtree(work / "project")
+            try:
+                shutil.rmtree(work / "project")
+            except OSError as exc:  # AEDT or NFS may still hold files; the measurements are already written
+                print(f"   note: could not remove the project copy {work / 'project'} ({exc}); remove it by hand")
         return 0
     return 1
 

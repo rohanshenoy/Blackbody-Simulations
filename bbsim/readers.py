@@ -103,6 +103,25 @@ def read_calculator_scalar(path: Path) -> float:
     return value
 
 
+def _ffd_axis(path: Path, name: str, start: float, end: float, count: int, step: float) -> np.ndarray:
+    """One far-field axis from the header's start and point count and the requested step.
+
+    The header's end checks the count but does not define the axis. AEDT prints numbers to about six significant
+    digits (HPC step 8b, Slurm 4264786: the last phi, -180 + 2047 * 0.17578125 = 179.82421875, printed as 179.824),
+    and the end may be the requested stop rather than the last point (the runner asks for phi up to 90 and gets 524
+    points ending at 89.66977). So the end must lie from the last point, less the printing error, to less than one
+    step beyond it; a count one point off in either direction puts it outside that range.
+    """
+    values = start + step * np.arange(count)
+    printed = 1e-5 * max(1.0, abs(end))           # the error of a six-significant-digit end
+    beyond = end - values[-1] if count >= 1 else float("nan")
+    if not (-printed <= beyond < max(step, 0.0) - printed or abs(beyond) <= printed):  # NaN (no points) fails both
+        last = values[-1] if count >= 1 else None
+        raise FieldFileError(f"{path}: header has {count} {name} points from {start} to {end}, but step {step} "
+                             f"puts the last point at {last}")
+    return values
+
+
 def read_far_field_ffd(path: Path, theta_step_deg: float, phi_step_deg: float) -> pd.DataFrame:
     """Read an infinite-sphere .ffd export.
 
@@ -116,12 +135,8 @@ def read_far_field_ffd(path: Path, theta_step_deg: float, phi_step_deg: float) -
     phi_start, phi_end, n_phi = (float(v) for v in lines[1].split()[:3])
     n_theta, n_phi = int(n_theta), int(n_phi)
 
-    theta_vals = np.arange(theta_start, theta_end + 1e-8, theta_step_deg)
-    phi_vals = np.arange(phi_start, phi_end + 1e-8, phi_step_deg)
-    if len(theta_vals) != n_theta:
-        raise FieldFileError(f"{path}: header has {n_theta} theta points but step {theta_step_deg} gives {len(theta_vals)}")
-    if len(phi_vals) != n_phi:
-        raise FieldFileError(f"{path}: header has {n_phi} phi points but step {phi_step_deg} gives {len(phi_vals)}")
+    theta_vals = _ffd_axis(path, "theta", theta_start, theta_end, n_theta, theta_step_deg)
+    phi_vals = _ffd_axis(path, "phi", phi_start, phi_end, n_phi, phi_step_deg)
 
     data_lines = [line for line in lines[4:] if line.strip()]
     expected = n_theta * n_phi
