@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -47,8 +48,15 @@ def aedt_session(project_path: Path | None, design: str | None, version: str = "
     """Start a new headless AEDT desktop, open ``project_path``, and release everything on exit.
 
     ``project_path=None`` starts with a new empty project (used by the smoke test).
-    ``new_desktop=True`` guarantees we never attach to someone else's AEDT process.
+    ``new_desktop=True`` asks for a desktop of our own, but PyAEDT 1.7.0 lets PYAEDT_DESKTOP_PORT and
+    PYAEDT_PROCESS_ID override it (desktop.py), so the job would run in, and on release close, another job's AEDT.
+    Every PYAEDT_* variable is therefore removed from this process first, whoever the caller is.
     """
+    stale = sorted(k for k in os.environ if k.startswith("PYAEDT_"))
+    if stale:
+        log.warning("Removing %s from the environment so PyAEDT starts its own desktop", ", ".join(stale))
+        for k in stale:
+            del os.environ[k]
     from ansys.aedt.core import Hfss, settings  # lazy: the pure modules must import without PyAEDT
 
     # On an exception inside one of its own methods PyAEDT releases every desktop it knows (HPC step 4a lost
