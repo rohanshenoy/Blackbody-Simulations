@@ -91,6 +91,7 @@ def aedt_messages_on_error(hfss: Any, seen: set[str]) -> Iterator[None]:
 
 
 def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
+    from bbsim.convergence import qualify
     from bbsim.readers import require_finite_table
     from bbsim.extract import (
         RIM_BAND_REL,
@@ -246,6 +247,15 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
                 exit_point_counts[ephi] = waveguide.groupby(KEY_COLUMNS).size().to_dict()
                 convergence[str(ephi)] = export_convergence_text(hfss, setup, f"Ephi='{ephi}'", dirs.logs / f"convergence_Ephi{ephi}.txt")
                 log.info("wrote %s (%d waveguide rows, %d far-field rows)", out_dir, len(waveguide), len(far_field))
+            # CDX-025: whether each polarization met the configured target. Recorded, not yet a gate (OR-027): the
+            # job array's assembly will refuse unqualified datasets.
+            qualification = {e: qualify(text, cfg.solver.max_delta_e) for e, text in convergence.items()}
+            qualified = bool(qualification) and all(q["qualified"] for q in qualification.values())
+            if not qualified:
+                log.warning("convergence target %g not met or not shown (CDX-025; recorded in the manifest, not yet a "
+                            "gate): %s", cfg.solver.max_delta_e,
+                            "; ".join(f"Ephi={e}: {', '.join(q['reasons'])}" for e, q in qualification.items()
+                                      if not q["qualified"]))
             # Geant4 pairs the Ephi=0 and Ephi=1 exit points of each incident angle by row index.
             first_ephi, first_counts = next(iter(exit_point_counts.items()))
             for ephi, counts in exit_point_counts.items():
@@ -290,7 +300,10 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
                 "initial_mesh_settings": {"requested": mesh_requested, "inherited_from_base_design": mesh_inherited},
                 "wall_facets": wall_facets,
                 "boundaries": {"rbin": "Radiation on entrance", "rbout": "Radiation on exit", "other faces": "default PEC"},
-                "solved_variations": variations, "convergence": convergence},
+                "solved_variations": variations, "convergence": convergence, "qualified": qualified,
+                "convergence_qualification": {e: {k: q[k] for k in ("achieved", "target", "passes_completed", "max_passes",
+                                                                    "converged", "qualified", "reasons")}
+                                              for e, q in qualification.items()}},
         far_field={"sphere": sphere, "theta_step_deg": grid.theta_step_deg, "phi_step_deg": grid.phi_step_deg,
                    "points_per_angle": grid.points_per_angle, "coordinate_system": EXIT_CS, "radiation_surface": EXIT_FACE_LIST,
                    "theta_deg": _axis_summary(grid.theta_values, grid.theta_step_deg),
