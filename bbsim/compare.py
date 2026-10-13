@@ -27,6 +27,9 @@ class Tolerances:
     rho_atol: float = 0.05         # paired-polarization overlap Re rho; a relative sign flip moves it by about 2
     pair_dark_ratio: float = 1e-3  # a key whose weaker polarization carries less than this fraction of the
                                    # stronger one's T has no meaningful rho (cut-off polarization)
+    pair_lit_ratio: float = 1e-2   # above this fraction both polarizations are lit; in between a key is not judged
+                                   # for rho, so two solves straddling one threshold near a cutoff do not fail.
+                                   # Legacy 500 GHz margins: lit keys >= 0.945, dark keys <= 1.9e-8.
 
 
 @dataclass
@@ -237,7 +240,8 @@ def _pair_stats(tables, tol: Tolerances):
         sin_t = np.sin(np.radians(fa["Theta"].to_numpy(float)))
         stats[key] = {
             "T0": t[0], "T1": t[1],
-            "dark": max(t) < tol.t_noise_floor or min(t) < tol.pair_dark_ratio * max(t),
+            "state": ("dark" if max(t) < tol.t_noise_floor or min(t) < tol.pair_dark_ratio * max(t)
+                      else "lit" if min(t) > tol.pair_lit_ratio * max(t) else "between"),
             "rho_exit": _overlap(a[EXIT_VALUES].to_numpy(float), b[EXIT_VALUES].to_numpy(float)),
             "rho_far": _overlap(fa[FAR_VALUES].to_numpy(float), fb[FAR_VALUES].to_numpy(float), sin_t),
         }
@@ -258,19 +262,19 @@ def _check_rho(name: str, field: str, cs: dict, rs: dict, tol: Tolerances) -> Ch
     rows, failures, dark = [], [], 0
     for key in sorted(set(cs) & set(rs)):
         c, r = cs[key], rs[key]
-        if c["dark"] != r["dark"]:
-            # A polarization cut off on one side only is a difference, not a key to skip.
-            rows.append({"key": list(key), "candidate_dark": c["dark"], "reference_dark": r["dark"], "status": "fail"})
+        if {c["state"], r["state"]} == {"dark", "lit"}:
+            # A polarization cut off on one side and lit on the other is a difference, not a key to skip.
+            rows.append({"key": list(key), "candidate_state": c["state"], "reference_state": r["state"], "status": "fail"})
             failures.append(key)
             continue
-        if c["dark"] or c[field] is None or r[field] is None:
+        if c["state"] != "lit" or r["state"] != "lit" or c[field] is None or r[field] is None:
             dark += 1
             continue
         ok = abs(c[field] - r[field]) <= tol.rho_atol
         rows.append({"key": list(key), "candidate": c[field], "reference": r[field], "status": "pass" if ok else "fail"})
         if not ok:
             failures.append(key)
-    detail = f"{len(rows) - len(failures)} pass, {dark} dark, {len(failures)} fail"
+    detail = f"{len(rows) - len(failures)} pass, {dark} dark or near-dark (not judged), {len(failures)} fail"
     if failures:
         detail += f": {failures}"
     return Check(name, not failures, "fail", detail, {"rows": rows})
