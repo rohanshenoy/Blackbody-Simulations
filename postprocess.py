@@ -1,5 +1,47 @@
+"""Per-key photon sampling from an HFSS dataset pair, following BBRsim's schema-1 sampler (CDX-004): coherent
+polarization cross term, load-time normalization, sin(Theta)-weighted outgoing directions."""
 import pandas as pd
 import numpy as np
+
+# BBRsim's schema-1 sampler (BBRHFSSData.cc, mirrored by BBRSimulation/tools/python/bbrsim/hfss.py) is the one
+# supported physics; this script follows it without importing it (CDX-004). Schema 2 (ledger HF-039 to HF-042)
+# changes the cross term and the exit weights; update this file with it.
+K_MIN_NORMAL_COMPONENT = 1e-6   # kMinNormalComponent in BBRHFSSData.cc
+EXIT_VALUES = ["Ex_real", "Ey_real", "Ez_real", "Ex_imag", "Ey_imag", "Ez_imag"]
+
+
+def _key(df, phi, theta):
+    rows = df[(df["IWavePhi"] == phi) & (df["IWaveTheta"] == theta)].reset_index(drop=True)
+    if rows.empty:
+        raise ValueError(f"No data for IWavePhi={phi}, IWaveTheta={theta}")
+    return rows
+
+
+def key_transmittances(phi_in, theta_in, df_0, df_1):
+    """(T0, T1, Re rho) of one incidence key, as BBRsim's loader computes them.
+
+    T_e = OutgoingPower / IngoingPower; rho = sum E0.E1* / sqrt(sum|E0|^2 sum|E1|^2) over the exit points,
+    rows paired by order (its real part is the sum of products of the six stored values, whatever their
+    column order); when the key's largest transmittance over linear polarizations, the top eigenvalue of
+    [[T0, c], [c, T1]] with c = sqrt(T0 T1) Re rho, exceeds 1, both T are divided by it.
+    """
+    a, b = _key(df_0, phi_in, theta_in), _key(df_1, phi_in, theta_in)
+    if len(a) != len(b) or not np.array_equal(a[["X", "Y", "Z"]].to_numpy(), b[["X", "Y", "Z"]].to_numpy()):
+        raise ValueError("Mismatch in exit points between df_0 and df_1.")
+    t = []
+    for rows in (a, b):
+        p_in = float(rows["IngoingPower"].iloc[0])
+        if p_in == 0:
+            raise ZeroDivisionError("IngoingPower is zero.")
+        t.append(float(rows["OutgoingPower"].iloc[0]) / p_in)
+    v0, v1 = a[EXIT_VALUES].to_numpy(float), b[EXIT_VALUES].to_numpy(float)
+    p0, p1 = float(np.sum(v0 * v0)), float(np.sum(v1 * v1))
+    rho = float(np.sum(v0 * v1) / np.sqrt(p0 * p1)) if p0 > 0 and p1 > 0 else 0.0
+    c = np.sqrt(t[0] * t[1]) * rho
+    lam = 0.5 * (t[0] + t[1]) + float(np.hypot(0.5 * (t[0] - t[1]), c))
+    if lam > 1.0:
+        t = [x / lam for x in t]
+    return t[0], t[1], rho
 
 def load_datasets(ephi0_dir, ephi1_dir):
     """Load waveguide and far-field tables for the Ephi=0 and Ephi=1 datasets of one frequency."""
@@ -27,28 +69,16 @@ def get_S21(phi_in, theta_in, polarization_0, polarization_1, df_0, df_1):
         df_1 (pd.DataFrame): DataFrame for polarization mode 1 (Ephi=1)
 
     Returns:
-        float: Weighted and clipped |S21|^2 (P_out / P_in, capped at 1)
+        float: BBRsim's transmission probability for this linear polarization, in [0, 1]
     """
 
-    def lookup_power(df, phi, theta):
-        row = df[(df["IWavePhi"] == phi) & (df["IWaveTheta"] == theta)]
-        if row.empty:
-            raise ValueError(f"No data for IWavePhi={phi}, IWaveTheta={theta}")
-        P_out = row["OutgoingPower"].values[0]
-        P_in = row["IngoingPower"].values[0]
-        if P_in == 0:
-            raise ZeroDivisionError("IngoingPower is zero.")
-        return min(P_out / P_in, 1)
-
-    transmission_0 = lookup_power(df_0, phi_in, theta_in)
-    transmission_1 = lookup_power(df_1, phi_in, theta_in)
-
-    weighted_S21_sq = (
-        polarization_0**2 * transmission_0 +
-        polarization_1**2 * transmission_1
-    )
-
-    return weighted_S21_sq
+    norm = float(np.hypot(polarization_0, polarization_1))
+    if norm == 0:
+        raise ValueError("polarization amplitudes are both zero")
+    e_t, e_p = polarization_0 / norm, polarization_1 / norm
+    t0, t1, rho = key_transmittances(phi_in, theta_in, df_0, df_1)
+    t = e_t ** 2 * t0 + e_p ** 2 * t1 + 2.0 * e_t * e_p * np.sqrt(t0 * t1) * rho
+    return min(1.0, max(0.0, float(t)))
 #%% Stage 2: Determining a probability distribution over the location of emission from the outgoing face.
 
 def get_face_emission_distribution(phi_in, theta_in, polarization_0, polarization_1,
@@ -56,6 +86,7 @@ def get_face_emission_distribution(phi_in, theta_in, polarization_0, polarizatio
     """
     Compute normalized emission probability distribution over the output face
     for a given incoming angle and polarization, using linear superposition of E-fields.
+    Matches BBRsim's schema-1 exit-position weights.
 
     Parameters:
         phi_in (float): IWavePhi in degrees
@@ -160,15 +191,18 @@ def get_angular_emission_distribution(phi_in, theta_in, polarization_0, polariza
     Etheta_total = polarization_0 * Etheta_0 + polarization_1 * Etheta_1
     Ephi_total   = polarization_0 * Ephi_0   + polarization_1 * Ephi_1
 
-    # Compute |E|^2 = |Etheta|^2 + |Ephi|^2
+    # |E|^2 = |Etheta|^2 + |Ephi|^2 is power per unit solid angle; on the (Theta, Phi) grid each row stands for
+    # sin(Theta) dTheta dPhi of solid angle, and rows in or behind the exit plane carry none (BBRsim's sampler).
     E2 = np.abs(Etheta_total)**2 + np.abs(Ephi_total)**2
+    sin_t = np.sin(np.radians(f0["Theta"].to_numpy(dtype=float)))
+    outward = sin_t * np.cos(np.radians(f0["Phi"].to_numpy(dtype=float)))
+    weights = np.where(outward < K_MIN_NORMAL_COMPONENT, 0.0, sin_t * E2.to_numpy())
 
-    # Normalize to get probability distribution
-    total_E2 = E2.sum()
-    if total_E2 == 0:
-        raise ValueError("Total E-field magnitude squared is zero — can't normalize.")
+    total = weights.sum()
+    if total == 0:
+        raise ValueError("No outgoing far-field power at this key — can't normalize.")
 
-    probabilities = E2 / total_E2
+    probabilities = weights / total
 
     # Normalize outgoing polarization vectors at each point
     polarization_vectors = np.vstack([Etheta_total, Ephi_total]).T  # shape (N, 2)

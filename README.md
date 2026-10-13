@@ -16,7 +16,7 @@ These gaps behave like semi-open parallel-plate waveguides that can support low-
    `python run_hfss_frequency.py --config configs/crack1_500GHz_reference.toml`
 3. Compare against a reference dataset:
    `python compare_hfss_exports.py <job>/InfParallelPlate_crack1Rohan_500GHz_Ephi=0 <reference dir>`
-4. Post-process: `python postprocess.py <Ephi=0 dir> <Ephi=1 dir>`, `python plot.py <dataset dir> --out-dir figs`.
+4. Post-process (BBRsim's sampling physics per key, schema 1): `python postprocess.py <Ephi=0 dir> <Ephi=1 dir>`, `python plot.py <dataset dir> --out-dir figs`.
 
 See `hpc/README.md` for the cluster environment.
 For the original geometry and simulation guide, see [here](https://github.com/ModerJason/Blackbody-Simulations/blob/main/Blackbody%20Simulations%20Usage%20Guide.pdf).
