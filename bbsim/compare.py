@@ -24,6 +24,9 @@ class Tolerances:
     t_rtol: float = 0.05
     t_noise_floor: float = 1e-6
     corr_warn: float = 0.95
+    rho_atol: float = 0.05         # paired-polarization overlap Re rho; a relative sign flip moves it by about 2
+    pair_dark_ratio: float = 1e-3  # a key whose weaker polarization carries less than this fraction of the
+                                   # stronger one's T has no meaningful rho (cut-off polarization)
 
 
 @dataclass
@@ -191,3 +194,124 @@ def compare_datasets(candidate_dir: Path, reference_dir: Path, tol: Tolerances =
         checks += _check_points_and_fields("far_field", cf, rf, ["Theta", "Phi"], ["rEtheta", "rEphi"], tol.angle_deg, tol)
 
     return ComparisonResult(str(candidate_dir), str(reference_dir), checks, asdict(tol))
+
+
+EXIT_VALUES = ["Ex_real", "Ey_real", "Ez_real", "Ex_imag", "Ey_imag", "Ez_imag"]
+FAR_VALUES = ["rEtheta_real", "rEtheta_imag", "rEphi_real", "rEphi_imag"]
+
+
+def _overlap(a: np.ndarray, b: np.ndarray, weight: np.ndarray | None = None) -> float | None:
+    """Re of sum(a . conj b) / sqrt(sum|a|^2 sum|b|^2) from stored real/imaginary parts.
+
+    Equal to the sum of products of the stored reals however they pair into complex components, so the
+    exit-field column order (HF-038) does not change it."""
+    w = np.ones(len(a)) if weight is None else weight
+    p0, p1 = float(np.sum(w[:, None] * a * a)), float(np.sum(w[:, None] * b * b))
+    if p0 <= 0.0 or p1 <= 0.0:
+        return None
+    return float(np.sum(w[:, None] * a * b) / np.sqrt(p0 * p1))
+
+
+def _pair_stats(tables, tol: Tolerances):
+    """Per key of one (Ephi=0, Ephi=1) pair: T0, T1, exit and far-field Re rho, and whether the key is dark.
+
+    Rows pair by order within a key, as BBRsim pairs them; a pairing BBRsim would refuse is a problem."""
+    (w0, f0), (w1, f1) = tables
+    stats, problems = {}, []
+    keys0, keys1 = _keys(w0), _keys(w1)
+    if keys0 != keys1:
+        problems.append(f"incidence keys differ between the polarizations: {sorted(keys0 ^ keys1)}")
+    for key in sorted(keys0 & keys1):
+        def sel(df):
+            return df[(df[KEY_COLUMNS[0]] == key[0]) & (df[KEY_COLUMNS[1]] == key[1])].reset_index(drop=True)
+        a, b, fa, fb = sel(w0), sel(w1), sel(f0), sel(f1)
+        if len(a) != len(b) or not np.allclose(a[["X", "Y", "Z"]].to_numpy(float), b[["X", "Y", "Z"]].to_numpy(float),
+                                               rtol=0.0, atol=tol.coord_m):
+            problems.append(f"{key}: exit points do not pair by row")
+            continue
+        if len(fa) != len(fb) or not np.allclose(fa[["Theta", "Phi"]].to_numpy(float), fb[["Theta", "Phi"]].to_numpy(float),
+                                                 rtol=0.0, atol=tol.angle_deg):
+            problems.append(f"{key}: far-field grids do not pair by row")
+            continue
+        t = [float(df["OutgoingPower"].iloc[0]) / float(df["IngoingPower"].iloc[0]) for df in (a, b)]
+        sin_t = np.sin(np.radians(fa["Theta"].to_numpy(float)))
+        stats[key] = {
+            "T0": t[0], "T1": t[1],
+            "dark": max(t) < tol.t_noise_floor or min(t) < tol.pair_dark_ratio * max(t),
+            "rho_exit": _overlap(a[EXIT_VALUES].to_numpy(float), b[EXIT_VALUES].to_numpy(float)),
+            "rho_far": _overlap(fa[FAR_VALUES].to_numpy(float), fb[FAR_VALUES].to_numpy(float), sin_t),
+        }
+    return stats, problems
+
+
+def _check_pair_ephi(candidate, reference) -> Check:
+    wrong = []
+    for label, tables in (("candidate", candidate), ("reference", reference)):
+        for expected, (wg, ff) in enumerate(tables):
+            found = sorted({int(v) for v in wg["Ephi"].unique()} | {int(v) for v in ff["Ephi"].unique()})
+            if found != [expected]:
+                wrong.append(f"{label} directory {expected + 1} holds Ephi {found}, expected [{expected}]")
+    return Check("pair.ephi", not wrong, "fail", "Ephi=0 then Ephi=1 on both sides" if not wrong else "; ".join(wrong))
+
+
+def _check_rho(name: str, field: str, cs: dict, rs: dict, tol: Tolerances) -> Check:
+    rows, failures, dark = [], [], 0
+    for key in sorted(set(cs) & set(rs)):
+        c, r = cs[key], rs[key]
+        if c["dark"] or r["dark"] or c[field] is None or r[field] is None:
+            dark += 1
+            continue
+        ok = abs(c[field] - r[field]) <= tol.rho_atol
+        rows.append({"key": list(key), "candidate": c[field], "reference": r[field], "status": "pass" if ok else "fail"})
+        if not ok:
+            failures.append(key)
+    detail = f"{len(rows) - len(failures)} pass, {dark} dark, {len(failures)} fail"
+    if failures:
+        detail += f": {failures}"
+    return Check(name, not failures, "fail", detail, {"rows": rows})
+
+
+def _check_mixed(cs: dict, rs: dict, tol: Tolerances) -> Check:
+    rows, failures = [], []
+    for key in sorted(set(cs) & set(rs)):
+        pred = {}
+        for label, s in (("candidate", cs[key]), ("reference", rs[key])):
+            cross = np.sqrt(s["T0"] * s["T1"]) * (s["rho_exit"] or 0.0)
+            pred[label] = (0.5 * (s["T0"] + s["T1"]) + cross, 0.5 * (s["T0"] + s["T1"]) - cross)
+        for sign, i in (("plus", 0), ("minus", 1)):
+            c, r = pred["candidate"][i], pred["reference"][i]
+            if c < tol.t_noise_floor and r < tol.t_noise_floor:
+                continue
+            ok = abs(c - r) <= max(tol.t_atol, tol.t_rtol * abs(r))
+            rows.append({"key": list(key), "state": sign, "candidate": c, "reference": r, "status": "pass" if ok else "fail"})
+            if not ok:
+                failures.append((key, sign))
+    detail = f"{len(rows) - len(failures)} pass, {len(failures)} fail"
+    if failures:
+        detail += f": {failures}"
+    return Check("pair.mixed_transmission", not failures, "fail", detail, {"rows": rows})
+
+
+def compare_polarization_pair(candidate: tuple[Path, Path], reference: tuple[Path, Path],
+                              tol: Tolerances = Tolerances()) -> ComparisonResult:
+    """Compare what coherent transport uses and the per-directory comparison cannot see (CDX-005).
+
+    Each argument is (Ephi=0 directory, Ephi=1 directory). The checks are: the exit-field and far-field
+    overlap Re rho of the two polarizations (BBRsim's polarization cross term; the far field weighted by
+    sin(Theta)), and the transmission of equal-amplitude mixed states, T = (T0+T1)/2 +- sqrt(T0 T1) Re rho. A
+    relative sign or phase change between the polarizations fails them; a phase common to both does not.
+    Keys where one polarization is cut off are skipped for rho.
+    """
+    def load(dirs):
+        return [(pd.read_csv(Path(d) / "waveguide.csv"), pd.read_csv(Path(d) / "far_field.csv")) for d in dirs]
+
+    cand, ref = load(candidate), load(reference)
+    checks = [_check_pair_ephi(cand, ref)]
+    (cs, cp), (rs, rp) = _pair_stats(cand, tol), _pair_stats(ref, tol)
+    problems = [f"candidate {p}" for p in cp] + [f"reference {p}" for p in rp]
+    checks.append(Check("pair.points", not problems, "fail",
+                        "both pairs pair by row at every key" if not problems else "; ".join(problems[:5])))
+    checks += [_check_rho("pair.exit_overlap", "rho_exit", cs, rs, tol),
+               _check_rho("pair.far_field_overlap", "rho_far", cs, rs, tol),
+               _check_mixed(cs, rs, tol)]
+    return ComparisonResult(f"{candidate[0]} + {candidate[1]}", f"{reference[0]} + {reference[1]}", checks, asdict(tol))
