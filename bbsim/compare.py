@@ -258,7 +258,12 @@ def _check_rho(name: str, field: str, cs: dict, rs: dict, tol: Tolerances) -> Ch
     rows, failures, dark = [], [], 0
     for key in sorted(set(cs) & set(rs)):
         c, r = cs[key], rs[key]
-        if c["dark"] or r["dark"] or c[field] is None or r[field] is None:
+        if c["dark"] != r["dark"]:
+            # A polarization cut off on one side only is a difference, not a key to skip.
+            rows.append({"key": list(key), "candidate_dark": c["dark"], "reference_dark": r["dark"], "status": "fail"})
+            failures.append(key)
+            continue
+        if c["dark"] or c[field] is None or r[field] is None:
             dark += 1
             continue
         ok = abs(c[field] - r[field]) <= tol.rho_atol
@@ -312,6 +317,10 @@ def compare_polarization_pair(candidate: tuple[Path, Path], reference: tuple[Pat
     checks = [_check_pair_ephi(cand, ref)]
     (cs, cp), (rs, rp) = _pair_stats(cand, tol), _pair_stats(ref, tol)
     problems = [f"candidate {p}" for p in cp] + [f"reference {p}" for p in rp]
+    for (cw, _), (rw, _), e in zip(cand, ref, (0, 1)):
+        if _keys(cw) != _keys(rw):
+            problems.append(f"Ephi={e} incidence keys differ from the reference: missing {sorted(_keys(rw) - _keys(cw))} "
+                            f"extra {sorted(_keys(cw) - _keys(rw))}")
     checks.append(Check("pair.points", not problems, "fail",
                         "both pairs pair by row at every key" if not problems else "; ".join(problems[:5])))
     checks += [_check_rho("pair.exit_overlap", "rho_exit", cs, rs, tol),

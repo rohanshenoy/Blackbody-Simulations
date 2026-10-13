@@ -17,8 +17,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--t-rtol", type=float, default=Tolerances.t_rtol, help="Relative transmission tolerance")
     p.add_argument("--corr-warn", type=float, default=Tolerances.corr_warn, help="Warn if |E| correlation is below this")
     p.add_argument("--pair", nargs=2, type=Path, metavar=("CANDIDATE_EPHI1", "REFERENCE_EPHI1"), default=None,
-                   help="Also compare the polarization pair (relative phase, CDX-005); the positional "
-                        "directories are then the Ephi=0 ones")
+                   help="Also compare the Ephi=1 directories, alone and as a polarization pair with the Ephi=0 "
+                        "ones (relative phase, CDX-005); the positional directories are then the Ephi=0 ones")
     return p.parse_args(argv)
 
 
@@ -29,11 +29,13 @@ def main(argv: list[str] | None = None) -> int:
     print(result.format_table())
     record, passed = result.to_dict(), result.passed
     if args.pair:
+        ephi1 = compare_datasets(args.pair[0], args.pair[1], tol)
         pair = compare_polarization_pair((args.candidate, args.pair[0]), (args.reference, args.pair[1]), tol)
-        print()
-        print(pair.format_table())
-        record["pair"] = pair.to_dict()
-        passed = passed and pair.passed
+        for part in (ephi1, pair):
+            print()
+            print(part.format_table())
+        record["ephi1"], record["pair"] = ephi1.to_dict(), pair.to_dict()
+        passed = passed and ephi1.passed and pair.passed
         record["passed"] = passed
     if args.json:
         write_json(args.json, record)
