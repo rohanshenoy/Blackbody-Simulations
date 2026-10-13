@@ -91,6 +91,7 @@ def aedt_messages_on_error(hfss: Any, seen: set[str]) -> Iterator[None]:
 
 
 def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
+    from bbsim.readers import require_finite_table
     from bbsim.extract import (
         RIM_BAND_REL,
         ExtractionContext,
@@ -232,6 +233,8 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
             for ephi in cfg.output.polarizations:
                 waveguide = extract_waveguide(hfss, ctx, ephi, face_geometry, rim_log)
                 far_field = extract_far_field(hfss, ctx, ephi)
+                for name, table in (("waveguide.csv", waveguide), ("far_field.csv", far_field)):
+                    require_finite_table(table, f"{cfg.project.dataset_id} Ephi={ephi} {name}")
                 out_dir = dirs.dataset_dir(cfg.project.dataset_id, freq, ephi)
                 out_dir.mkdir(parents=True, exist_ok=False)
                 for name, table in (("waveguide.csv", waveguide), ("far_field.csv", far_field)):

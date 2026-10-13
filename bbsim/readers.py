@@ -103,6 +103,23 @@ def read_calculator_scalar(path: Path) -> float:
     return value
 
 
+def require_finite_table(df: pd.DataFrame, where: str, skip: tuple[str, ...] = ("Freq",)) -> None:
+    """Refuse a table holding a non-numeric or non-finite value in any column BBRsim parses as a number.
+
+    BBRsim rejects such a value at load (BBR013), after the dataset has been published with valid checksums
+    (CDX-001), so the runner checks every table before it writes a CSV, a manifest or a sidecar. ``Freq`` carries
+    its unit and is skipped.
+    """
+    cols = [c for c in df.columns if c not in skip]
+    values = df[cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+    bad = ~np.isfinite(values)
+    if bad.any():
+        rows, idx = np.nonzero(bad)
+        names = sorted({cols[i] for i in idx})
+        raise FieldFileError(f"{where}: {int(bad.sum())} non-numeric or non-finite values in {names} "
+                             f"(first at row {int(rows[0])}); BBRsim refuses them at load (BBR013)")
+
+
 def _ffd_axis(path: Path, name: str, start: float, end: float, count: int, step: float) -> np.ndarray:
     """One far-field axis from the header's start and point count and the requested step.
 
@@ -142,7 +159,15 @@ def read_far_field_ffd(path: Path, theta_step_deg: float, phi_step_deg: float) -
     expected = n_theta * n_phi
     if len(data_lines) != expected:
         raise FieldFileError(f"{path}: expected {expected} data lines, found {len(data_lines)}")
-    data = np.array([[float(v) for v in line.split()[:4]] for line in data_lines])
+    try:
+        data = np.array([[float(v) for v in line.split()[:4]] for line in data_lines])
+    except ValueError:
+        raise FieldFileError(f"{path}: a far-field data line holds a non-numeric value") from None
+    bad = ~np.isfinite(data).all(axis=1)
+    if bad.any():
+        first = int(np.argmax(bad))
+        raise FieldFileError(f"{path}: {int(bad.sum())} far-field data lines hold non-finite values (first: data "
+                             f"line {first + 1}, {data_lines[first].strip()!r}); BBRsim refuses them at load (BBR013)")
 
     theta_grid, phi_grid = np.meshgrid(theta_vals, phi_vals, indexing="ij")
     return pd.DataFrame({
