@@ -300,7 +300,10 @@ def compare_polarization_pair(candidate: tuple[Path, Path], reference: tuple[Pat
     overlap Re rho of the two polarizations (BBRsim's polarization cross term; the far field weighted by
     sin(Theta)), and the transmission of equal-amplitude mixed states, T = (T0+T1)/2 +- sqrt(T0 T1) Re rho. A
     relative sign or phase change between the polarizations fails them; a phase common to both does not.
-    Keys where one polarization is cut off are skipped for rho.
+    Keys where one polarization is cut off are skipped for rho. At keys where rho is near 0 (normal
+    incidence, E along one axis) a relative sign is invisible, and harmless, since equal-plus and equal-minus
+    transmissions are then equal; the check sees the phase wherever it matters to BBRsim. T is the producer's
+    OutgoingPower / IngoingPower, not BBRsim's load-time value divided by the key's top eigenvalue above 1.
     """
     def load(dirs):
         return [(pd.read_csv(Path(d) / "waveguide.csv"), pd.read_csv(Path(d) / "far_field.csv")) for d in dirs]
