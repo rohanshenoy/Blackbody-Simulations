@@ -45,6 +45,8 @@ ETA0 = VACUUM_PERMEABILITY_H_PER_M * SPEED_OF_LIGHT_M_PER_S
 
 # The outward guard on far-field rows: sin(Theta) cos(Phi) must exceed this (BBRsim's sampler uses the same).
 OUTWARD_GUARD = 1e-6
+# A retained exit point must lie within this fraction of the lattice step of its node (BBRsim's C4 node tolerance).
+NODE_TOL = 1e-6
 _THETA_90_TOL_DEG = 1e-9
 
 
@@ -105,29 +107,104 @@ def c_key(phi_deg: float, theta_deg: float, theta_list: Sequence[float]) -> floa
     return abs(math.cos(math.radians(float(theta_deg))))
 
 
+def _axis_weights(n: int) -> np.ndarray:
+    """Trapezoid weights along one axis of n nodes: 1/2 on the first and last node, 1 between."""
+    w = np.ones(n)
+    w[0] = w[-1] = 0.5
+    return w
+
+
+def _rectangle_axes(ny: int, nz: int) -> tuple[np.ndarray, np.ndarray]:
+    if ny < 2 or nz < 2:
+        raise DatasetV2Error(
+            f"a rectangle exit lattice needs at least 2 nodes per axis, got {ny} x {nz}: with fewer than 2 "
+            "the first and last node coincide, so the wall weight and the step are undefined")
+    return _axis_weights(ny), _axis_weights(nz)
+
+
 def quadrature_weights(shape: str, ny: int, nz: int, n_points: int) -> np.ndarray:
     """Dimensionless weights of the retained exit points, in export order (Y outer, Z inner).
 
     Rectangle: 1 inside, 1/2 on a wall row, 1/4 at a corner, wall rows being the first and last node index
     along each axis (trapezoid rule). Disc: 1 on every retained point, zero-filled rim points included.
+
+    This is the weight of the node at each row *assuming* export order; ``node_weights`` assigns the same weights
+    from the points' own coordinates, as BBRsim does, and is what ``build`` uses for a rectangle.
     """
     if shape == "rectangle":
-        if ny < 2 or nz < 2:
-            raise DatasetV2Error(
-                f"a rectangle exit lattice needs at least 2 nodes per axis, got {ny} x {nz}: with fewer than 2 "
-                "the first and last node coincide, so the wall weight and the step are undefined")
+        wy, wz = _rectangle_axes(ny, nz)
         if n_points != ny * nz:
             raise DatasetV2Error(f"a {ny} x {nz} rectangle lattice has {ny * nz} points, got {n_points}")
-        wy = np.ones(ny)
-        wy[0] = wy[-1] = 0.5
-        wz = np.ones(nz)
-        wz[0] = wz[-1] = 0.5
         return np.outer(wy, wz).reshape(-1)
     if shape == "disc":
         if n_points < 1:
             raise DatasetV2Error(f"a disc exit lattice needs at least one point, got {n_points}")
         return np.ones(int(n_points))
     raise DatasetV2Error(f"unknown exit cross-section shape {shape!r}: expected 'rectangle' or 'disc'")
+
+
+def _lattice_nodes(y_m: np.ndarray, z_m: np.ndarray, grid: ExitGrid) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """Node indices (iy, iz) of each exit point of a rectangle lattice, plus the lattice's (ny, nz).
+
+    Node = round((coordinate - min) / step) per axis, with min = the grid's y_e / z_e lower bound and step its step
+    along that axis, both in metres: BBRsim's AxisNode. Refuses (``DatasetV2Error``) a count other than ny * nz, a
+    non-finite coordinate, a point off its node by more than ``NODE_TOL`` of the step, a node outside
+    [0, count - 1], and two points at one node (so a passing call covers every node exactly once).
+    """
+    ny, nz = int(grid.counts[1]), int(grid.counts[2])
+    _rectangle_axes(ny, nz)                                     # at least 2 nodes per axis
+    y = np.asarray(y_m, dtype=float)
+    z = np.asarray(z_m, dtype=float)
+    if y.ndim != 1 or y.shape != z.shape:
+        raise DatasetV2Error(f"exit-point Y and Z must be equal-length 1-D arrays, got shapes {y.shape} and {z.shape}")
+    if y.size != ny * nz:
+        raise DatasetV2Error(f"a {ny} x {nz} rectangle lattice has {ny * nz} points, got {y.size}")
+    if not (np.all(np.isfinite(y)) and np.all(np.isfinite(z))):
+        raise DatasetV2Error("exit-point Y and Z must be finite")
+    indices = []
+    for axis, coord, count, lo_mm, step_mm in (("y_e", y, ny, grid.lo_mm[1], grid.step_mm[1]),
+                                               ("z_e", z, nz, grid.lo_mm[2], grid.step_mm[2])):
+        step = _positive_finite(f"the exit lattice step along {axis}", step_mm) * 1e-3
+        steps_from_min = (coord - lo_mm * 1e-3) / step
+        node = np.rint(steps_from_min)
+        outside = (node < 0) | (node > count - 1)
+        if outside.any():
+            i = int(np.flatnonzero(outside)[0])
+            raise DatasetV2Error(f"exit point {i} lies outside the {count}-node {axis} lattice: node {node[i]:g} of "
+                                 f"0..{count - 1} (coordinate {coord[i]!r} m)")
+        off = np.abs(steps_from_min - node)
+        if (off > NODE_TOL).any():
+            i = int(np.argmax(off))
+            raise DatasetV2Error(f"exit point {i} is off its {axis} node by {off[i]:g} of the step "
+                                 f"(limit {NODE_TOL:g}): coordinate {coord[i]!r} m, nearest node {node[i]:g}")
+        indices.append(node.astype(int))
+    iy, iz = indices
+    flat = iy * nz + iz
+    seen = np.bincount(flat, minlength=ny * nz)
+    if (seen > 1).any():
+        node = int(np.flatnonzero(seen > 1)[0])
+        raise DatasetV2Error(f"two exit points sit at the same node (iy, iz) = ({node // nz}, {node % nz}): "
+                             "a rectangle lattice holds each node exactly once")
+    return iy, iz, ny, nz
+
+
+def _node_weights(iy: np.ndarray, iz: np.ndarray, ny: int, nz: int) -> np.ndarray:
+    wy, wz = _rectangle_axes(ny, nz)
+    return wy[iy] * wz[iz]
+
+
+def node_weights(y_m: np.ndarray, z_m: np.ndarray, grid: ExitGrid) -> np.ndarray:
+    """Trapezoid weights of a rectangle's retained exit points from each point's own grid node.
+
+    The weight of the point at node (iy, iz) is (1/2 if iy is 0 or ny - 1 else 1) times (1/2 if iz is 0 or nz - 1
+    else 1), the nodes found as BBRsim finds them (AxisNode): i = round((coordinate - min) / step) on Y and on Z,
+    in metres, against the grid's y_e / z_e bounds and steps. The result follows the input row order whatever
+    that is; in export order (Y outer, Z inner) it equals ``quadrature_weights("rectangle", ny, nz, n)``.
+
+    The point set must be the whole ny x nz lattice, every point within ``NODE_TOL`` of the step of its node.
+    Anything else raises ``DatasetV2Error``. Rectangles only: a disc keeps weight 1 on every retained point.
+    """
+    return _node_weights(*_lattice_nodes(y_m, z_m, grid))
 
 
 def tangential(values: np.ndarray) -> np.ndarray:
@@ -693,22 +770,27 @@ def build(extracted: Mapping[int, Extracted], grid: ExitGrid, cross_section: Map
           polarization_filter_limit_ghz: float, order_check: Mapping[str, Any]) -> DatasetV2Result:
     """The 2.0 tables and sidecar blocks from one job's raw extraction of both polarizations.
 
-    Per declared key and polarization: the quadrature weights (trapezoid by lattice index for a rectangle, uniform
-    for a disc), the scale W and the dark flag (``scale_factor``), the sanity ratio flux / |Re S|, the far-field
-    hemisphere power over the stored flux, and Re rho on the scaled fields. ``cell_90`` is computed once over the
-    whole declared theta list, so a grid without theta = 90 deg is refused for every run (Ruling 4).
+    Per declared key and polarization: the quadrature weights (trapezoid by each point's grid node, found from its
+    Y and Z as BBRsim finds it, for a rectangle; uniform for a disc), the scale W and the dark flag
+    (``scale_factor``), the sanity ratio flux / |Re S|, the far-field hemisphere power over the stored flux, and
+    Re rho on the scaled fields. ``cell_90`` is computed once over the whole declared theta list, so a grid without
+    theta = 90 deg is refused for every run (Ruling 4).
 
-    Tables keep their rows in input order and every stored value in its position: OutgoingPower becomes the key's
-    stored flux (0 when dark), IngoingPower ``incoming_w`` on every row, columns 9-14 times the key's W (1 when dark:
-    the stored fields are unchanged), the labels become ``schema.WAVEGUIDE_COLUMNS_V2`` and ``InterceptFactor`` (c_k)
-    is appended last. Far-field tables are returned unchanged.
+    Row order within a key is free for a rectangle: W and the blocks do not depend on it. Tables keep their rows
+    in input order and every stored value in its position: OutgoingPower becomes the key's stored flux (0 when
+    dark), IngoingPower ``incoming_w`` on every row, columns 9-14 times the key's W (1 when dark: the stored fields
+    are unchanged), the labels become ``schema.WAVEGUIDE_COLUMNS_V2`` and ``InterceptFactor`` (c_k) is appended
+    last. Far-field tables are returned unchanged.
 
     Stops (``DatasetV2Error``, nothing returned) on: a polarization other than exactly 0 and 1; a declared key
     missing from, or an undeclared key present in, any table or power map of either polarization; a non-finite
     flux, |Re S|, field or far-field value, or a negative |Re S|; a negative flux beyond the dark floor; a
     non-dark record whose tangential integral is not positive; different point counts of the two polarizations
-    at a key; a positive flux with |Re S| = 0 at any key; and, on keys with theta >= 90 deg whose stored flux
-    exceeds ``WEAK_REL`` times the polarization's largest stored flux, flux / |Re S| outside ``SANITY_BOUNDS``.
+    at a key; for a rectangle, a key that is not the whole lattice (a point off its node by more than ``NODE_TOL``
+    of the step, outside the lattice, or two points at one node) and polarizations whose rows are not at the same
+    nodes row by row (BBRsim pairs them by index); a positive flux with |Re S| = 0 at any key; and, on keys with
+    theta >= 90 deg whose stored flux exceeds ``WEAK_REL`` times the polarization's largest stored flux,
+    flux / |Re S| outside ``SANITY_BOUNDS``.
     Dark records (stored flux 0) are never inside that band. Ratios of keys below 90 deg are reported only.
     """
     if not isinstance(extracted, Mapping) or set(extracted) != {0, 1}:
@@ -740,6 +822,8 @@ def build(extracted: Mapping[int, Extracted], grid: ExitGrid, cross_section: Map
     row_key: dict[int, np.ndarray] = {}
     ff_key: dict[int, np.ndarray] = {}
     values_all: dict[int, np.ndarray] = {}
+    position_y: dict[int, np.ndarray] = {}
+    position_z: dict[int, np.ndarray] = {}
     flux: dict[int, list[float]] = {}
     absolute: dict[int, list[float]] = {}
     for e in (0, 1):
@@ -768,6 +852,12 @@ def build(extracted: Mapping[int, Extracted], grid: ExitGrid, cross_section: Map
         if bad.any():
             raise DatasetV2Error(f"{wg_where} at {_key_text(keys[row_key[e][np.flatnonzero(bad)[0]]])} has "
                                  f"{int(bad.sum())} rows with non-finite exit-field values")
+        if shape == "rectangle":                                # a rectangle's weights follow each point's node
+            try:
+                position_y[e] = ex.waveguide["Y"].to_numpy(dtype=float)
+                position_z[e] = ex.waveguide["Z"].to_numpy(dtype=float)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise DatasetV2Error(f"{wg_where}: unreadable exit-point Y / Z: {exc}") from exc
         for column in _FAR_FIELD_NUMERIC:                       # column by column: the far field can be large
             try:
                 finite = np.isfinite(ex.far_field[column].to_numpy(dtype=float))
@@ -790,16 +880,30 @@ def build(extracted: Mapping[int, Extracted], grid: ExitGrid, cross_section: Map
         if rows[0].size != rows[1].size:
             raise DatasetV2Error(f"at {_key_text(key)} Ephi=0 has {rows[0].size} exit points and Ephi=1 has "
                                  f"{rows[1].size}: BBRsim pairs the polarizations' rows by index")
-        try:
-            weights = quadrature_weights(shape, ny, nz, int(rows[0].size))
-        except DatasetV2Error as exc:
-            raise DatasetV2Error(f"at {_key_text(key)}: {exc}") from exc
+        weights = {}
+        if shape == "rectangle":
+            # Each point's weight comes from its own lattice node, as BBRsim assigns it, never from its row.
+            nodes = {}
+            for e in (0, 1):
+                try:
+                    nodes[e] = _lattice_nodes(position_y[e][rows[e]], position_z[e][rows[e]], grid)
+                except DatasetV2Error as exc:
+                    raise DatasetV2Error(f"Ephi={e} at {_key_text(key)}: {exc}") from exc
+            if not (np.array_equal(nodes[0][0], nodes[1][0]) and np.array_equal(nodes[0][1], nodes[1][1])):
+                raise DatasetV2Error(f"at {_key_text(key)} Ephi=0 and Ephi=1 hold their exit points at different "
+                                     "lattice nodes, row by row: BBRsim pairs the polarizations' rows by index")
+            weights = {e: _node_weights(*nodes[e]) for e in (0, 1)}
+        else:
+            try:
+                weights = {e: quadrature_weights(shape, ny, nz, int(rows[e].size)) for e in (0, 1)}
+            except DatasetV2Error as exc:
+                raise DatasetV2Error(f"at {_key_text(key)}: {exc}") from exc
         scaled = {}
         for e in (0, 1):
             where = f"Ephi={e} at {_key_text(key)}"
             values = values_all[e][rows[e]]
             try:
-                w, is_dark = scale_factor(values, weights, h_y, h_z, flux[e][k], incoming)
+                w, is_dark = scale_factor(values, weights[e], h_y, h_z, flux[e][k], incoming)
                 ratio[e][k] = sanity_ratio(flux[e][k], absolute[e][k], incoming)
             except DatasetV2Error as exc:
                 raise DatasetV2Error(f"{where}: {exc}") from exc
@@ -810,7 +914,7 @@ def build(extracted: Mapping[int, Extracted], grid: ExitGrid, cross_section: Map
                 ff_over[e][k] = hemisphere_power_w(ff_rows, dtheta_ff, dphi_ff) / stored[e][k]
             scaled[e] = values * w
         try:
-            rho_values[k] = rho(scaled[0], scaled[1], weights, dark[0][k], dark[1][k])
+            rho_values[k] = rho(scaled[0], scaled[1], weights[0], dark[0][k], dark[1][k])
         except DatasetV2Error as exc:
             raise DatasetV2Error(f"at {_key_text(key)}: {exc}") from exc
 
