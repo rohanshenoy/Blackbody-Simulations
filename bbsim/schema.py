@@ -11,6 +11,15 @@ WAVEGUIDE_COLUMNS = [
     "Freq", "Ephi", "IWavePhi", "IWaveTheta", "OutgoingPower", "IngoingPower",
     "X", "Y", "Z", "Ex_real", "Ey_real", "Ez_real", "Ex_imag", "Ey_imag", "Ez_imag",
 ]
+# Schema 2.0 header: the stored values of columns 0-14 keep their positions, only the labels change to the
+# interleaved order the exporter really writes (Re Ex, Im Ex, Re Ey, Im Ey, Re Ez, Im Ez; ledger HF-038);
+# InterceptFactor is appended last. Readers take the fields by position, never by label.
+WAVEGUIDE_COLUMNS_V2 = [
+    "Freq", "Ephi", "IWavePhi", "IWaveTheta", "OutgoingPower", "IngoingPower",
+    "X", "Y", "Z", "Ex_real", "Ex_imag", "Ey_real", "Ey_imag", "Ez_real", "Ez_imag", "InterceptFactor",
+]
+EXIT_FIELD_SLOTS = slice(9, 15)
+INTERCEPT_FACTOR = "InterceptFactor"
 FAR_FIELD_COLUMNS = [
     "Freq", "Ephi", "IWavePhi", "IWaveTheta", "Phi", "Theta",
     "rEphi_real", "rEphi_imag", "rEtheta_real", "rEtheta_imag",
