@@ -309,6 +309,7 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str) -> Path:
                    "theta_deg": _axis_summary(grid.theta_values, grid.theta_step_deg),
                    "phi_deg": _axis_summary(grid.phi_values, grid.phi_step_deg)},
         exit_field={"manual": cfg.exit_field.manual, "resolution_mm": list(cfg.exit_field.resolution_mm),
+                    "step_mm": list(lattice.step_mm) if lattice is not None else None,
                     "points_in_si": True, "field_in_ref_cs": False, "coordinate_system": EXIT_CS,
                     "grid": lattice.axis_record() if lattice is not None else None, "lattice_points": lattice_points,
                     "retained_points_per_key": retained, "outside_points": outside_points,

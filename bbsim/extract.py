@@ -30,6 +30,8 @@ GUARD_MM = 1e-9           # floating-noise guard when rounding lattice bounds ou
 CONTAIN_REL_TOL = 1e-6    # retained exit points may exceed the declared cross-section by this fraction
 PLANE_TOL_M = 1e-12       # retained exit points must lie on the exit plane x_e = 0 to this, as BBRsim requires (CDX-023)
 RIM_BAND_REL = 0.05       # a disc's faceted rim: export disagreements tolerated within this fraction of the radius
+WHOLE_STEP_TOL = 1e-9     # an extent within this many steps of a whole number keeps the configured step (HF-045)
+NODE_TOL_M = 1e-12        # a fitted axis's first and last exported nodes must lie on its bounds to this (HF-045)
 FIELD_COLUMNS = ["Ex_real", "Ey_real", "Ez_real", "Ex_imag", "Ey_imag", "Ez_imag"]
 
 
@@ -74,23 +76,43 @@ class ExitFaceGeometry:
 
 @dataclass(frozen=True)
 class ExitGrid:
-    """The ExportOnGrid lattice in the exit frame, in mm."""
+    """The ExportOnGrid lattice in the exit frame, in mm.
+
+    ``resolution_mm`` is the configured resolution, ``step_mm`` the step used: equal on whole-step axes, and on a
+    fitted axis (HF-045) the largest step no coarser than the resolution that puts a node on both bounds.
+    """
 
     lo_mm: tuple[float, float, float]
     hi_mm: tuple[float, float, float]
     resolution_mm: tuple[float, float, float]
+    step_mm: tuple[float, float, float] | None = None
+    fitted: tuple[bool, bool, bool] = (False, False, False)
+
+    def __post_init__(self) -> None:
+        if self.step_mm is None:
+            object.__setattr__(self, "step_mm", tuple(float(v) for v in self.resolution_mm))
 
     @property
     def counts(self) -> tuple[int, ...]:
         return tuple(1 if step == 0 else int(math.floor((hi - lo) / step + 1e-9)) + 1
-                     for lo, hi, step in zip(self.lo_mm, self.hi_mm, self.resolution_mm))
+                     for lo, hi, step in zip(self.lo_mm, self.hi_mm, self.step_mm))
 
     @property
     def lattice_points(self) -> int:
         return math.prod(self.counts)
 
     def range_strings(self, units: str) -> tuple[list[str], list[str]]:
-        return [_fmt_length(v, units) for v in self.lo_mm], [_fmt_length(v, units) for v in self.hi_mm]
+        """ExportOnGrid's bounds. On a fitted axis the stop is padded by half a step: AEDT steps by accumulating
+        the decimal step, so the far wall's node could otherwise fall a rounding error past the stop and be lost.
+        The declared maximum (``axis_record``) stays the wall."""
+        stops = [hi + step / 2 if fit else hi for hi, step, fit in zip(self.hi_mm, self.step_mm, self.fitted)]
+        return [_fmt_length(v, units) for v in self.lo_mm], [_fmt_length(v, units) for v in stops]
+
+    def step_strings(self) -> list[str]:
+        """ExportOnGrid's spacing: the configured value as written on whole-step axes (so existing exports stay
+        byte-identical), the fitted step's full repr otherwise."""
+        return [f"{step!r}mm" if fit else f"{res}mm"
+                for res, step, fit in zip(self.resolution_mm, self.step_mm, self.fitted)]
 
     def axis_record(self) -> dict[str, dict[str, float | int]]:
         """Sidecar exit_field.grid: the lattice along exit Y and Z in metres (the CSV unit)."""
@@ -194,6 +216,24 @@ def chord_sagitta_mm(local_points_mm: np.ndarray, samples_per_edge: int) -> floa
     return d_max * (1.0 - math.cos(math.pi / samples_per_edge))
 
 
+def fit_axis(lo: float, hi: float, resolution: float) -> tuple[float, bool]:
+    """The lattice step along one axis and whether it was fitted (HF-045, OR-030).
+
+    When the extent is a whole number of resolution steps (to ``WHOLE_STEP_TOL``) the configured step is kept.
+    Otherwise step = extent / ceil(extent / resolution), so both bounds are nodes and the step is never coarser
+    than requested: a lattice that stopped short of the far wall would drop that wall row's weight, break the
+    mirror symmetry, and be refused by BBRsim's lattice check.
+    """
+    lo, hi, resolution = float(lo), float(hi), float(resolution)
+    extent = hi - lo
+    if resolution == 0 or extent <= 0:
+        return resolution, False
+    ratio = extent / resolution
+    if abs(ratio - round(ratio)) <= WHOLE_STEP_TOL:
+        return resolution, False
+    return extent / math.ceil(ratio - WHOLE_STEP_TOL), True
+
+
 def check_exit_plane_bounds(lo_mm: Sequence[float], hi_mm: Sequence[float]) -> None:
     """The lattice's x_e bounds must both lie on the exit plane to ``PLANE_TOL_M``: otherwise every exported point
     is off the plane, and BBRsim would refuse the dataset (BBR012) after a licensed solve (CDX-023)."""
@@ -205,9 +245,10 @@ def check_exit_plane_bounds(lo_mm: Sequence[float], hi_mm: Sequence[float]) -> N
 
 def exit_grid(face: ExitFaceGeometry, exit_field: ExitFieldConfig) -> ExitGrid:
     """The export lattice. Manual bounds win; vertex bounds are used as they are (legacy, so the crack
-    exports stay byte-identical); edge-sample bounds are rounded outward to the resolution. Called before the
-    solve, so bounds off the exit plane cost seconds."""
-    resolution = tuple(float(v) for v in exit_field.resolution_mm)
+    exports stay byte-identical); edge-sample bounds are rounded outward to the resolution. On a rectangle, whose
+    bounds are its walls, an axis that is not a whole number of steps gets the fitted step (HF-045); discs and
+    polygons keep their rounded bounding box. Called before the solve, so bounds off the exit plane cost seconds."""
+    resolution = tuple(exit_field.resolution_mm)
     if exit_field.boundary_mm is not None:
         lo, hi = exit_field.boundary_mm
     else:
@@ -215,7 +256,27 @@ def exit_grid(face: ExitFaceGeometry, exit_field: ExitFieldConfig) -> ExitGrid:
         if face.bounds_method == "edge_samples":
             lo, hi = round_bounds_outward(lo, hi, resolution)
     check_exit_plane_bounds(lo, hi)
-    return ExitGrid(tuple(float(v) for v in lo), tuple(float(v) for v in hi), resolution)
+    lo, hi = tuple(float(v) for v in lo), tuple(float(v) for v in hi)
+    steps, fitted = [float(v) for v in resolution], [False, False, False]
+    if face.cross_section["shape"] == "rectangle":
+        for axis in (1, 2):
+            steps[axis], fitted[axis] = fit_axis(lo[axis], hi[axis], resolution[axis])
+    return ExitGrid(lo, hi, resolution, tuple(steps), tuple(fitted))
+
+
+def check_lattice_ends(df: pd.DataFrame, grid: ExitGrid, where: str) -> None:
+    """On each fitted axis the raw export's first and last nodes must lie on the declared bounds to ``NODE_TOL_M``
+    (HF-045): the stop is padded, so a missing or extra wall row would otherwise go unseen."""
+    for axis, column, name in ((1, "Y", "y_e"), (2, "Z", "z_e")):
+        if not grid.fitted[axis]:
+            continue
+        values = df[column].to_numpy(dtype=float)
+        expected = (grid.lo_mm[axis] * 1e-3, grid.hi_mm[axis] * 1e-3)
+        found = (float(values.min()), float(values.max())) if len(values) else (math.nan, math.nan)
+        if not all(abs(f - e) <= NODE_TOL_M for f, e in zip(found, expected)):
+            raise FieldFileError(
+                f"{where}: the fitted {name} lattice runs from {found[0]!r} to {found[1]!r} m, not from the declared "
+                f"{expected[0]!r} to {expected[1]!r} m; AEDT did not place a node on both walls")
 
 
 def _outside_outline_hull(y: np.ndarray, z: np.ndarray, vertices_m: Sequence[Sequence[float]],
@@ -380,6 +441,8 @@ def _checked_exit_field(df: pd.DataFrame, ctx: ExtractionContext, face: ExitFace
         raise FieldFileError(
             f"{where}: the export has {len(df)} rows but the lattice has {grid.lattice_points} points "
             f"{grid.counts}; the export was cut short, or the lattice model disagrees with HFSS")
+    if grid is not None:
+        check_lattice_ends(df, grid, where)
     if disc:
         df, rim = retain_disc_lattice(df, face.cross_section, where)
         log.info("%s: rim: %d unsolved inside points set to zero (deepest %.3g m), %d valued outside points "
@@ -420,7 +483,7 @@ def extract_waveguide(hfss: Any, ctx: ExtractionContext, ephi: int, face: ExitFa
     if ctx.exit_field.manual:
         grid = exit_grid(face, ctx.exit_field)
         range_min, range_max = grid.range_strings(hfss.modeler.model_units)
-        resolution = [f"{v}mm" for v in ctx.exit_field.resolution_mm]
+        resolution = grid.step_strings()
         log.info("exit-field grid in %s: min %s max %s step %s (%d lattice points, %s bounds)", ctx.exit_cs_name,
                  range_min, range_max, resolution, grid.lattice_points, face.bounds_method)
     else:

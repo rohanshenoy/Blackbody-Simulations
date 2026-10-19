@@ -370,7 +370,7 @@ def main(argv: list[str] | None = None) -> int:
                 lattice = exit_grid(face_geometry, cfg.exit_field) if face_geometry is not None and cfg.exit_field.manual else None
                 if lattice is not None:
                     range_min, range_max = lattice.range_strings(hfss.modeler.model_units)
-                    resolution = [f"{v}mm" for v in cfg.exit_field.resolution_mm]
+                    resolution = lattice.step_strings()
                     grid_variants = [
                         ("grid_int1", "ExportOnGrid, Ephi integer 1", ["Ephi:=", 1, "Freq:=", label] + (ang if swept else []) + phase),
                         ("grid_text1", "ExportOnGrid, Ephi text 1", ["Ephi:=", "1", "Freq:=", label] + (ang if swept else []) + phase),
