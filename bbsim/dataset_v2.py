@@ -1,9 +1,9 @@
 """Arithmetic of the 2.0 dataset: the per-key divisor, quadrature weights, the field scale, rho and the
-far-field hemisphere power.
+far-field hemisphere power; ``build`` assembles them into the 2.0 tables and sidecar blocks.
 
-Everything here is pure: arrays and numbers in, numbers out, no AEDT. The runner (later tasks) supplies the raw
-exit-field table of one key and polarization, the stored exit flux and the declared grid. The only file access is
-hashing the three exporter source files for the column-order reference.
+Everything here is pure: arrays and numbers in, numbers out, no AEDT. The runner supplies one ``Extracted`` per
+polarization (the raw 1.0-labelled tables and the per-key exit flux and |Re S|), the exit lattice and the declared
+grid. The only file access is hashing the three exporter source files for the column-order reference.
 
 Stored exit-field slots (columns 9-14 of the waveguide table, ``schema.EXIT_FIELD_SLOTS``) are interleaved,
 whatever the 1.0 headers say: Re Ex, Im Ex, Re Ey, Im Ey, Re Ez, Im Ez (ledger HF-038). Fields are always taken
@@ -11,15 +11,17 @@ by position, never by label.
 
 Ledger: HF-040 (|E_t|^2 sampler, quadrature weights), HF-042 (rho from the sampler's density), HF-049 and
 OR-036 (cell_90 from the declared grid), OR-034 (the InterceptFactor column), CDX-015 (far-field fraction),
-HF-041 and HF-052 (the exporter column-order reference).
+HF-041 and HF-052 (the exporter column-order reference), CDX-009 (flux numerator, sanity bound), OR-038 (dark
+records).
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import math
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
 import pandas as pd
@@ -27,6 +29,9 @@ import pandas as pd
 from . import schema
 from .manifest import sha256_file
 from .sampling import SPEED_OF_LIGHT_M_PER_S, VACUUM_PERMEABILITY_H_PER_M
+
+if TYPE_CHECKING:
+    from .extract import ExitGrid
 
 # A flux at or below DARK_REL * (entrance power A*I) is a numerical zero: the key is dark.
 DARK_REL = 1e-12
@@ -51,6 +56,21 @@ def _is_90(theta_deg: float) -> bool:
     return abs(float(theta_deg) - 90.0) <= _THETA_90_TOL_DEG
 
 
+def cell_90_band_deg(theta_list: Sequence[float]) -> tuple[float, float]:
+    """(90 - D/2, 90): the 90 deg cell's band, D the gap from 90 deg to the next larger declared theta.
+
+    A declared grid with no 90 deg entry, or none above it, is refused: the band is never guessed.
+    """
+    thetas = sorted({float(t) for t in theta_list})
+    if not any(_is_90(t) for t in thetas):
+        raise DatasetV2Error(f"cell_90 needs a theta = 90 deg key in the declared grid, got {thetas}")
+    above = [t for t in thetas if t > 90.0 + _THETA_90_TOL_DEG]
+    if not above:
+        raise DatasetV2Error(f"cell_90 needs a declared theta above 90 deg to set the band, got {thetas}")
+    delta_deg = above[0] - 90.0
+    return 90.0 - delta_deg / 2.0, 90.0
+
+
 def cell_90(theta_list: Sequence[float], cos_floor: float = COS_FLOOR) -> float:
     """Divisor of the 90 degree key: 1 / <1 / max(cos alpha, floor)> over the outermost declared band.
 
@@ -61,14 +81,8 @@ def cell_90(theta_list: Sequence[float], cos_floor: float = COS_FLOOR) -> float:
     """
     if not 0.0 < cos_floor < 1.0:
         raise DatasetV2Error(f"cos_floor must lie in (0, 1), got {cos_floor!r}")
-    thetas = sorted({float(t) for t in theta_list})
-    if not any(_is_90(t) for t in thetas):
-        raise DatasetV2Error(f"cell_90 needs a theta = 90 deg key in the declared grid, got {thetas}")
-    above = [t for t in thetas if t > 90.0 + _THETA_90_TOL_DEG]
-    if not above:
-        raise DatasetV2Error(f"cell_90 needs a declared theta above 90 deg to set the band, got {thetas}")
-    delta_deg = above[0] - 90.0
-    a0 = math.radians(90.0 - delta_deg / 2.0)
+    lo_deg, _ = cell_90_band_deg(theta_list)
+    a0 = math.radians(lo_deg)
     half_pi = math.pi / 2.0
     a_floor = math.acos(cos_floor)
     if a0 >= a_floor:
@@ -500,3 +514,376 @@ def check_reference_compatible(reference: dict, aedt_version: str, pyaedt_versio
             raise DatasetV2Error(
                 f"the column-order reference was measured with {name} {reference[name]!r}, the current one is "
                 f"{now!r}: export the reference again")
+
+
+# --- The 2.0 tables and sidecar blocks from one job's raw extraction (CDX-009, HF-040, HF-042, OR-034, OR-038) ----
+#
+# Strings are verbatim from the field list (docs/superpowers/specs/2026-10-13-schema-2-sidecar-fields.md, section 2).
+
+TRANSMITTANCE_DEFINITION = "OutgoingPower / (IngoingPower * InterceptFactor)"
+TRANSMITTANCE_NUMERATOR = "exit_flux_re_s_dot_n"
+TRANSMITTANCE_INCOMING = "area_times_intensity_undivided"
+TRANSMITTANCE_ABOVE_ONE = "per_photon_cap"
+CELL_90_EMITTER = "uniform_theta"
+QUADRATURE_BY_SHAPE = {"rectangle": "trapezoid", "disc": "uniform_disc"}
+TANGENTIAL_COMPONENTS = ("Ex", "Ey")
+SCALE_RULE = "sum_i w_i abs(E_t,i)^2 h_y h_z / (2 eta0) = outgoing_power_w"
+SAMPLER = "abs_e_t_squared_times_quadrature"
+CROSS_TERM_DENSITY = "e_t_quadrature"
+CROSS_TERM_DEFINITION = ("Re rho = sum_i w_i Re(E_t0,i . conj E_t1,i) / sqrt(sum_i w_i abs(E_t0,i)^2 * "
+                         "sum_i w_i abs(E_t1,i)^2)")
+CROSS_TERM_ABOVE_LIMIT = "warn_once"
+FAR_FIELD_NORMALIZATION = "pattern_only"
+# Declared keys and table rows match within this, in degrees (field list: per-key lists matched to 1e-9).
+KEY_TOL_DEG = 1e-9
+_FAR_FIELD_NUMERIC = ("IWavePhi", "IWaveTheta", "Phi", "Theta",
+                      "rEphi_real", "rEphi_imag", "rEtheta_real", "rEtheta_imag")
+
+
+@dataclasses.dataclass
+class Extracted:
+    """One polarization's raw extraction: the waveguide table with the 1.0 labels (values in stored, interleaved
+    order), the far-field table, and per (phi, theta) key the exit flux Re S.n and |Re S| over the exit face, in W."""
+
+    waveguide: pd.DataFrame
+    far_field: pd.DataFrame
+    flux_w: dict[tuple[float, float], float]
+    abs_w: dict[tuple[float, float], float]
+
+
+@dataclasses.dataclass
+class DatasetV2Result:
+    """What ``build`` returns.
+
+    ``waveguide``: per Ephi, the 2.0 table (``schema.WAVEGUIDE_COLUMNS_V2``). ``far_field``: per Ephi, the input
+    table unchanged. ``blocks``: the sidecar blocks ``transmittance``, ``exit_field`` (``column_order_check``,
+    ``tangential_components``, ``quadrature``, ``scale``, ``sampler``), ``cross_term``, ``far_field``
+    (``normalization``, ``ff_over_flux``). ``raw_powers_per_key``: the manifest's ``exit_field.raw_powers_per_key``
+    (signed flux before the dark clamp, and |Re S|). ``flux_over_abs_re_s``: per key, flux / |Re S| per polarization
+    or null (manifest only). ``rho_per_key``: per key, Re rho on the sampler's density, 0 where either basis is dark
+    (a diagnostic; rho is not stored per key in the sidecar). Every per-key list has one record per declared key,
+    phi outer and theta inner.
+    """
+
+    waveguide: dict[int, pd.DataFrame]
+    far_field: dict[int, pd.DataFrame]
+    blocks: dict[str, Any]
+    raw_powers_per_key: list[dict[str, Any]]
+    flux_over_abs_re_s: list[dict[str, Any]]
+    rho_per_key: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+
+
+def _key_text(key: tuple[float, float]) -> str:
+    return f"(phi, theta) = ({key[0]:g}, {key[1]:g}) deg"
+
+
+def _positive_finite(name: str, value: object) -> float:
+    try:
+        number = float(value)                                   # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        number = math.nan
+    if isinstance(value, bool) or not (math.isfinite(number) and number > 0.0):
+        raise DatasetV2Error(f"{name} must be a finite positive number, got {value!r}")
+    return number
+
+
+def _declared_keys(phi_values: Sequence[float], theta_values: Sequence[float]) -> list[tuple[float, float]]:
+    """The declared incidence keys, phi outer and theta inner (the runner's extraction order)."""
+    axes = []
+    for name, values in (("incident phi", phi_values), ("incident theta", theta_values)):
+        try:
+            numbers = [float(v) for v in values]
+        except (TypeError, ValueError) as exc:
+            raise DatasetV2Error(f"{name} values must be numbers, got {values!r}") from exc
+        if not numbers:
+            raise DatasetV2Error(f"no {name} values declared")
+        if not all(math.isfinite(v) for v in numbers):
+            raise DatasetV2Error(f"{name} values must be finite, got {numbers}")
+        ordered = sorted(numbers)
+        for a, b in zip(ordered, ordered[1:]):
+            if b - a <= KEY_TOL_DEG:
+                raise DatasetV2Error(f"duplicate {name} value {a!r} in the declared grid {numbers}")
+        axes.append(numbers)
+    return [(phi, theta) for phi in axes[0] for theta in axes[1]]
+
+
+def _checked_order_check(order_check: object) -> dict[str, Any]:
+    """The ``column_order_check`` block as ``order_check_block`` builds it, with a passed reference."""
+    if not isinstance(order_check, Mapping) or set(order_check) != {"rule", "method", "reference"}:
+        raise DatasetV2Error(f"the column-order check block must hold exactly rule, method and reference, "
+                             f"got {order_check!r}")
+    if order_check["rule"] != ORDER_RULE or order_check["method"] not in ORDER_METHODS:
+        raise DatasetV2Error(f"the column-order check block must have rule {ORDER_RULE!r} and a method in "
+                             f"{ORDER_METHODS}, got {order_check['rule']!r} and {order_check['method']!r}")
+    reference = order_check["reference"]
+    if not isinstance(reference, Mapping) or reference.get("passed") is not True:
+        raise DatasetV2Error("the column-order check block must embed a passed reference: a missing or failed "
+                             "reference stops the run")
+    return dict(order_check)
+
+
+def _row_keys(table: pd.DataFrame, keys: list[tuple[float, float]], where: str) -> np.ndarray:
+    """Index of the declared key of every row; every declared key needs rows, and every row a declared key."""
+    try:
+        phis = table["IWavePhi"].to_numpy(dtype=float)
+        thetas = table["IWaveTheta"].to_numpy(dtype=float)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DatasetV2Error(f"{where}: unreadable IWavePhi / IWaveTheta: {exc}") from exc
+    if not (np.all(np.isfinite(phis)) and np.all(np.isfinite(thetas))):
+        raise DatasetV2Error(f"{where}: non-finite IWavePhi / IWaveTheta values")
+    index = np.full(len(table), -1, dtype=int)
+    for k, (phi, theta) in enumerate(keys):
+        mask = (np.abs(phis - phi) <= KEY_TOL_DEG) & (np.abs(thetas - theta) <= KEY_TOL_DEG)
+        if not mask.any():
+            raise DatasetV2Error(f"{where} has no rows at the declared key {_key_text((phi, theta))}")
+        if np.any(index[mask] >= 0):
+            raise DatasetV2Error(f"{where}: rows at {_key_text((phi, theta))} match two declared keys")
+        index[mask] = k
+    unmatched = np.flatnonzero(index < 0)
+    if unmatched.size:
+        first = (float(phis[unmatched[0]]), float(thetas[unmatched[0]]))
+        raise DatasetV2Error(f"{where} has {unmatched.size} rows at keys outside the declared grid, the first at "
+                             f"{_key_text(first)}")
+    return index
+
+
+def _key_powers(powers: object, keys: list[tuple[float, float]], where: str) -> list[float]:
+    """The per-key powers of one polarization, in declared-key order: exactly one finite value per declared key."""
+    if not isinstance(powers, Mapping):
+        raise DatasetV2Error(f"{where} must map (phi, theta) to W, got {type(powers).__name__}")
+    out: list[float | None] = [None] * len(keys)
+    for raw_key, value in powers.items():
+        try:
+            phi, theta = (float(x) for x in raw_key)
+        except (TypeError, ValueError) as exc:
+            raise DatasetV2Error(f"{where}: key {raw_key!r} is not a (phi, theta) pair") from exc
+        matches = [k for k, (p, t) in enumerate(keys)
+                   if abs(p - phi) <= KEY_TOL_DEG and abs(t - theta) <= KEY_TOL_DEG]
+        if not matches:
+            raise DatasetV2Error(f"{where} has a value at {_key_text((phi, theta))}, outside the declared grid")
+        k = matches[0]
+        if out[k] is not None:
+            raise DatasetV2Error(f"{where} has two values at {_key_text(keys[k])}")
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = math.nan
+        if isinstance(value, bool) or not math.isfinite(number):
+            raise DatasetV2Error(f"{where} at {_key_text(keys[k])} is not a finite number: {value!r}")
+        out[k] = number
+    missing = [keys[k] for k, v in enumerate(out) if v is None]
+    if missing:
+        raise DatasetV2Error(f"{where} lacks the declared key {_key_text(missing[0])} "
+                             f"({len(missing)} declared keys missing)")
+    return [float(v) for v in out]                              # type: ignore[arg-type]
+
+
+def _check_polarization_column(table: pd.DataFrame, ephi: int, where: str) -> None:
+    try:
+        ephis = table["Ephi"].to_numpy(dtype=float)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DatasetV2Error(f"{where}: unreadable Ephi column: {exc}") from exc
+    if not np.all(ephis == ephi):
+        raise DatasetV2Error(f"{where}: the Ephi column holds {sorted(set(ephis.tolist()))}, not {ephi}: the "
+                             "tables are not this polarization's")
+
+
+def build(extracted: Mapping[int, Extracted], grid: ExitGrid, cross_section: Mapping[str, Any], incoming_w: float,
+          phi_values: Sequence[float], theta_values: Sequence[float], ff_steps_deg: tuple[float, float],
+          polarization_filter_limit_ghz: float, order_check: Mapping[str, Any]) -> DatasetV2Result:
+    """The 2.0 tables and sidecar blocks from one job's raw extraction of both polarizations.
+
+    Per declared key and polarization: the quadrature weights (trapezoid by lattice index for a rectangle, uniform
+    for a disc), the scale W and the dark flag (``scale_factor``), the sanity ratio flux / |Re S|, the far-field
+    hemisphere power over the stored flux, and Re rho on the scaled fields. ``cell_90`` is computed once over the
+    whole declared theta list, so a grid without theta = 90 deg is refused for every run (Ruling 4).
+
+    Tables keep their rows in input order and every stored value in its position: OutgoingPower becomes the key's
+    stored flux (0 when dark), IngoingPower ``incoming_w`` on every row, columns 9-14 times the key's W (1 when dark:
+    the stored fields are unchanged), the labels become ``schema.WAVEGUIDE_COLUMNS_V2`` and ``InterceptFactor`` (c_k)
+    is appended last. Far-field tables are returned unchanged.
+
+    Stops (``DatasetV2Error``, nothing returned) on: a polarization other than exactly 0 and 1; a declared key
+    missing from, or an undeclared key present in, any table or power map of either polarization; a non-finite
+    flux, |Re S|, field or far-field value, or a negative |Re S|; a negative flux beyond the dark floor; a
+    non-dark record whose tangential integral is not positive; different point counts of the two polarizations
+    at a key; a positive flux with |Re S| = 0 at any key; and, on keys with theta >= 90 deg whose stored flux
+    exceeds ``WEAK_REL`` times the polarization's largest stored flux, flux / |Re S| outside ``SANITY_BOUNDS``.
+    Dark records (stored flux 0) are never inside that band. Ratios of keys below 90 deg are reported only.
+    """
+    if not isinstance(extracted, Mapping) or set(extracted) != {0, 1}:
+        got = sorted(extracted) if isinstance(extracted, Mapping) else type(extracted).__name__
+        raise DatasetV2Error(f"schema 2 needs the extraction of both polarizations, Ephi 0 and 1, got {got}")
+    incoming = _positive_finite("the entrance power A*I (incoming_w)", incoming_w)
+    limit = _positive_finite("polarization_filter_limit_ghz", polarization_filter_limit_ghz)
+    try:
+        dtheta_ff, dphi_ff = ff_steps_deg
+    except (TypeError, ValueError) as exc:
+        raise DatasetV2Error(f"the far-field steps must be (theta step, phi step) in deg, got {ff_steps_deg!r}") from exc
+    dtheta_ff = _positive_finite("the far-field step in theta", dtheta_ff)
+    dphi_ff = _positive_finite("the far-field step in phi", dphi_ff)
+    order_block = _checked_order_check(order_check)
+
+    keys = _declared_keys(phi_values, theta_values)
+    cell90 = cell_90(theta_values)                              # Ruling 4: refuses a grid without theta = 90 deg
+    band_lo, band_hi = cell_90_band_deg(theta_values)
+    c_values = [c_key(phi, theta, theta_values) for phi, theta in keys]
+
+    shape = cross_section.get("shape") if isinstance(cross_section, Mapping) else None
+    if shape not in QUADRATURE_BY_SHAPE:
+        raise DatasetV2Error(f"unknown exit cross-section shape {shape!r}: expected one of {sorted(QUADRATURE_BY_SHAPE)}")
+    ny, nz = int(grid.counts[1]), int(grid.counts[2])
+    h_y = _positive_finite("the exit lattice step along y_e", grid.step_mm[1]) * 1e-3
+    h_z = _positive_finite("the exit lattice step along z_e", grid.step_mm[2]) * 1e-3
+
+    # Per polarization: the tables' key index, the per-key powers and the raw field values, all checked.
+    row_key: dict[int, np.ndarray] = {}
+    ff_key: dict[int, np.ndarray] = {}
+    values_all: dict[int, np.ndarray] = {}
+    flux: dict[int, list[float]] = {}
+    absolute: dict[int, list[float]] = {}
+    for e in (0, 1):
+        ex = extracted[e]
+        wg_where, ff_where = f"the waveguide table of Ephi={e}", f"the far-field table of Ephi={e}"
+        if list(ex.waveguide.columns) != list(schema.WAVEGUIDE_COLUMNS):
+            raise DatasetV2Error(f"{wg_where} must carry the 1.0 columns {schema.WAVEGUIDE_COLUMNS}, got "
+                                 f"{list(ex.waveguide.columns)}")
+        if list(ex.far_field.columns) != list(schema.FAR_FIELD_COLUMNS):
+            raise DatasetV2Error(f"{ff_where} must carry the columns {schema.FAR_FIELD_COLUMNS}, got "
+                                 f"{list(ex.far_field.columns)}")
+        _check_polarization_column(ex.waveguide, e, wg_where)
+        _check_polarization_column(ex.far_field, e, ff_where)
+        row_key[e] = _row_keys(ex.waveguide, keys, wg_where)
+        ff_key[e] = _row_keys(ex.far_field, keys, ff_where)
+        flux[e] = _key_powers(ex.flux_w, keys, f"the exit flux of Ephi={e}")
+        absolute[e] = _key_powers(ex.abs_w, keys, f"the |Re S| integral of Ephi={e}")
+        for k, a in enumerate(absolute[e]):
+            if a < 0.0:
+                raise DatasetV2Error(f"the |Re S| integral of Ephi={e} at {_key_text(keys[k])} is negative: {a!r}")
+        try:
+            values_all[e] = ex.waveguide.iloc[:, schema.EXIT_FIELD_SLOTS].to_numpy(dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise DatasetV2Error(f"{wg_where} has non-numeric exit-field values: {exc}") from exc
+        bad = ~np.all(np.isfinite(values_all[e]), axis=1)
+        if bad.any():
+            raise DatasetV2Error(f"{wg_where} at {_key_text(keys[row_key[e][np.flatnonzero(bad)[0]]])} has "
+                                 f"{int(bad.sum())} rows with non-finite exit-field values")
+        for column in _FAR_FIELD_NUMERIC:                       # column by column: the far field can be large
+            try:
+                finite = np.isfinite(ex.far_field[column].to_numpy(dtype=float))
+            except (TypeError, ValueError) as exc:
+                raise DatasetV2Error(f"{ff_where} has non-numeric values in {column}: {exc}") from exc
+            if not finite.all():
+                raise DatasetV2Error(f"{ff_where} has non-finite values in {column}, the first at "
+                                     f"{_key_text(keys[ff_key[e][np.flatnonzero(~finite)[0]]])}")
+
+    # Per key and polarization: W, dark, the sanity ratio, ff_over_flux; then rho on the pair.
+    n_keys = len(keys)
+    scale = {e: [1.0] * n_keys for e in (0, 1)}
+    dark = {e: [False] * n_keys for e in (0, 1)}
+    stored = {e: [0.0] * n_keys for e in (0, 1)}
+    ratio: dict[int, list[float | None]] = {e: [None] * n_keys for e in (0, 1)}
+    ff_over: dict[int, list[float | None]] = {e: [None] * n_keys for e in (0, 1)}
+    rho_values = [0.0] * n_keys
+    for k, key in enumerate(keys):
+        rows = {e: np.flatnonzero(row_key[e] == k) for e in (0, 1)}
+        if rows[0].size != rows[1].size:
+            raise DatasetV2Error(f"at {_key_text(key)} Ephi=0 has {rows[0].size} exit points and Ephi=1 has "
+                                 f"{rows[1].size}: BBRsim pairs the polarizations' rows by index")
+        try:
+            weights = quadrature_weights(shape, ny, nz, int(rows[0].size))
+        except DatasetV2Error as exc:
+            raise DatasetV2Error(f"at {_key_text(key)}: {exc}") from exc
+        scaled = {}
+        for e in (0, 1):
+            where = f"Ephi={e} at {_key_text(key)}"
+            values = values_all[e][rows[e]]
+            try:
+                w, is_dark = scale_factor(values, weights, h_y, h_z, flux[e][k], incoming)
+                ratio[e][k] = sanity_ratio(flux[e][k], absolute[e][k], incoming)
+            except DatasetV2Error as exc:
+                raise DatasetV2Error(f"{where}: {exc}") from exc
+            scale[e][k], dark[e][k] = float(w), bool(is_dark)
+            stored[e][k] = 0.0 if is_dark else flux[e][k]
+            if not is_dark:
+                ff_rows = extracted[e].far_field.iloc[np.flatnonzero(ff_key[e] == k)]
+                ff_over[e][k] = hemisphere_power_w(ff_rows, dtheta_ff, dphi_ff) / stored[e][k]
+            scaled[e] = values * w
+        try:
+            rho_values[k] = rho(scaled[0], scaled[1], weights, dark[0][k], dark[1][k])
+        except DatasetV2Error as exc:
+            raise DatasetV2Error(f"at {_key_text(key)}: {exc}") from exc
+
+    # Sanity bound (CDX-009) on reachable keys of non-weak flux; dark records are stored as 0 and never inside.
+    lo_bound, hi_bound = SANITY_BOUNDS
+    failures = []
+    for e in (0, 1):
+        largest = max(stored[e])
+        for k, (phi, theta) in enumerate(keys):
+            if theta < 90.0 - _THETA_90_TOL_DEG or not stored[e][k] > WEAK_REL * largest:
+                continue
+            r = ratio[e][k]
+            if r is None or not lo_bound <= r <= hi_bound:
+                failures.append(f"Ephi={e} at {_key_text((phi, theta))}: flux / |Re S| = {r!r}")
+    if failures:
+        raise DatasetV2Error(f"exit flux over |Re S| outside [{lo_bound}, {hi_bound}] on reachable keys: "
+                             + "; ".join(failures))
+
+    # The 2.0 tables.
+    tables: dict[int, pd.DataFrame] = {}
+    for e in (0, 1):
+        idx = row_key[e]
+        out = extracted[e].waveguide.copy()
+        out.columns = list(schema.WAVEGUIDE_COLUMNS_V2[:15])
+        out["OutgoingPower"] = np.asarray(stored[e], dtype=float)[idx]
+        out["IngoingPower"] = incoming
+        fields = values_all[e] * np.asarray(scale[e], dtype=float)[idx][:, None]
+        for j, name in enumerate(schema.WAVEGUIDE_COLUMNS_V2[9:15]):
+            out[name] = fields[:, j]
+        out[schema.INTERCEPT_FACTOR] = np.asarray(c_values, dtype=float)[idx]
+        tables[e] = out.loc[:, list(schema.WAVEGUIDE_COLUMNS_V2)]
+
+    def head(k: int) -> dict[str, float]:
+        return {"phi_deg": float(keys[k][0]), "theta_deg": float(keys[k][1])}
+
+    blocks = {
+        "transmittance": {
+            "definition": TRANSMITTANCE_DEFINITION,
+            "numerator": TRANSMITTANCE_NUMERATOR,
+            "incoming": TRANSMITTANCE_INCOMING,
+            "c_key": [{**head(k), "c_k": float(c_values[k])} for k in range(n_keys)],
+            "cell_90": float(cell90),
+            "cell_90_assumes": {"emitter": CELL_90_EMITTER, "cos_floor": COS_FLOOR, "band_deg": [band_lo, band_hi]},
+            "above_one": TRANSMITTANCE_ABOVE_ONE,
+            "per_key": [{**head(k), "c_k": float(c_values[k]), "polarizations": {
+                str(e): {"t_flux": stored[e][k] / incoming, "outgoing_power_abs_re_s_w": absolute[e][k]}
+                for e in (0, 1)}} for k in range(n_keys)],
+        },
+        "exit_field": {
+            "column_order_check": order_block,
+            "tangential_components": list(TANGENTIAL_COMPONENTS),
+            "quadrature": QUADRATURE_BY_SHAPE[shape],
+            "scale": {"rule": SCALE_RULE, "per_key": [
+                {**head(k), "w0": scale[0][k], "w1": scale[1][k], "dark0": dark[0][k], "dark1": dark[1][k]}
+                for k in range(n_keys)]},
+            "sampler": SAMPLER,
+        },
+        "cross_term": {
+            "density": CROSS_TERM_DENSITY,
+            "definition": CROSS_TERM_DEFINITION,
+            "valid_below_ghz": limit,
+            "above_limit": CROSS_TERM_ABOVE_LIMIT,
+        },
+        "far_field": {
+            "normalization": FAR_FIELD_NORMALIZATION,
+            "ff_over_flux": [{**head(k), "polarizations": {str(e): ff_over[e][k] for e in (0, 1)}}
+                             for k in range(n_keys)],
+        },
+    }
+    raw_powers = [{**head(k), "polarizations": {
+        str(e): {"exit_flux_re_s_dot_n_w": flux[e][k], "outgoing_power_abs_re_s_w": absolute[e][k]} for e in (0, 1)}}
+        for k in range(n_keys)]
+    ratios = [{**head(k), "polarizations": {str(e): ratio[e][k] for e in (0, 1)}} for k in range(n_keys)]
+    rho_records = [{**head(k), "rho": float(rho_values[k])} for k in range(n_keys)]
+    return DatasetV2Result(waveguide=tables, far_field={e: extracted[e].far_field for e in (0, 1)}, blocks=blocks,
+                           raw_powers_per_key=raw_powers, flux_over_abs_re_s=ratios, rho_per_key=rho_records)
