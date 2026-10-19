@@ -17,6 +17,27 @@ POSE_RULES = ("canonical-z", "unchecked")
 SYMMETRIES = ("mirror_l", "mirror_g", "end_to_end", "rotational")
 
 
+def _finite(name: str, value: Any) -> float:
+    """A real, finite number (CDX-024): nan passes every inequality guard and inf passes "> 0", so both are refused
+    here, before any job directory or AEDT session exists. Booleans and strings are refused too. The value itself
+    is left as given (an integer frequency keeps its label)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ConfigError(f"{name} must be a finite number, got {value!r}")
+    return float(value)
+
+
+def _finite_vector(name: str, values: Any) -> tuple[float, ...]:
+    if isinstance(values, (str, bytes)) or not hasattr(values, "__iter__"):
+        raise ConfigError(f"{name} must be a list of numbers, got {values!r}")
+    return tuple(_finite(f"{name}[{i}]", v) for i, v in enumerate(values))
+
+
+def _integer(name: str, value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"{name} must be an integer, got {value!r}")
+    return value
+
+
 @dataclass(frozen=True)
 class FaceSelector:
     axis: str
@@ -51,7 +72,7 @@ class GeometryConfig:
 
     def __post_init__(self) -> None:
         for name in ("exit_cs_x", "exit_cs_y"):
-            if len(getattr(self, name)) != 3:
+            if len(_finite_vector(name, getattr(self, name))) != 3:
                 raise ConfigError(f"{name} must have 3 components")
         x = [float(c) for c in self.exit_cs_x]
         y = [float(c) for c in self.exit_cs_y]
@@ -60,8 +81,11 @@ class GeometryConfig:
                 raise ConfigError(f"{name} must be a unit vector, got {v}")
         if abs(sum(a * b for a, b in zip(x, y))) > 1e-9:
             raise ConfigError(f"exit_cs_x and exit_cs_y must be orthogonal, got {x} and {y}")
-        if self.expected_box_size_mm is not None and len(self.expected_box_size_mm) != 3:
+        if self.expected_box_size_mm is not None and len(_finite_vector("expected_box_size_mm",
+                                                                         self.expected_box_size_mm)) != 3:
             raise ConfigError("expected_box_size_mm must have 3 components")
+        if self.expected_face_area_mm2 is not None:
+            _finite("expected_face_area_mm2", self.expected_face_area_mm2)
         if self.pose not in POSE_RULES:
             raise ConfigError(f"pose must be one of {list(POSE_RULES)}, got {self.pose!r}")
         if isinstance(self.symmetry, str):
@@ -84,6 +108,8 @@ class ExcitationConfig:
     phi_step_deg: float
 
     def __post_init__(self) -> None:
+        for f in fields(self):
+            _finite(f.name, getattr(self, f.name))
         if self.ei_v_per_m != 1.0:
             raise ConfigError(
                 "ei_v_per_m must be 1.0: the HFSS plane wave amplitude is fixed at 1 V/m by the polarization "
@@ -110,8 +136,16 @@ class SolverConfig:
     wall_normal_deviation_deg: float | None = None
 
     def __post_init__(self) -> None:
+        _finite("frequency_ghz", self.frequency_ghz)
+        _finite("max_delta_e", self.max_delta_e)
+        _integer("max_passes", self.max_passes)
+        _integer("cores", self.cores)
+        if self.wall_normal_deviation_deg is not None:
+            _finite("wall_normal_deviation_deg", self.wall_normal_deviation_deg)
         if self.frequency_ghz <= 0:
             raise ConfigError("frequency_ghz must be positive")
+        if self.max_delta_e <= 0:
+            raise ConfigError("max_delta_e must be positive")
         if self.wall_normal_deviation_deg is not None and not 0 < self.wall_normal_deviation_deg < 90:
             raise ConfigError("wall_normal_deviation_deg must lie strictly between 0 and 90 degrees")
         if self.max_passes < 1:
@@ -138,6 +172,8 @@ class FarFieldConfig:
     max_coarseness_deg: float
 
     def __post_init__(self) -> None:
+        for f in fields(self):
+            _finite(f.name, getattr(self, f.name))
         if self.a_mm <= 0 or self.b_mm <= 0 or self.fineness <= 0:
             raise ConfigError("a_mm, b_mm and fineness must be positive")
         if not 0 < self.min_coarseness_deg <= self.max_coarseness_deg:
@@ -162,10 +198,12 @@ class ExitFieldConfig:
                 "with no lattice, so its CSVs and sidecar would fail BBRsim's exit-plane and grid checks; it "
                 "remains in legacy/bbsim1freq.py."
             )
-        res = self.resolution_mm
+        res = _finite_vector("resolution_mm", self.resolution_mm)
         if len(res) != 3 or any(v < 0 for v in res) or not any(v > 0 for v in res):
             raise ConfigError(f"resolution_mm must be 3 non-negative steps with at least one positive, got {list(res)}")
         if self.boundary_mm is not None:
+            for i, corner in enumerate(self.boundary_mm):
+                _finite_vector(f"boundary_mm[{i}]", corner)
             ok = (len(self.boundary_mm) == 2 and all(len(corner) == 3 for corner in self.boundary_mm)
                   and all(hi >= lo for lo, hi in zip(*self.boundary_mm)))
             if not ok:
@@ -181,6 +219,7 @@ class OutputConfig:
     export_timeout_s: float = 300.0
 
     def __post_init__(self) -> None:
+        _finite("export_timeout_s", self.export_timeout_s)
         if not self.polarizations or any(p not in (0, 1) for p in self.polarizations):
             raise ConfigError(f"polarizations must be a non-empty subset of [0, 1], got {list(self.polarizations)}")
         if len(set(self.polarizations)) != len(self.polarizations):

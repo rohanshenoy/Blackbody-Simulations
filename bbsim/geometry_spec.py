@@ -57,8 +57,9 @@ class CylinderSolid:
         _non_empty("solid", "material", self.material)
         for name in ("radius_mm", "length_mm"):
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0:
-                raise GeometrySpecError(f"[solid] {name} must be a positive number, got {value!r}")
+            if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+                    or not value > 0):
+                raise GeometrySpecError(f"[solid] {name} must be a positive finite number, got {value!r}")
 
     @property
     def expected_bounding_box_mm(self) -> list[float]:
