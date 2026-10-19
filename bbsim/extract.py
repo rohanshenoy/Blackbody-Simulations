@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 
 GUARD_MM = 1e-9           # floating-noise guard when rounding lattice bounds outward
 CONTAIN_REL_TOL = 1e-6    # retained exit points may exceed the declared cross-section by this fraction
-PLANE_TOL_M = 1e-9        # retained exit points must lie on the exit plane x_e = 0 to this
+PLANE_TOL_M = 1e-12       # retained exit points must lie on the exit plane x_e = 0 to this, as BBRsim requires (CDX-023)
 RIM_BAND_REL = 0.05       # a disc's faceted rim: export disagreements tolerated within this fraction of the radius
 FIELD_COLUMNS = ["Ex_real", "Ey_real", "Ez_real", "Ex_imag", "Ey_imag", "Ez_imag"]
 
@@ -194,16 +194,27 @@ def chord_sagitta_mm(local_points_mm: np.ndarray, samples_per_edge: int) -> floa
     return d_max * (1.0 - math.cos(math.pi / samples_per_edge))
 
 
+def check_exit_plane_bounds(lo_mm: Sequence[float], hi_mm: Sequence[float]) -> None:
+    """The lattice's x_e bounds must both lie on the exit plane to ``PLANE_TOL_M``: otherwise every exported point
+    is off the plane, and BBRsim would refuse the dataset (BBR012) after a licensed solve (CDX-023)."""
+    tol_mm = PLANE_TOL_M * 1e3
+    if abs(float(lo_mm[0])) > tol_mm or abs(float(hi_mm[0])) > tol_mm:
+        raise GeometryError(f"the exit lattice's x_e bounds [{lo_mm[0]}, {hi_mm[0]}] mm are off the exit plane "
+                            f"x_e = 0 (tolerance {PLANE_TOL_M:g} m); fix exit_field.boundary_mm")
+
+
 def exit_grid(face: ExitFaceGeometry, exit_field: ExitFieldConfig) -> ExitGrid:
     """The export lattice. Manual bounds win; vertex bounds are used as they are (legacy, so the crack
-    exports stay byte-identical); edge-sample bounds are rounded outward to the resolution."""
+    exports stay byte-identical); edge-sample bounds are rounded outward to the resolution. Called before the
+    solve, so bounds off the exit plane cost seconds."""
     resolution = tuple(float(v) for v in exit_field.resolution_mm)
     if exit_field.boundary_mm is not None:
         lo, hi = exit_field.boundary_mm
-        return ExitGrid(tuple(float(v) for v in lo), tuple(float(v) for v in hi), resolution)
-    lo, hi = face.local_points_mm.min(axis=0), face.local_points_mm.max(axis=0)
-    if face.bounds_method == "edge_samples":
-        lo, hi = round_bounds_outward(lo, hi, resolution)
+    else:
+        lo, hi = face.local_points_mm.min(axis=0), face.local_points_mm.max(axis=0)
+        if face.bounds_method == "edge_samples":
+            lo, hi = round_bounds_outward(lo, hi, resolution)
+    check_exit_plane_bounds(lo, hi)
     return ExitGrid(tuple(float(v) for v in lo), tuple(float(v) for v in hi), resolution)
 
 
