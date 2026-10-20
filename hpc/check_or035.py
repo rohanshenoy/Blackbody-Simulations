@@ -196,9 +196,9 @@ def copy_project(job: Job) -> Path:
     return project
 
 
-def inspect(job: Job, project: Path) -> dict[str, list[str]]:
-    """Open the copy, describe its exit face as the runner does, judge (b), and on crack1 export and judge (a).
-    Returns the problems per check, keyed "a" and "b"."""
+def inspect_project(job: Job, project: Path) -> dict[str, list[str]]:
+    """Open the copy, refuse model units other than mm (as prepare_from_solved does), describe its exit face as the
+    runner does, judge (b), and on crack1 export and judge (a). Returns the problems per check, keyed "a" and "b"."""
     from bbsim import session
     from bbsim.extract import ExtractionContext, describe_exit_face
     from bbsim.geometry import select_faces
@@ -216,6 +216,8 @@ def inspect(job: Job, project: Path) -> dict[str, list[str]]:
             raise RuntimeError(f"design {run_design!r} not in the copy {project}; designs: {list(hfss.design_list)}")
         if hfss.design_name != run_design:
             hfss.set_active_design(run_design)
+        if hfss.modeler.model_units != "mm":   # as prepare_from_solved: every length below is read as mm
+            raise RuntimeError(f"model units are {hfss.modeler.model_units!r}; the configuration assumes mm")
         entrance, exit_face = select_faces(hfss, cfg.geometry)
         sphere, ff_grid = far_field_sphere(cfg.far_field, freq)
         ctx = ExtractionContext(
@@ -292,7 +294,7 @@ def main(argv: list[str] | None = None) -> int:
     for job in jobs:
         print(f"== {job.label}: a copy of {job.source.project}" + (" and its .aedtresults" if job.export else ""))
         try:
-            found = inspect(job, copy_project(job))
+            found = inspect_project(job, copy_project(job))
         except Exception as exc:  # noqa: BLE001 - one project's failure is its checks' failure; the others still run
             print(f"   {job.label}: stopped: {type(exc).__name__}: {exc}")
             failed.append(f"{job.label} stopped ({type(exc).__name__})")

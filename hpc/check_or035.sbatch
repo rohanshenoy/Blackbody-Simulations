@@ -49,15 +49,22 @@ echo "host=$(hostname) job=${SLURM_JOB_ID:-none} checkout=$CHECKOUT commit=$(git
 LOG=$(mktemp "${TMPDIR:-/tmp}/check_or035.XXXXXX")
 "$PYTHON" -u hpc/check_or035.py "$@" 2>&1 | tee "$LOG"
 rc=$?
+# The verdict is the script's last "== RESULT:" line, wherever it falls (a line printed at exit may follow it); it is
+# repeated when it was not the last line, so the job still ends with it. PASS counts only with exit 0; no verdict
+# (an import error, a killed process) is a FAIL here.
+verdict=$(grep '^== RESULT:' "$LOG" | tail -n 1)
 last=$(tail -n 1 "$LOG")
 rm -f "$LOG"
-# The script ends with its own verdict line; a crash before it (an import error, a killed process) is a FAIL here.
-case $last in
+case $verdict in
   "== RESULT: PASS"*)
-    [ "$rc" -eq 0 ] && exit 0
+    if [ "$rc" -eq 0 ]; then
+      [ "$last" = "$verdict" ] || echo "$verdict"
+      exit 0
+    fi
     echo "== RESULT: FAIL hpc/check_or035.py printed PASS but exited $rc"
     exit 1 ;;
   "== RESULT: FAIL"*)
+    [ "$last" = "$verdict" ] || echo "$verdict"
     [ "$rc" -eq 2 ] && exit 2
     exit 1 ;;
 esac

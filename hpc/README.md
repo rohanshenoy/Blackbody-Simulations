@@ -547,7 +547,9 @@ solve and one AEDT seat per project. (a) On crack1's copy, the runner's own latt
 y lattice and z in [-0.01875, 0.01875] mm at the configured 1 um: 37.5 steps, so `fit_axis` gives 38 intervals of
 0.0375/38 mm and 39 nodes. (b) On all three copies, the exit-face outline in the exit frame, from the runner's own
 face description. It runs inside Rohan's one HPC batch on its own (B4), independent of step 9. crack1's copy carries
-its `.aedtresults` (about 2.5 GB) under `<job>/check_or035/` while the job runs. One paste:
+its `.aedtresults` (about 2.5 GB) under `<job>/check_or035/` while the job runs; with step 9b's re-exports (about
+7.5 GB) running at the same time, the peak on `/home` is about 10 GB, so check `quota -s` or `df -h /home/rshenoy`
+first. One paste:
 
     cd /home/rshenoy/BBRSim/Blackbody-Simulations && git pull --ff-only fork linux-hpc-migration
     mkdir -p /home/rshenoy/BBRSim/outputs
@@ -556,7 +558,7 @@ its `.aedtresults` (about 2.5 GB) under `<job>/check_or035/` while the job runs.
 When it has left the queue (same shell, or put the job number in place of `$B4`):
 
     sacct -j $B4 -o JobID,State,ExitCode,Elapsed,MaxRSS
-    grep -E '^(== |   \((a|b)\)|       |   HF-045|   copies|   note)' /home/rshenoy/BBRSim/outputs/check_or035-$B4.out
+    grep -E '^(== |   \((a|b)\)|       |   HF-045|   copies|   note)|: stopped: |Error:|Exception:' /home/rshenoy/BBRSim/outputs/check_or035-$B4.out
 
 Expected: (a) the fitted step 0.0375/38 mm (0.000986842105263158) with that spacing string in the ExportOnGrid
 call; `expect 101 x 39 = 3939 rows per key, z end nodes at -1.875e-05 and 1.875e-05 m to 1e-12 m`; 15 keys exported
@@ -573,9 +575,9 @@ the `sacct` lines.
 The schema-2 tables (HF-050) for the three solved 2025 R2 jobs, crack1 and crack2 `job_tight1` (step 5d) and the round
 gap's `job_reference1` (step 8), come from a fresh extraction on copies of their solved projects: no solve, one AEDT
 seat per project, no solver licence. Each fresh job is accepted against its source, then the `_v2` trees are
-assembled for BBRsim's schema-2 reader. These steps run inside Rohan's one HPC batch as independent chains, so a
-failure in one never blocks another: 9b-9c (B1), then 9d (B2), then 9e (B3); step 8d (B4) runs alone. The pastes
-below are what the batch submits; each also works on its own, in this order.
+assembled for BBRsim's schema-2 reader. These steps run inside Rohan's one HPC batch, in chain B: B1 (9b-9c) -> B2
+(9d) -> B3 (9e); B4 (step 8d) alone; chain B never waits on chain C, and a failure in one chain never blocks another.
+The pastes below are what the batch submits; each also works on its own, in this order.
 
 With schema 2 the default (HF-050): a run that is not crack1 at 500 GHz needs `--column-order-reference`, the file
 crack1's job keeps as `scratch/column_order_reference.json` (HF-041); a `--polarizations 1` run is refused; the
@@ -589,7 +591,9 @@ single-angle pastes (steps 4, 7, 7b, and step 8's 2.5 deg check) still run schem
     quota -s; df -h /home/rshenoy
 
 Expected: `git rev-parse HEAD` prints the tip pushed for the batch. Each re-export copies its source's
-`.aedtresults` (about 2.5 GB) onto `/home` NFS, about 7.5 GB for the three, so `quota -s` or `df -h` must leave
+`.aedtresults` (about 2.5 GB) onto `/home` NFS, about 7.5 GB for the three (B1). Step 8d (B4) is an independent
+chain that may run at the same time and holds its own copy of crack1's `.aedtresults` (about 2.5 GB) under
+`check_or035/` while it runs, so the peak on `/home` is about 10 GB: `quota -s` or `df -h /home/rshenoy` must leave
 that much free.
 
 ### 9b. Re-export, with its acceptance (9c) in the same job (batch B1)
@@ -608,7 +612,7 @@ The records it compares against are step 8c's `<job_tight1>/diagnose_poynting/po
 When it has left the queue (same shell, or put the job number in place of `$B1`):
 
     sacct -j $B1 -o JobID,State,ExitCode,Elapsed,MaxRSS
-    grep -E '^(== |PREFLIGHT|preflight: |REEXPORT|(PASS|FAIL) |   (manifest|Ephi=|sidecar|ff_over_flux|reference|column-order))|wrote the schema-2 sidecar|done; manifest at|failed' /home/rshenoy/BBRSim/outputs/reexport_v2-$B1.out
+    grep -E '^(== |PREFLIGHT|preflight: |REEXPORT|(PASS|FAIL) |   (manifest|Ephi=|sidecar|ff_over_flux|reference|column-order|\(no summary|\(the reference))|wrote the schema-2 sidecar|done; manifest at|failed|refused|earlier attempt|reexport_check: |bbsim.run: aedt: |Error:|Exception:' /home/rshenoy/BBRSim/outputs/reexport_v2-$B1.out
     sed -n '/^largest deviations:/,/^REEXPORT/p' /home/rshenoy/BBRSim/outputs/reexport_v2-$B1.out
 
 Expected: three `PREFLIGHT: PASS` lines. Each re-export's log ends with the schema-2 sidecar written and
@@ -641,7 +645,7 @@ polarization; one sidecar named by its dataset; both `_Ephi` directories with `w
 `manifest.json`; no dataset twice; one schema major per tree; the expected file count. It refuses an existing
 non-empty tree directory. It lays the tree out as steps 5e and 8a did, and writes and checks `SHA256SUMS`. The
 schema-1 trees `cracks_500GHz_2025r2` and `testworld_2025r2` stay as they are. One paste (after 9b; the
-dependency waits for it):
+dependency waits for it; same shell as 9b, or put B1's job number in place of `$B1`):
 
     T=/resnick/groups/golwala/rshenoy/bbsim/trees; O=/home/rshenoy/BBRSim/outputs
     C1=$O/InfParallelPlate_crack1Rohan_500GHz/job_tight1_v2; C2=$O/InfParallelPlate_crack2_500GHz/job_tight1_v2
