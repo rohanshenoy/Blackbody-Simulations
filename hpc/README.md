@@ -650,8 +650,8 @@ dependency waits for it; same shell as 9b, or put B1's job number in place of `$
     T=/resnick/groups/golwala/rshenoy/bbsim/trees; O=/home/rshenoy/BBRSim/outputs
     C1=$O/InfParallelPlate_crack1Rohan_500GHz/job_tight1_v2; C2=$O/InfParallelPlate_crack2_500GHz/job_tight1_v2
     R=$O/RoundGap_r50um_2000GHz/job_reference1_v2
-    A=$(sbatch --parsable --dependency=afterok:$B1 hpc/assemble_tree.sbatch $T/cracks_500GHz_2025r2_v2 14 $C1 $C2); A=${A%%;*}
-    W=$(sbatch --parsable --dependency=afterok:$B1 hpc/assemble_tree.sbatch $T/testworld_2025r2_v2 21 $C1 $C2 $R); W=${W%%;*}
+    A=$(sbatch --parsable --dependency=afterok:$B1 --kill-on-invalid-dep=yes hpc/assemble_tree.sbatch $T/cracks_500GHz_2025r2_v2 14 $C1 $C2); A=${A%%;*}
+    W=$(sbatch --parsable --dependency=afterok:$B1 --kill-on-invalid-dep=yes hpc/assemble_tree.sbatch $T/testworld_2025r2_v2 21 $C1 $C2 $R); W=${W%%;*}
     echo "B2 jobs $A $W"
 
 When both have left the queue:
@@ -659,10 +659,11 @@ When both have left the queue:
     sacct -j $A,$W -o JobID,State,ExitCode,Elapsed
     for j in $A $W; do grep -v ': OK$' /home/rshenoy/BBRSim/outputs/assemble_tree-$j.out; done
 
-Expected, per tree: every job's two polarization lines read `qualified true` with the achieved delta against
-0.005; every dataset `schema_version 2.0`; `copied 14` (cracks) and `copied 21` (test world) files;
+Expected, per tree: every job's two polarization lines read `qualified true` with the achieved delta against 0.005;
+every dataset `schema_version 2.0`; `copied 14` (cracks) and `copied 21` (test world) files;
 `SHA256SUMS: 14 files, all OK` and `21 files`; the last line `== RESULT: PASS` with exit 0. A refusal names the job
-and its reason, and nothing is copied; a tree directory that exists and is not empty is never touched.
+and its reason, and nothing is copied; a tree directory that exists and is not empty is never touched. If B1 failed,
+Slurm cancels both (`--kill-on-invalid-dep`).
 
 ### 9e. BBRsim's tree check on the `_v2` trees (BBRsim side, batch B3)
 
@@ -692,10 +693,11 @@ With schema 2 the default (HF-050), every job but the crack1 500 GHz reference n
 (90, 180) deg), so it runs with none and keeps its own as `job_grid35_1/scratch/column_order_reference.json`;
 crack2 and the round gap take that file, not step 9's, so chain C does not wait for chain B.
 
-Space on `/home`: each job keeps its solved project and `.aedtresults`, about 2.8 / 4.8 / 2.5 GB for crack1 /
-crack2 / the round gap going by the 15-key runs; the 35-key size is not measured yet, so record it with `du -sh`
-(it sizes the job array). With chain B's copies (about 10 GB at its peak, step 9a) on `/home` at the same time,
-check `quota -s` or `df -h /home/rshenoy` first.
+Space on `/home`: each job keeps its solved project and `.aedtresults`, at least the 15-key runs' sizes, about
+2.8 / 4.8 / 2.5 GB for crack1 / crack2 / the round gap. Field solutions are stored per excitation, so a 35-key
+`.aedtresults` may approach 35/15 of the 15-key one, roughly 24 GB for the three. Not measured yet: record it with
+`du -sh` (it sizes the job array). With chain B's copies (about 10 GB at its peak, step 9a) on `/home` at the same
+time, check `quota -s` or `df -h /home/rshenoy` first.
 
 ### 10a. Solve the three (batch C1)
 
@@ -718,64 +720,42 @@ runner refuses a missing reference before the job starts too). One paste:
 When all three have left the queue (same shell, or put the job numbers in place of `$G1`, `$G2`, `$G3`):
 
     sacct -j $G1,$G2,$G3 -o JobID,State,ExitCode,Elapsed,MaxRSS
-    for j in $G1 $G2 $G3; do grep -E '^(== |preflight: |   (manifest|Ephi=|sidecar|cell_90|column-order|reference passed))|wrote the schema-2 sidecar|convergence target|done; manifest at|job failed|refused|bbsim.run: aedt: |Error:|Exception:' /home/rshenoy/BBRSim/outputs/solve_grid35-$j.out; done
+    for j in $G1 $G2 $G3; do grep -E '^(== |host=|preflight: |   (manifest|Ephi=|sidecar|cell_90|column-order|reference passed))|wrote the schema-2 sidecar|convergence target|done; manifest at|job failed|refused|bbsim.run: aedt: |Error:|Exception:' /home/rshenoy/BBRSim/outputs/solve_grid35-$j.out; done
     du -sh /home/rshenoy/BBRSim/outputs/*/job_grid35_1 /home/rshenoy/BBRSim/outputs/*/job_grid35_1/project/*.aedtresults
 
-Expected, for each: `preflight: ok; 5 x 7 = 35 keys, schema 2`; the run logs `wrote the schema-2 sidecar` and ends
-`done; manifest at .../job_grid35_1/manifest.json` and `run_hfss_frequency.py exited 0`, with no
-`convergence target ... not met` warning; the summary shows `qualified true` for both polarizations with the
-achieved delta at most the target 0.005, the sidecar with `schema_version 2.0; 35 keys` and
-`cell_90 0.036633054690581604` (0.0366330547: the band 82.5 to 90 deg, HF-049's rule on this grid); crack1's two
-column-order cases `passed true`, at least one `discriminating true`, P2/P printed (the legacy tables gave 0.713 /
-0.725; printed, not pinned); the last line `== RESULT: PASS` with exit 0. Cost, from the 15-key runs times 35/15
-(time grows with the keys, memory does not): crack1 about 20 min and 2.8 GB (15 keys: 8.7 min, 2.8 GB), crack2 about
-34 min and 4.8 GB (14.4 min, 4.8 GB), the round gap about 10 min and 2.5 GB (4 min 16 s, 2.5 GB). Record `Elapsed`,
-`MaxRSS` and the `du -sh` sizes: they size the job array. Anything else ends `== RESULT: FAIL <reasons>` with exit 1
-(the runner's exit code, `solver.qualified`, the key count, cell_90, crack1's reference), or exit 2 with "nothing
-started". Before a rerun, remove a failed attempt's `job_grid35_1` by hand; the script never deletes anything. Paste
-the `grep` and `du` output and the `sacct` lines.
+Expected, for each: the `host=` line with the commit that ran; `preflight: ok; 5 x 7 = 35 keys, schema 2`; the run
+logs `wrote the schema-2 sidecar` and ends `done; manifest at .../job_grid35_1/manifest.json` and
+`run_hfss_frequency.py exited 0`, with no `convergence target ... not met` warning; the summary shows
+`qualified true` for both polarizations with the achieved delta at most the target 0.005, the sidecar with
+`schema_version 2.0; 35 keys` and `cell_90 0.036633054690581604` (0.0366330547: the band 82.5 to 90 deg, HF-049's
+rule on this grid); crack1's two column-order cases `passed true`, at least one `discriminating true`, P2/P printed
+(the legacy tables gave 0.713 / 0.725; printed, not pinned); the last line `== RESULT: PASS` with exit 0. Cost, from
+the 15-key runs times 35/15 (time grows with the keys, memory does not): crack1 about 20 min and 2.8 GB (15 keys:
+8.7 min, 2.8 GB), crack2 about 34 min and 4.8 GB (14.4 min, 4.8 GB), the round gap about 10 min and 2.5 GB (4 min
+16 s, 2.5 GB). Record `Elapsed`, `MaxRSS` and the `du -sh` sizes: they size the job array. Anything else ends
+`== RESULT: FAIL <reasons>` with exit 1 (the runner's exit code, `solver.qualified`, the key count, cell_90,
+crack1's reference), or exit 2 with "nothing started". Before a rerun, remove a failed attempt's `job_grid35_1` by
+hand; the script never deletes anything. Paste the `grep` and `du` output and the `sacct` lines.
 
 ### 10b. Key-by-key acceptance against the 15-key solves (batch C2)
 
-`python -m bbsim.grid_acceptance --new <job_grid35_1> --reference <15-key job>` compares, at the nine keys both
-grids declare (phi 0, 45, 90 x theta 90, 135, 180 deg), the new job's magnitude-power ratio, its sidecar's
-`outgoing_power_abs_re_s_w` over IngoingPower (A I), with the 15-key job's OutgoingPower / IngoingPower: crack1 and
-crack2 against `job_tight1` (step 5d), the round gap against `job_reference1` (step 8). A key passes within 0.5 % of
-T_ref; one whose T_ref is below 1e-3 of its polarization's largest is reported as noise. Neither the stored schema-2
-flux nor c_k enters: the flux differs from |Re S| by 0.2 % at normal incidence and 10 to 18 % on oblique keys (step
-8b), and c_k at theta 90 deg follows the grid, so the comparison isolates mesh and solver differences from the
-decided numerator and divisor changes. 0.5 % sits above the mesh noise at MaxDeltaE 0.005 (0.1 % between the
-separately meshed polarizations, step 5d; 0.3 % for the round gap's facet check, step 8). It also requires the new
-job to declare schema 2.x and exactly the 35-key grid, the reference schema 1.x and all nine keys, the same dataset
-and frequency label, and IngoingPower constant within each table and equal between the jobs to 1e-9; a non-finite
-number fails the row that reads it. Each run writes `<job_grid35_1>/grid_acceptance.json`. One paste, after 10a
-(same shell; it writes a small batch script and submits it once all three solves have passed):
+`hpc/grid_acceptance.sbatch` runs `python -m bbsim.grid_acceptance --new <job_grid35_1> --reference <15-key job>` on
+the three pairs: crack1 and crack2 against `job_tight1` (step 5d), the round gap against `job_reference1` (step 8).
+Each compares, at the nine keys both grids declare (phi 0, 45, 90 x theta 90, 135, 180 deg), the new job's
+magnitude-power ratio, its sidecar's `outgoing_power_abs_re_s_w` over IngoingPower (A I), with the 15-key job's
+OutgoingPower / IngoingPower. A key passes within 0.5 % of T_ref; one whose T_ref is below 1e-3 of its
+polarization's largest is reported as noise (with a note if its T_new is not also below that band). Neither the
+stored schema-2 flux nor c_k enters: the flux differs from |Re S| by 0.2 % at normal incidence and 10 to 18 % on
+oblique keys (step 8b), and c_k at theta 90 deg follows the grid, so the comparison isolates mesh and solver
+differences from the decided numerator and divisor changes. 0.5 % sits above the mesh noise at MaxDeltaE 0.005
+(0.1 % between the separately meshed polarizations, step 5d; 0.3 % for the round gap's facet check, step 8). It also
+requires the new job to declare schema 2.x and exactly the 35-key grid, the reference schema 1.x and all nine keys,
+the same dataset and frequency label, and IngoingPower constant within each table and equal between the jobs to
+1e-9; a non-finite number fails the row that reads it. Each pair prints its table, then writes
+`<job_grid35_1>/grid_acceptance.json`; a report that cannot be written fails that pair. A failing pair does not stop
+the others, and each is judged by its exit code. One paste, after 10a (same shell):
 
-    O=/home/rshenoy/BBRSim/outputs
-    cat > $O/grid35_acceptance.sh <<'SH'
-    #!/bin/bash -l
-    #SBATCH --job-name=bbsim_grid35_acceptance
-    #SBATCH --account=golwala
-    #SBATCH --partition=expansion
-    #SBATCH --qos=normal
-    #SBATCH --nodes=1
-    #SBATCH --ntasks=1
-    #SBATCH --cpus-per-task=1
-    #SBATCH --mem=8G
-    #SBATCH --time=00:30:00
-    #SBATCH --output=/home/rshenoy/BBRSim/outputs/grid_acceptance-%j.out
-    source /home/rshenoy/BBRSim/bb_env.sh || { echo "== RESULT: FAIL environment"; exit 1; }
-    cd /home/rshenoy/BBRSim/Blackbody-Simulations || { echo "== RESULT: FAIL checkout"; exit 1; }
-    O=/home/rshenoy/BBRSim/outputs
-    FAILED=""
-    for P in InfParallelPlate_crack1Rohan_500GHz/job_tight1 InfParallelPlate_crack2_500GHz/job_tight1 RoundGap_r50um_2000GHz/job_reference1; do
-      echo "== grid_acceptance ${P%/*}"
-      python -m bbsim.grid_acceptance --new "$O/${P%/*}/job_grid35_1" --reference "$O/$P" || FAILED="$FAILED ${P%/*}"
-    done
-    if [ -n "$FAILED" ]; then echo "== RESULT: FAIL$FAILED"; exit 1; fi
-    echo "== RESULT: PASS"
-    SH
-    GACC=$(sbatch --parsable --dependency=afterok:$G1:$G2:$G3 --kill-on-invalid-dep=yes $O/grid35_acceptance.sh); GACC=${GACC%%;*}
+    GACC=$(sbatch --parsable --dependency=afterok:$G1:$G2:$G3 --kill-on-invalid-dep=yes hpc/grid_acceptance.sbatch); GACC=${GACC%%;*}
     echo "C2 job $GACC"
 
 When it has left the queue:
@@ -784,9 +764,11 @@ When it has left the queue:
     cat /home/rshenoy/BBRSim/outputs/grid_acceptance-$GACC.out
 
 Expected: `GRID35: PASS` three times at 0.5 % on the nine shared keys, each table with its 18 rows (nine keys, two
-polarizations); for the cracks the keys whose polarization the slot cuts off (crack1's T about 1e-10) show as
-`noise`; the last line `== RESULT: PASS` with exit 0. A `FAIL` names the key and polarization and the relative
-difference: the new solve does not reproduce the old one there. Paste the table; do not loosen the tolerance
+polarizations), and the last line `== RESULT: PASS` with exit 0. Noise rows, as guidance and not a pin: on the
+legacy 500 GHz tables 6 per crack, the polarization the slot cuts off (Ephi=0 at phi 90 deg and Ephi=1 at phi 0 deg,
+three theta each, T about 1e-10); the round gap's count is whatever its reference gives. A pair that fails names its
+key, polarization and relative difference, and the last line `== RESULT: FAIL <datasets>` names it with its exit
+code (exit 1): the new solve does not reproduce the old one there. Paste the tables; do not loosen the tolerance
 silently. If a solve failed, Slurm cancels this job (`--kill-on-invalid-dep`).
 
 ### 10c. Assemble the two 35-key trees (batch C3)
@@ -799,8 +781,8 @@ One paste (same shell as 10b):
     T=/resnick/groups/golwala/rshenoy/bbsim/trees; O=/home/rshenoy/BBRSim/outputs
     N1=$O/InfParallelPlate_crack1Rohan_500GHz/job_grid35_1; N2=$O/InfParallelPlate_crack2_500GHz/job_grid35_1
     NR=$O/RoundGap_r50um_2000GHz/job_grid35_1
-    GT1=$(sbatch --parsable --dependency=afterok:$GACC hpc/assemble_tree.sbatch $T/cracks_500GHz_grid35 14 $N1 $N2); GT1=${GT1%%;*}
-    GT2=$(sbatch --parsable --dependency=afterok:$GACC hpc/assemble_tree.sbatch $T/testworld_grid35 21 $N1 $N2 $NR); GT2=${GT2%%;*}
+    GT1=$(sbatch --parsable --dependency=afterok:$GACC --kill-on-invalid-dep=yes hpc/assemble_tree.sbatch $T/cracks_500GHz_grid35 14 $N1 $N2); GT1=${GT1%%;*}
+    GT2=$(sbatch --parsable --dependency=afterok:$GACC --kill-on-invalid-dep=yes hpc/assemble_tree.sbatch $T/testworld_grid35 21 $N1 $N2 $NR); GT2=${GT2%%;*}
     echo "C3 jobs $GT1 $GT2"
 
 When both have left the queue:
@@ -811,7 +793,7 @@ When both have left the queue:
 Expected, as step 9d: every job's two polarization lines `qualified true` against 0.005; every dataset
 `schema_version 2.0`; `copied 14` (cracks) and `copied 21` (test world); `SHA256SUMS: 14 files, all OK` and
 `21 files`; the last line `== RESULT: PASS` with exit 0. A refusal names the job and its reason, and nothing is
-copied.
+copied. If the acceptance failed, Slurm cancels both (`--kill-on-invalid-dep`).
 
 ### 10d. BBRsim's tree check on the 35-key trees (BBRsim side, batch C4)
 

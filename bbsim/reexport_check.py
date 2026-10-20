@@ -52,7 +52,6 @@ directory or the --poynting file is missing.
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import sys
 from collections.abc import Callable, Mapping, Sequence
@@ -64,6 +63,13 @@ import numpy as np
 import pandas as pd
 
 from bbsim import dataset_v2, schema
+from bbsim.acceptance_rows import RowVerdicts, guard
+from bbsim.acceptance_rows import Refused as _Refused
+from bbsim.acceptance_rows import at_key as _where
+from bbsim.acceptance_rows import get as _get
+from bbsim.acceptance_rows import number as _number
+from bbsim.acceptance_rows import read_json as _read_json
+from bbsim.acceptance_rows import row as _row
 from bbsim.compare import Check
 from bbsim.convergence import qualify
 from bbsim.dataset_v2 import key_text
@@ -86,7 +92,6 @@ STORED_REL = 1e-12         # a stored OutgoingPower, t_flux, IngoingPower or |Re
 COORD_M = 1e-12            # exit points, source against fresh: BBRsim pairs rows to this
 KEY_DEG = dataset_v2.KEY_TOL_DEG
 DARK_REL = dataset_v2.DARK_REL
-MAX_LISTED = 5
 
 _WG = {name: i for i, name in enumerate(schema.WAVEGUIDE_COLUMNS_V2)}   # positions 0-8 are the same in 1.0
 _FF = {name: i for i, name in enumerate(schema.FAR_FIELD_COLUMNS)}
@@ -100,48 +105,12 @@ EXIT_ROWS = ("exit_field.dark", "exit_field.scale", "exit_field.values", "exit_f
 _MISSING = object()
 
 
-class _Refused(ValueError):
-    """Input a check cannot accept: it fails the row that needed it."""
-
-
 # --- small helpers ---------------------------------------------------------------------------------------------------
-
-def _where(ephi: int, key: tuple[float, float]) -> str:
-    return f"Ephi={ephi} at {key_text(key)}"
-
-
-def _number(value: object, where: str) -> float:
-    """``dataset_v2.finite_number``, refused as this module refuses (bool, string, null, NaN, infinity)."""
-    try:
-        return dataset_v2.finite_number(value, where)
-    except dataset_v2.DatasetV2Error as exc:
-        raise _Refused(str(exc)) from exc
-
 
 def _integer(value: object, where: str) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
         raise _Refused(f"{where} must be an integer, got {value!r}")
     return int(value)
-
-
-def _get(mapping: object, *path: str, where: str, default: object = _MISSING) -> Any:
-    """``dataset_v2.require``; a missing step returns ``default`` when one is given, else is refused."""
-    try:
-        return dataset_v2.require(mapping, *path, where=where)
-    except dataset_v2.DatasetV2Error as exc:
-        if default is _MISSING:
-            raise _Refused(str(exc)) from exc
-        return default
-
-
-def _read_json(path: Path, what: str) -> dict:
-    try:
-        data = json.loads(Path(path).read_text())
-    except (OSError, ValueError) as exc:
-        raise _Refused(f"{what} {path} is unreadable: {exc}") from exc
-    if not isinstance(data, dict):
-        raise _Refused(f"{what} {path} is not a JSON object")
-    return data
 
 
 def _relative(a: float, b: float) -> float:
@@ -212,21 +181,10 @@ def _strict(records: object, keys: Sequence[tuple[float, float]], where: str, **
     return found
 
 
-def _row(name: str, rule: str, failures: list[str], summary: str, values: dict | None = None) -> Check:
-    """A fail-severity row whose detail always states its rule, then the summary or the first failures."""
-    if failures:
-        listed = "; ".join(failures[:MAX_LISTED])
-        more = f"; and {len(failures) - MAX_LISTED} more" if len(failures) > MAX_LISTED else ""
-        detail = f"{rule}: {len(failures)} failure(s): {listed}{more}"
-    else:
-        detail = f"{rule}: {summary}"
-    return Check(name, not failures, "fail", detail, {**(values or {}), "failures": failures})
-
-
 # --- the result ------------------------------------------------------------------------------------------------------
 
 @dataclass
-class ReexportResult:
+class ReexportResult(RowVerdicts):
     """The rows in the design's order, the largest deviation of each compared quantity (value, limit, where), the
     tolerances used, and the verdict."""
 
@@ -236,14 +194,6 @@ class ReexportResult:
     checks: list[Check]
     largest_deviation: dict[str, dict[str, Any]]
     tolerances: dict[str, float]
-
-    @property
-    def failures(self) -> list[Check]:
-        return [c for c in self.checks if c.severity == "fail" and not c.passed]
-
-    @property
-    def passed(self) -> bool:
-        return bool(self.checks) and not self.failures
 
     @property
     def verdict(self) -> str:
@@ -326,13 +276,7 @@ class _Acceptance:
             raise exc
         return value
 
-    @staticmethod
-    def _guard(names: Sequence[str], step: Callable[[], list[Check]]) -> list[Check]:
-        try:
-            return step()
-        except Exception as exc:  # noqa: BLE001 - every refusal becomes a failing row, never a traceback (CDX-030)
-            text = str(exc) if isinstance(exc, _Refused) else f"{type(exc).__name__}: {exc}"
-            return [Check(name, False, "fail", f"refused: {text}") for name in names]
+    _guard = staticmethod(guard)    # every refusal becomes a failing row, never a traceback (CDX-030)
 
     def _needs(self, names: Sequence[str], step: Callable[[], list[Check]], *, keys: bool = False,
                tables: bool = False, aligned: bool = False) -> list[Check]:

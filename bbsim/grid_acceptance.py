@@ -35,19 +35,20 @@ Rows, in order (the first stops the rest when it fails, as nothing else can be r
    reference tables, to 1e-9 relative (same geometry, same Ei: the key's constant A I).
 7. transmittance.shared_keys: per shared key and polarization, where T_ref >= 1e-3 x the polarization's largest
    T_ref over the shared keys, |T_new - T_ref| <= t_rel_tol x T_ref; keys below that band are reported as noise and
-   do not fail (crack1's E-along-slot polarization at normal incidence carries T about 1e-10).
+   do not fail (crack1's E-along-slot polarization at normal incidence carries T about 1e-10); a noise row whose
+   T_new lies inside the band carries a note saying so.
 
 Every number read must be finite: a missing, malformed or non-finite value fails the row that reads it, naming the key
 and polarization where there is one, and never escapes as an exception (CDX-030: nothing is compared with NaN). The
 rows, the per-key table and the verdict go to ``<new>/grid_acceptance.json`` (written only into a job whose sidecar
-declares schema 2, never into a 15-key source job); the printed table ends in
+declares schema 2, never into a 15-key source job), after the table is printed; a report that cannot be written is
+named on its own ``report:`` line and fails the run, without a traceback. The printed table ends in
 ``GRID35: PASS`` or ``GRID35: FAIL <n>`` (n failing rows). Exit code 0 on PASS, 1 on FAIL, 2 when a job directory is
 missing or the arguments are wrong.
 """
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import sys
 from collections.abc import Mapping, Sequence
@@ -59,6 +60,13 @@ import numpy as np
 import pandas as pd
 
 from bbsim import dataset_v2
+from bbsim.acceptance_rows import RowVerdicts, guard
+from bbsim.acceptance_rows import Refused as _Refused
+from bbsim.acceptance_rows import at_key as _where
+from bbsim.acceptance_rows import get as _get
+from bbsim.acceptance_rows import number as _number
+from bbsim.acceptance_rows import read_json as _read_json
+from bbsim.acceptance_rows import row as _row
 from bbsim.compare import Check
 from bbsim.dataset_v2 import key_text
 from bbsim.manifest import write_json
@@ -77,42 +85,9 @@ NEW_MAJOR, REFERENCE_MAJOR = "2", "1"
 # The waveguide table's first six columns, the same labels and positions in schema 1.0 and 2.0.
 LEADING_COLUMNS = ["Freq", "Ephi", "IWavePhi", "IWaveTheta", "OutgoingPower", "IngoingPower"]
 PHI, THETA, OUTGOING, INGOING = 2, 3, 4, 5
-MAX_LISTED = 5
-
-
-class _Refused(ValueError):
-    """Input a row cannot accept: it fails the row that needed it."""
 
 
 # --- small helpers ---------------------------------------------------------------------------------------------------
-
-def _where(ephi: int, key: tuple[float, float]) -> str:
-    return f"Ephi={ephi} at {key_text(key)}"
-
-
-def _number(value: object, where: str) -> float:
-    try:
-        return dataset_v2.finite_number(value, where)
-    except dataset_v2.DatasetV2Error as exc:
-        raise _Refused(str(exc)) from exc
-
-
-def _get(mapping: object, *path: str, where: str) -> Any:
-    try:
-        return dataset_v2.require(mapping, *path, where=where)
-    except dataset_v2.DatasetV2Error as exc:
-        raise _Refused(str(exc)) from exc
-
-
-def _read_json(path: Path, what: str) -> dict:
-    try:
-        data = json.loads(Path(path).read_text())
-    except (OSError, ValueError) as exc:
-        raise _Refused(f"{what} {path} is unreadable: {exc}") from exc
-    if not isinstance(data, dict):
-        raise _Refused(f"{what} {path} is not a JSON object")
-    return data
-
 
 def _axis(sidecar: Mapping, name: str, where: str) -> list[float]:
     values = _get(sidecar, "excitation", name, where=where)
@@ -137,43 +112,33 @@ def _finite_or_none(value: float | None) -> float | None:
     return float(value) if value is not None and math.isfinite(value) else None
 
 
-def _row(name: str, rule: str, failures: list[str], summary: str, values: dict | None = None) -> Check:
-    """A fail-severity row whose detail states its rule, then the summary or the first failures."""
-    if failures:
-        listed = "; ".join(failures[:MAX_LISTED])
-        more = f"; and {len(failures) - MAX_LISTED} more" if len(failures) > MAX_LISTED else ""
-        detail = f"{rule}: {len(failures)} failure(s): {listed}{more}"
-    else:
-        detail = f"{rule}: {summary}"
-    return Check(name, not failures, "fail", detail, {**(values or {}), "failures": failures})
-
-
 # --- the result ------------------------------------------------------------------------------------------------------
 
 @dataclass
-class GridResult:
+class GridResult(RowVerdicts):
     """The rows in order, one comparison record per shared key and polarization (``phi_deg``, ``theta_deg``,
     ``ephi``, ``t_new``, ``t_ref``, ``rel_diff`` = (T_new - T_ref) / T_ref, ``status`` PASS, FAIL or noise, ``note``),
-    the tolerance used, and the verdict."""
+    the tolerance used, where the JSON report goes and whether it was written, and the verdict. A report that could
+    not be written fails the run."""
 
     new_job: str
     reference_job: str
     t_rel_tol: float
     checks: list[Check]
     rows: list[dict[str, Any]] = field(default_factory=list)
-    report: str | None = None      # the JSON written, or None when the new job is not a declared schema-2 job
-
-    @property
-    def failures(self) -> list[Check]:
-        return [c for c in self.checks if c.severity == "fail" and not c.passed]
+    report_target: str | None = None   # <new>/grid_acceptance.json for a declared schema-2 new job, else None
+    report: str | None = None          # the JSON written (``write_report``)
+    report_error: str | None = None    # why it could not be written
 
     @property
     def passed(self) -> bool:
-        return bool(self.checks) and not self.failures
+        return super().passed and self.report_error is None
 
     @property
     def verdict(self) -> str:
-        return "GRID35: PASS" if self.passed else f"GRID35: FAIL {len(self.failures)}"
+        if self.passed:
+            return "GRID35: PASS"
+        return f"GRID35: FAIL {len(self.failures) + (1 if self.report_error else 0)}"
 
     def to_dict(self) -> dict[str, Any]:
         return {"new_job": self.new_job, "reference_job": self.reference_job, "passed": self.passed,
@@ -184,6 +149,20 @@ class GridResult:
                 "checks": [asdict(c) for c in self.checks], "rows": [dict(r) for r in self.rows]}
 
     def format_table(self) -> str:
+        return self.format_rows() + "\n" + self.format_footer()
+
+    def format_footer(self) -> str:
+        """The report line and the verdict: what ``main`` prints after writing the report."""
+        if self.report:
+            report = f"report: {self.report}"
+        elif self.report_error:
+            report = f"report: {self.report_error}"
+        else:
+            report = "report: not written (the new job is not a declared schema-2 job; a 15-key source is never written)"
+        return "\n".join(["", report, "", self.verdict])
+
+    def format_rows(self) -> str:
+        """The header, the check rows and the per-key table: what ``main`` prints before writing the report."""
         lines = [f"new:       {self.new_job}", f"reference: {self.reference_job}",
                  f"tolerances: t_rel_tol={self.t_rel_tol:g} noise_rel={NOISE_REL:g} ingoing_rel={INGOING_REL:g}", ""]
         for c in self.checks:
@@ -198,9 +177,6 @@ class GridResult:
                 note = f"  ({r['note']})" if r.get("note") else ""
                 lines.append(f"{r['phi_deg']:>6g} {r['theta_deg']:>6g} {r['ephi']:>4d} {t_new:>16} {t_ref:>16} "
                              f"{rel:>10}  {r['status']}{note}")
-        lines += ["", f"report: {self.report}" if self.report else
-                  "report: not written (the new job is not a declared schema-2 job; a 15-key source is never written)",
-                  "", self.verdict]
         return "\n".join(lines)
 
 
@@ -232,11 +208,7 @@ class _Acceptance:
 
     @staticmethod
     def _guard(name: str, step: Any) -> Check:
-        try:
-            return step()
-        except Exception as exc:  # noqa: BLE001 - every refusal becomes a failing row, never a traceback (CDX-030)
-            text = str(exc) if isinstance(exc, _Refused) else f"{type(exc).__name__}: {exc}"
-            return Check(name, False, "fail", f"refused: {text}")
+        return guard([name], lambda: [step()])[0]     # a refusal is a failing row, never a traceback (CDX-030)
 
     def run(self) -> list[Check]:
         checks = [self._guard("schema.declared", self._schemas)]
@@ -485,6 +457,7 @@ class _Acceptance:
                 problems.append(f"Ephi={ephi}: no positive T_ref among the shared keys, so no key can be compared")
         failures: list[str] = list(problems)
         counts = {"PASS": 0, "FAIL": 0, "noise": 0}
+        noted = 0
         self.rows = []
         for k, key in enumerate(SHARED_KEYS):
             for ephi in (0, 1):
@@ -504,6 +477,10 @@ class _Acceptance:
                                         f"{rel:+.4%}, beyond {self.tol:g}")
                 else:
                     status = "noise"
+                    if t_new >= NOISE_REL * largest[ephi]:
+                        noted += 1
+                        note = (f"T_new {t_new:.6g} is above the noise band ({NOISE_REL:g} x the largest T_ref = "
+                                f"{NOISE_REL * largest[ephi]:.6g}) while T_ref {t_ref:.6g} is below it; not a failure")
                 counts[status] += 1
                 self.rows.append({"phi_deg": key[0], "theta_deg": key[1], "ephi": ephi,
                                   "t_new": _finite_or_none(t_new), "t_ref": _finite_or_none(t_ref),
@@ -513,16 +490,29 @@ class _Acceptance:
                     f"(reference), no c_k and no flux: |T_new - T_ref| <= {self.tol:g} T_ref where T_ref >= "
                     f"{NOISE_REL:g} of the polarization's largest", failures,
                     f"{counts['PASS']} compared within {self.tol:g}, {counts['noise']} below the band reported as "
-                    "noise", {"largest_t_ref": {str(e): _finite_or_none(v) for e, v in largest.items()},
+                    "noise" + (f" ({noted} with T_new above it, noted on the row)" if noted else ""), {"largest_t_ref": {str(e): _finite_or_none(v) for e, v in largest.items()},
                               "counts": counts})
 
 
 # --- entry points ----------------------------------------------------------------------------------------------------
 
-def compare(new_job: Path, reference_job: Path, t_rel_tol: float = T_REL_TOL) -> GridResult:
+def write_report(result: GridResult) -> None:
+    """Write ``result.to_dict()`` to ``result.report_target`` (nothing when it is None). An OSError is recorded in
+    ``result.report_error``, which fails the run, and never raised."""
+    if result.report_target is None:
+        return
+    try:
+        write_json(Path(result.report_target), result.to_dict())
+    except OSError as exc:
+        result.report_error = f"{result.report_target} could not be written ({exc}); the run fails"
+        return
+    result.report = result.report_target
+
+
+def compare(new_job: Path, reference_job: Path, t_rel_tol: float = T_REL_TOL, write: bool = True) -> GridResult:
     """Accept ``new_job`` (schema 2, 35 keys) against ``reference_job`` (schema 1, 15 keys) at the nine shared keys
-    and write ``<new_job>/grid_acceptance.json``; only into a job whose sidecar declares schema 2, so that a swapped
-    call never writes into a 15-key source job.
+    and, with ``write``, write ``<new_job>/grid_acceptance.json`` (``write_report``); only into a job whose sidecar
+    declares schema 2, so that a swapped call never writes into a 15-key source job.
 
     Raises ``FileNotFoundError`` when a job directory is missing and ``ValueError`` for a tolerance that is not a
     finite positive number (usage errors); every problem with the jobs' contents becomes a failing row instead.
@@ -536,11 +526,12 @@ def compare(new_job: Path, reference_job: Path, t_rel_tol: float = T_REL_TOL) ->
         raise ValueError(f"t_rel_tol must be a finite positive number, got {t_rel_tol!r}")
     acceptance = _Acceptance(new_job, reference_job, float(t_rel_tol))
     checks = acceptance.run()
-    result = GridResult(str(new_job), str(reference_job), float(t_rel_tol), checks, acceptance.rows)
     version = acceptance.new.sidecar.get("schema_version")
-    if isinstance(version, str) and version.split(".")[0] == NEW_MAJOR:
-        result.report = str(new_job / REPORT_NAME)
-        write_json(new_job / REPORT_NAME, result.to_dict())
+    target = new_job / REPORT_NAME if isinstance(version, str) and version.split(".")[0] == NEW_MAJOR else None
+    result = GridResult(str(new_job), str(reference_job), float(t_rel_tol), checks, acceptance.rows,
+                        report_target=None if target is None else str(target))
+    if write:
+        write_report(result)
     return result
 
 
@@ -557,11 +548,13 @@ def main(argv: list[str] | None = None) -> int:
     except SystemExit as exc:             # argparse has printed its message
         return 2 if exc.code else 0
     try:
-        result = compare(args.new, args.reference, args.t_rel_tol)
+        result = compare(args.new, args.reference, args.t_rel_tol, write=False)
     except (FileNotFoundError, ValueError) as exc:
         print(f"grid_acceptance: {exc}", file=sys.stderr)
         return 2
-    print(result.format_table())
+    print(result.format_rows(), flush=True)     # the table reaches the log before the report is written
+    write_report(result)
+    print(result.format_footer())
     return 0 if result.passed else 1
 
 
