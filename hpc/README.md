@@ -536,3 +536,104 @@ near 0.2 for crack1 and 0.4 for crack2 at normal incidence, the fraction of the 
 currents on a slot about a tenth of a wavelength wide radiate (Codex found 0.18 and 0.34 on the outward
 hemisphere, CDX-015). If a copy cannot be removed, the run now says so and still exits 0; remove it by hand.
 Paste the round gap's `tail` and `ls`, the two blocks with their `tail` lines, and the `sacct` lines.
+
+## 9. Schema-2 re-export of the three solved jobs, no solve (batch)
+
+The schema-2 tables (HF-050) for the three solved 2025 R2 jobs, crack1 and crack2 `job_tight1` (step 5d) and the round
+gap's `job_reference1` (step 8), come from a fresh extraction on copies of their solved projects: no solve, one AEDT
+seat per project, no solver licence. Each fresh job is accepted against its source, then the `_v2` trees are
+assembled for BBRsim's schema-2 reader. These steps run inside Rohan's one HPC batch as independent chains, so a
+failure in one never blocks another: 9b-9c (B1), then 9d (B2), then 9e (B3); step 8d (B4) runs alone. The pastes
+below are what the batch submits; each also works on its own, in this order.
+
+With schema 2 the default (HF-050): a run that is not crack1 at 500 GHz needs `--column-order-reference`, the file
+crack1's job keeps as `scratch/column_order_reference.json` (HF-041); a `--polarizations 1` run is refused; the
+single-angle pastes (steps 4, 7, 7b, and step 8's 2.5 deg check) still run schema 1, as their configs say
+(`output.schema = 1`).
+
+### 9a. Pull the fork at the tip
+
+    cd /home/rshenoy/BBRSim/Blackbody-Simulations && git pull --ff-only fork linux-hpc-migration
+    git rev-parse HEAD
+    quota -s; df -h /home/rshenoy
+
+Expected: `git rev-parse HEAD` prints the tip pushed for the batch. Each re-export copies its source's
+`.aedtresults` (about 2.5 GB) onto `/home` NFS, about 7.5 GB for the three, so `quota -s` or `df -h` must leave
+that much free.
+
+### 9b. Re-export, with its acceptance (9c) in the same job (batch B1)
+
+`hpc/reexport_v2.sbatch` checks before any AEDT session that each source job and its step-8b record exist, that the
+record was made on that source (its `manifest_sha256`) and covers every key and both polarizations
+(`bbsim.reexport_check --preflight`), and that no fresh job exists yet. It then re-exports crack1 into
+`job_tight1_v2`, with no reference (it measures its own), and stops if that fails; then crack2 into `job_tight1_v2`
+and the round gap into `job_reference1_v2`, both with crack1's reference, a failure of one not stopping the other.
+The records it compares against are step 8c's `<job_tight1>/diagnose_poynting/poynting.json` for the cracks and step
+8b's `<job_reference1>/diagnose_poynting/poynting.json` for the round gap. One paste:
+
+    mkdir -p /home/rshenoy/BBRSim/outputs
+    B1=$(sbatch --parsable hpc/reexport_v2.sbatch); B1=${B1%%;*}; echo "B1 job $B1"
+
+When it has left the queue (same shell, or put the job number in place of `$B1`):
+
+    sacct -j $B1 -o JobID,State,ExitCode,Elapsed,MaxRSS
+    grep -E '^(== |PREFLIGHT|preflight: |REEXPORT|(PASS|FAIL) |   (manifest|Ephi=|sidecar|ff_over_flux|reference|column-order))|wrote the schema-2 sidecar|done; manifest at|failed' /home/rshenoy/BBRSim/outputs/reexport_v2-$B1.out
+    sed -n '/^largest deviations:/,/^REEXPORT/p' /home/rshenoy/BBRSim/outputs/reexport_v2-$B1.out
+
+Expected: three `PREFLIGHT: PASS` lines. Each re-export's log ends with the schema-2 sidecar written and
+`done; manifest at ...`, followed by its summary: `qualified true` for both polarizations, the achieved delta
+against the source's target 0.005 (HF-046: crack1 0.0036596 / 0.0037117, crack2 0.004126 / 0.00434, the round gap
+about 0.0025 / 0.0029), `solve_time_s null` (no solve, no `analyze`) and the source as `reused_solution`. crack1's two
+column-order cases print `passed true` with at least one `discriminating true`, and their P2/P (the legacy tables
+gave 0.713 / 0.725; a value far from them is worth a look, not a failure). `ff_over_flux` at normal incidence is near
+0.179 for crack1 and 0.348 for crack2 (step 8c's outward hemisphere over the exit flux), and near 0.66 for the round
+gap (step 8b's forward fraction).
+
+9c, inside the same job: `REEXPORT: PASS` three times, each table with its largest deviations printed, its
+`powers.poynting` row passing against the step-8b record, and the last line `== RESULT: PASS` with exit 0. What
+this run shows for the first time, beyond PASS: re-defining both named expressions (`ClearAllNamedExpr`, then
+`outgoing_power` and `exit_flux`), `export_convergence` and `EditSources(TotalFields)` work on a reopened solved
+design (an AEDT failure there names itself in the log before anything is written); the `convergence` row passes,
+so the reopened design's convergence tables equal the source's; and the dark keys that carry only noise (theta 0,
+T about 1e-44) pass `exit_field.values` within eps like every other key.
+
+Anything else ends `== RESULT: FAIL <what failed>`: exit 2 with "nothing started" names the preflight's reason;
+exit 1 names the failed re-export or acceptance (a failed crack1 re-export means the other two did not start).
+Before a rerun, remove a failed attempt's `job_*_v2` directory by hand; the runner refuses an existing one, and
+the script never deletes anything. Paste the `grep` and `sed` output and the `sacct` lines.
+
+### 9d. Assemble the two `_v2` trees (batch B2)
+
+`hpc/assemble_tree.sbatch <tree_dir> <expected_files> <job_dir>...` gates every job before copying anything:
+`solver.qualified` true in its manifest (OR-027: assembly takes qualified runs only), printed with one line per
+polarization; one sidecar named by its dataset; both `_Ephi` directories with `waveguide.csv`, `far_field.csv` and
+`manifest.json`; no dataset twice; one schema major per tree; the expected file count. It refuses an existing
+non-empty tree directory. It lays the tree out as steps 5e and 8a did, and writes and checks `SHA256SUMS`. The
+schema-1 trees `cracks_500GHz_2025r2` and `testworld_2025r2` stay as they are. One paste (after 9b; the
+dependency waits for it):
+
+    T=/resnick/groups/golwala/rshenoy/bbsim/trees; O=/home/rshenoy/BBRSim/outputs
+    C1=$O/InfParallelPlate_crack1Rohan_500GHz/job_tight1_v2; C2=$O/InfParallelPlate_crack2_500GHz/job_tight1_v2
+    R=$O/RoundGap_r50um_2000GHz/job_reference1_v2
+    A=$(sbatch --parsable --dependency=afterok:$B1 hpc/assemble_tree.sbatch $T/cracks_500GHz_2025r2_v2 14 $C1 $C2); A=${A%%;*}
+    W=$(sbatch --parsable --dependency=afterok:$B1 hpc/assemble_tree.sbatch $T/testworld_2025r2_v2 21 $C1 $C2 $R); W=${W%%;*}
+    echo "B2 jobs $A $W"
+
+When both have left the queue:
+
+    sacct -j $A,$W -o JobID,State,ExitCode,Elapsed
+    for j in $A $W; do grep -v ': OK$' /home/rshenoy/BBRSim/outputs/assemble_tree-$j.out; done
+
+Expected, per tree: every job's two polarization lines read `qualified true` with the achieved delta against
+0.005; every dataset `schema_version 2.0`; `copied 14` (cracks) and `copied 21` (test world) files;
+`SHA256SUMS: 14 files, all OK` and `21 files`; the last line `== RESULT: PASS` with exit 0. A refusal names the job
+and its reason, and nothing is copied; a tree directory that exists and is not empty is never touched.
+
+### 9e. BBRsim's tree check on the `_v2` trees (BBRsim side, batch B3)
+
+BBRsim's `g4_tree_check.sbatch`, after its full check, with the BBRSimulation checkout at the schema-2 reader
+(`feat/schema-2-reader`). That branch carries OR-024's BBR028 whitelist, which `testworld_2025r2_v2` needs: the
+round gap's 2000 GHz set lies above its 1757 GHz polarization-filter limit, so BBR028 fires once. Its header
+states the expected results; record them with the BBRsim side's. The paste, with `<A1>` the full check's job:
+
+    sbatch --dependency=afterok:<A1>:$A:$W /home/rshenoy/BBRSim/g4_tree_check.sbatch $T/cracks_500GHz_2025r2_v2 $T/testworld_2025r2_v2

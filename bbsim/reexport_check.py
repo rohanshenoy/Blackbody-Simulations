@@ -3,11 +3,18 @@
 Usage::
 
     python -m bbsim.reexport_check --source JOB --fresh JOB [--poynting JSON]
+    python -m bbsim.reexport_check --preflight --source JOB --poynting JSON
 
 ``--source`` is a finished schema-1 job; ``--fresh`` is the job ``run_frequency --from-solved`` made from it on a copy
 of its solved project (HF-050). On the HPC this is the gate before the ``_v2`` trees are assembled. Run it from the
 checkout that made the re-export: the embedded column-order reference is checked against this checkout's exporter
 files, as the runner checks it.
+
+``--preflight`` runs before the re-export, so that ``hpc/reexport_v2.sbatch`` refuses before any AEDT session starts:
+the --poynting record must exist, be made on this source (its ``manifest_sha256``) and hold every key of the source
+manifest's excitation lists for both polarizations, each with a finite ``exit.flux_z_w``. It reads step 8b's record
+with the same parser as the ``powers.poynting`` row below (``read_poynting``). It prints ``PREFLIGHT: PASS`` and
+exits 0, or lists the problems, prints ``PREFLIGHT: FAIL <n>`` and exits 2.
 
 Only a declared schema-1 source and a declared schema-2 fresh job are compared. The versions come from each job's
 ``*.dataset.json`` sidecar, never from a config without ``output.schema``; any other pair, a missing sidecar or a
@@ -1103,36 +1110,7 @@ class _Acceptance:
         data = _read_json(self.poynting, "the --poynting record")
         raw, _ = self._raw_powers()
         floor = DARK_REL * self._ai()
-        problems = []
-        source_sha = sha256_file(self.source.root / "manifest.json")
-        if data.get("manifest_sha256") != source_sha:
-            problems.append(f"the step-8b record was made on a job whose manifest_sha256 is "
-                            f"{data.get('manifest_sha256')!r}, not this source's {source_sha}")
-        records = data.get("keys")
-        if not isinstance(records, list):
-            raise _Refused(f"the --poynting record's keys must be a list, got {type(records).__name__}")
-        seen: dict[tuple[int, int], float] = {}
-        for i, record in enumerate(records):
-            at = f"the step-8b record keys[{i}]"
-            try:
-                ephi = _integer(_get(record, "ephi", where=at), f"{at}.ephi")
-                phi, theta = _phi_theta(record, at)
-                f8b = _number(_get(record, "exit", "flux_z_w", where=at), f"{at} ({_where(ephi, (phi, theta))}) "
-                              "exit.flux_z_w")
-            except _Refused as exc:
-                problems.append(str(exc))
-                continue
-            k = dataset_v2.key_position(self.keys, phi, theta)
-            if ephi not in (0, 1) or k is None:
-                problems.append(f"{at}: Ephi={ephi} at {key_text((phi, theta))} is not a declared record")
-            elif (ephi, k) in seen:
-                problems.append(f"{at}: a second record of {_where(ephi, self.keys[k])}")
-            else:
-                seen[(ephi, k)] = f8b
-        missing = [(e, k) for e in (0, 1) for k in range(len(self.keys)) if (e, k) not in seen]
-        if missing:
-            problems.append(f"the step-8b record lacks {len(missing)} records, the first "
-                            f"{_where(missing[0][0], self.keys[missing[0][1]])}")
+        seen, problems = read_poynting(data, self.keys, sha256_file(self.source.root / "manifest.json"))
         for (ephi, k), f8b in sorted(seen.items()):
             if (ephi, k) not in raw:
                 continue
@@ -1212,6 +1190,73 @@ class _Acceptance:
                      "fresh_recomputed": fresh_q, "source_manifest_has_qualification": source_recorded is not None})
 
 
+# --- step 8b's poynting.json: one parser for the preflight and the powers.poynting row ------------------------------
+
+def read_poynting(data: object, keys: Sequence[tuple[float, float]], manifest_sha256: str
+                  ) -> tuple[dict[tuple[int, int], float], list[str]]:
+    """The exit ``flux_z_w`` of every (Ephi, key index) in step 8b's record (``hpc/diagnose_poynting.py``'s
+    ``poynting.json``), and what is wrong with the record, each problem named: made on another job than the one whose
+    manifest hashes to ``manifest_sha256``; a record unreadable, off ``keys`` or repeated; a polarization absent; the
+    declared keys a polarization lacks. ``keys`` are the declared (phi, theta) keys in degrees."""
+    if not isinstance(data, Mapping):
+        return {}, [f"the step-8b record must be a JSON object, got {type(data).__name__}"]
+    problems: list[str] = []
+    if data.get("manifest_sha256") != manifest_sha256:
+        problems.append(f"the step-8b record was made on a job whose manifest_sha256 is "
+                        f"{data.get('manifest_sha256')!r}, not this source's {manifest_sha256}")
+    records = data.get("keys")
+    if not isinstance(records, list):
+        return {}, problems + [f"the step-8b record's keys must be a list, got {type(records).__name__}"]
+    seen: dict[tuple[int, int], float] = {}
+    for i, record in enumerate(records):
+        at = f"the step-8b record keys[{i}]"
+        try:
+            ephi = _integer(_get(record, "ephi", where=at), f"{at}.ephi")
+            phi, theta = _phi_theta(record, at)
+            f8b = _number(_get(record, "exit", "flux_z_w", where=at), f"{at} ({_where(ephi, (phi, theta))}) "
+                          "exit.flux_z_w")
+        except _Refused as exc:
+            problems.append(str(exc))
+            continue
+        k = dataset_v2.key_position(keys, phi, theta)
+        if ephi not in (0, 1) or k is None:
+            problems.append(f"{at}: Ephi={ephi} at {key_text((phi, theta))} is not a declared record")
+        elif (ephi, k) in seen:
+            problems.append(f"{at}: a second record of {_where(ephi, keys[k])}")
+        else:
+            seen[(ephi, k)] = f8b
+    for ephi in (0, 1):
+        missing = [k for k in range(len(keys)) if (ephi, k) not in seen]
+        if missing and len(missing) == len(keys):
+            problems.append(f"the step-8b record has no Ephi={ephi} records: polarization Ephi={ephi} is missing")
+        elif missing:
+            problems.append(f"the step-8b record lacks {len(missing)} Ephi={ephi} record(s), the first "
+                            f"{_where(ephi, keys[missing[0]])}")
+    return seen, problems
+
+
+def poynting_problems(source_job: Path, poynting: Path) -> list[str]:
+    """Before a re-export (``--preflight``): what keeps ``poynting`` from serving as the --poynting record of
+    ``source_job``; empty when it can. The keys are the source manifest's excitation lists, the parser is the
+    ``powers.poynting`` row's (``read_poynting``). Nothing is written."""
+    source_job, poynting = Path(source_job), Path(poynting)
+    manifest_path = source_job / "manifest.json"
+    if not source_job.is_dir():
+        return [f"the source job directory {source_job} does not exist"]
+    if not manifest_path.is_file():
+        return [f"no manifest.json in the source job {source_job}"]
+    if not poynting.is_file():
+        return [f"the --poynting file {poynting} does not exist"]
+    try:
+        phis, thetas = _Acceptance._declared_axes(_read_json(manifest_path, "the source manifest"),
+                                                  "the source manifest")
+        data = _read_json(poynting, "the --poynting record")
+    except _Refused as exc:
+        return [str(exc)]
+    _, problems = read_poynting(data, [(p, t) for p in phis for t in thetas], sha256_file(manifest_path))
+    return problems
+
+
 # --- entry points ----------------------------------------------------------------------------------------------------
 
 def check(source_job: Path, fresh_job: Path, poynting: Path | None = None, eps: float = EPS) -> ReexportResult:
@@ -1243,14 +1288,32 @@ def check(source_job: Path, fresh_job: Path, poynting: Path | None = None, eps: 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m bbsim.reexport_check", description=__doc__.splitlines()[0])
     parser.add_argument("--source", type=Path, required=True, help="the schema-1 source job directory")
-    parser.add_argument("--fresh", type=Path, required=True,
-                        help="the schema-2 job run_frequency --from-solved made from it")
+    parser.add_argument("--fresh", type=Path, default=None,
+                        help="the schema-2 job run_frequency --from-solved made from it (required unless --preflight)")
     parser.add_argument("--poynting", type=Path, default=None,
                         help="step 8b's diagnose_poynting/poynting.json of the source job")
+    parser.add_argument("--preflight", action="store_true",
+                        help="before the re-export: check only that --poynting exists, was made on --source and "
+                             "covers every key and both polarizations of it; exit 0, or 2 with the problems listed")
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:             # argparse has printed its message
         return 2 if exc.code else 0
+    if args.preflight:
+        if args.poynting is None or args.fresh is not None:
+            print("reexport_check: --preflight takes --source and --poynting, and no --fresh", file=sys.stderr)
+            return 2
+        problems = poynting_problems(args.source, args.poynting)
+        for problem in problems:
+            print(f"preflight: {problem}")
+        if problems:
+            print(f"PREFLIGHT: FAIL {len(problems)}")
+            return 2
+        print(f"PREFLIGHT: PASS {args.poynting} was made on {args.source} and covers every key and both polarizations")
+        return 0
+    if args.fresh is None:
+        print("reexport_check: --fresh is required unless --preflight is given", file=sys.stderr)
+        return 2
     try:
         result = check(args.source, args.fresh, args.poynting)
     except FileNotFoundError as exc:
