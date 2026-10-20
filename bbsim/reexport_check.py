@@ -25,9 +25,11 @@ declaration that a manifest or a CSV header contradicts fails before any value i
    lie within eps of max |W source|. Independently of W, sum_i w_i |E_t,i|^2 h_y h_z / (2 eta0) from the fresh Ex and
    Ey (quadrature weights from the declared grid) must equal OutgoingPower to 1e-6 on every non-dark record.
 4. Far field, not rescaled: within eps of the source; a zero source key exactly zero.
-5. Rim (HF-029, discs only): the source's zero-filled points come back exactly zero and the zero-fill counts match.
+5. Rim (HF-029, discs only): the source's zero-filled points come back exactly zero and the zero-fill counts match;
+   a zero-source dark record, all of whose rows are zero, is left to step 3.
 6. Powers: the fresh manifest's raw powers complete and finite; the dark flag recomputed (|flux| <= 1e-12 A I);
-   stored OutgoingPower zero on every row of a dark record and the raw flux otherwise; t_flux = OutgoingPower / (A I);
+   stored OutgoingPower zero on every row where the preserved raw flux is a numerical zero or dark<p> is true, and the
+   raw flux otherwise (OR-038); t_flux = OutgoingPower / (A I);
    IngoingPower = A I; InterceptFactor constant within each key and equal to c_key, itself recomputed from the
    declared grid, to 1e-12 (OR-034); the fresh |Re S| equal to the source's OutgoingPower to 1e-4; with
    ``--poynting`` (hpc/diagnose_poynting.py's poynting.json), the raw flux equal to step 8b's ``flux_z_w`` to 1e-4,
@@ -180,9 +182,11 @@ def _rim_key(record: object, where: str) -> tuple[float, float]:
 
 
 def _match_records(records: object, keys: Sequence[tuple[float, float]], where: str,
-                   key_of: Callable[[object, str], tuple[float, float]] = _phi_theta) -> tuple[dict[int, Any], list[str]]:
+                   key_of: Callable[[object, str], tuple[float, float]] = _phi_theta,
+                   polarized: bool = False) -> tuple[dict[int, Any], list[str]]:
     """The records of a per-key list by declared key index, and what is wrong with the list: not a list, a record
-    off the declared grid or unreadable, two records at one key, declared keys without a record."""
+    off the declared grid or unreadable, two records at one key, declared keys without a record. ``polarized``: each
+    record holds both polarizations, so a repeated key repeats Ephi=0 and Ephi=1 alike."""
     if not isinstance(records, list):
         return {}, [f"{where} must be a list of per-key records, got {type(records).__name__}"]
     found: dict[int, Any] = {}
@@ -197,7 +201,8 @@ def _match_records(records: object, keys: Sequence[tuple[float, float]], where: 
         if k is None:
             problems.append(f"{where} has a record at {_key_text((phi, theta))}, outside the declared grid")
         elif k in found:
-            problems.append(f"{where} has two records at {_key_text(keys[k])}")
+            repeated = ": Ephi=0 and Ephi=1 each appear twice" if polarized else ""
+            problems.append(f"{where} has two records at {_key_text(keys[k])}{repeated}")
         else:
             found[k] = record
     missing = [keys[k] for k in range(len(keys)) if k not in found]
@@ -890,30 +895,39 @@ class _Acceptance:
         if self.shape != "disc":
             return Check("rim.zero_fill", True, "info", f"a {self.shape}: the rim rule (HF-029) applies to discs only")
         source_counts, fresh_counts = self._rim_counts(self.source), self._rim_counts(self.fresh)
+        scale = self._scale_records()
         problems: list[str] = []
         totals = {"0": 0, "1": 0}
+        exempt = []
         for ephi in (0, 1):
             src, fresh = self.source.waveguide[ephi], self.fresh.waveguide[ephi]
             for k, key in enumerate(self.keys):
                 where = _where(ephi, key)
                 r = self.rows[ephi][k]
+                if fresh_counts[(ephi, k)] != source_counts[(ephi, k)]:
+                    problems.append(f"{where}: the fresh job zero-filled {fresh_counts[(ephi, k)]} points, the "
+                                    f"source {source_counts[(ephi, k)]}")
                 zero = np.all(src[r, FIELDS] == 0.0, axis=1)
+                if zero.all() and scale[k][1][ephi]:
+                    # A zero-source dark record: every row is zero, so the all-zero rows cannot tell the zero-filled
+                    # points apart; exit_field.dark holds the whole fresh record to exactly zero.
+                    exempt.append([ephi, *key])
+                    continue
                 n = int(zero.sum())
                 totals[str(ephi)] += n
                 if n != source_counts[(ephi, k)]:
                     problems.append(f"{where}: the source holds {n} all-zero exit points, its manifest records "
                                     f"{source_counts[(ephi, k)]} zero-filled points")
-                if fresh_counts[(ephi, k)] != source_counts[(ephi, k)]:
-                    problems.append(f"{where}: the fresh job zero-filled {fresh_counts[(ephi, k)]} points, the "
-                                    f"source {source_counts[(ephi, k)]}")
                 back = fresh[r[zero], FIELDS]
                 if np.any(back != 0.0):
                     problems.append(f"{where}: {int(np.any(back != 0.0, axis=1).sum())} of the source's {n} "
                                     f"zero-filled points come back nonzero (largest |value| "
                                     f"{float(np.max(np.abs(back)))!r})")
+        exempted = f"; {len(exempt)} zero-source dark records exempt from the all-zero count" if exempt else ""
         return _row("rim.zero_fill", "the source's zero-filled points come back exactly zero and the zero-fill counts "
                     "match per key and polarization (HF-029)", problems,
-                    f"{totals['0']} (Ephi=0) and {totals['1']} (Ephi=1) zero-filled points", {"zero_filled": totals})
+                    f"{totals['0']} (Ephi=0) and {totals['1']} (Ephi=1) zero-filled points{exempted}",
+                    {"zero_filled": totals, "zero_source_records_exempt": exempt})
 
     # -- 6. powers ---------------------------------------------------------------------------------------------------
     def _ai(self) -> float:
@@ -928,16 +942,22 @@ class _Acceptance:
             where = "the fresh manifest's exit_field.raw_powers_per_key"
             found, problems = _match_records(
                 _get(self.fresh.manifest, "exit_field", "raw_powers_per_key", where="the fresh manifest"),
-                self.keys, where)
+                self.keys, where, polarized=True)
             out = {}
             for k, record in sorted(found.items()):
                 polarizations = record.get("polarizations")
-                if not isinstance(polarizations, Mapping) or set(polarizations) != {"0", "1"}:
-                    problems.append(f"{where} at {_key_text(self.keys[k])}: polarizations must hold exactly '0' and "
-                                    "'1'")
+                if not isinstance(polarizations, Mapping):
+                    problems.append(f"{where} at {_key_text(self.keys[k])}: polarizations must be an object with "
+                                    "'0' and '1'")
                     continue
+                extra = sorted(set(polarizations) - {"0", "1"})
+                if extra:
+                    problems.append(f"{where} at {_key_text(self.keys[k])}: unexpected polarizations {extra}")
                 for ephi in (0, 1):
                     at = f"the raw powers of {_where(ephi, self.keys[k])}"
+                    if str(ephi) not in polarizations:
+                        problems.append(f"{at} are missing")
+                        continue
                     try:
                         flux = _number(_get(polarizations[str(ephi)], "exit_flux_re_s_dot_n_w", where=at),
                                        f"{at}: exit_flux_re_s_dot_n_w")
@@ -1005,16 +1025,24 @@ class _Acceptance:
         for (ephi, k), (flux, _) in sorted(raw.items()):
             where = _where(ephi, self.keys[k])
             stored = self.fresh.waveguide[ephi][self.rows[ephi][k], OUTGOING]
-            if self._is_dark(flux) or scale[k][1][ephi]:
-                if np.any(stored != 0.0):
-                    problems.append(f"{where}: a dark record stores OutgoingPower 0 on every row; "
-                                    f"{int(np.sum(stored != 0.0))} rows hold up to {float(np.max(np.abs(stored)))!r} W")
+            nonzero = stored != 0.0
+            # The raw flux preserved in the manifest decides, never the stored value: a numerical zero stores 0, any
+            # other flux is stored as it is. A declared dark flag requires 0 on its own (OR-038).
+            if self._is_dark(flux):
+                if nonzero.any():
+                    problems.append(f"{where}: the raw flux {flux!r} W is a numerical zero, so OutgoingPower is 0 on "
+                                    f"every row; {int(nonzero.sum())} rows hold up to "
+                                    f"{float(np.max(np.abs(stored)))!r} W")
             else:
                 dev = float(np.max(np.abs(stored - flux)))
                 if not dev <= STORED_REL * abs(flux):
                     problems.append(f"{where}: OutgoingPower differs from the raw flux {flux!r} W by up to {dev:.3g} W")
-        return _row("powers.outgoing", "stored OutgoingPower 0 on every row of a dark record (OR-038) and the raw flux "
-                    f"to {STORED_REL:g} on every row otherwise", problems, f"{len(raw)} records{self._unchecked(raw)}")
+            if scale[k][1][ephi] and nonzero.any():
+                problems.append(f"{where}: dark{ephi} is true, so OutgoingPower is 0 on every row; "
+                                f"{int(nonzero.sum())} rows hold up to {float(np.max(np.abs(stored)))!r} W")
+        return _row("powers.outgoing", "stored OutgoingPower 0 on every row where the raw flux is a numerical zero or "
+                    f"dark<p> is true (OR-038), the raw flux to {STORED_REL:g} on every row otherwise", problems,
+                    f"{len(raw)} records{self._unchecked(raw)}")
 
     def _t_flux(self) -> Check:
         raw, _ = self._raw_powers()
