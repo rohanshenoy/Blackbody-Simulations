@@ -1,0 +1,58 @@
+# The 35-key incidence grid of OR-036 (Rohan, 2026-10-19) for crack1 at 500 GHz, HPC step 10: theta 90 to 180 deg
+# in 15 deg steps and phi 0 to 90 deg in 22.5 deg steps, both in the crack-local frame, so every key is reachable.
+# Derived from crack1_500GHz_reference_tight.toml (MaxDeltaE 0.005, up to 20 passes): only those six [excitation]
+# lines and schema = 2 in [output] differ (tests/test_config.py pins that). This is the crack1 500 GHz reference
+# job, so it measures its own column-order reference (HF-041) and needs no --column-order-reference.
+
+[project]
+path = "/home/rshenoy/BBRSim/projects/ParallelPlateGaps.aedt"
+design = "parallel_plate_gap_50um"
+dataset_id = "InfParallelPlate_crack1Rohan"
+aedt_version = "2025.2"
+
+[geometry]
+object = "gap"
+entrance_face = { axis = "z", side = "min" }   # legacy face ID 8, plane wave origin (0.025, 0, 0) mm
+exit_face = { axis = "z", side = "max" }       # legacy face ID 7
+exit_cs_x = [0.0, 0.0, 1.0]
+exit_cs_y = [0.0, 1.0, 0.0]
+expected_box_size_mm = [0.05, 10.0, 1.0]
+expected_face_area_mm2 = 0.5
+symmetry = ["mirror_l", "mirror_g", "end_to_end"]
+
+[excitation]
+ei_v_per_m = 1.0
+theta_lower_deg = 90.0
+theta_upper_deg = 180.0
+theta_step_deg = 15.0
+phi_lower_deg = 0.0
+phi_upper_deg = 90.0
+phi_step_deg = 22.5
+
+[solver]
+frequency_ghz = 500
+max_delta_e = 0.005
+max_passes = 20
+cores = 4
+sweep = "discrete"
+
+[far_field]
+theta_lower_deg = 0.0
+theta_upper_deg = 180.0
+phi_lower_deg = -90.0
+phi_upper_deg = 90.0
+a_mm = 10.0
+b_mm = 0.05
+fineness = 10.0
+min_coarseness_deg = 0.1
+max_coarseness_deg = 5.0
+
+[exit_field]
+manual = true
+resolution_mm = [0.0, 0.1, 0.001]
+
+[output]
+root = "/home/rshenoy/BBRSim/outputs"
+polarizations = [0, 1]
+export_timeout_s = 300.0
+schema = 2
