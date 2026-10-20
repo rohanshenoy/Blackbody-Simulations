@@ -9,7 +9,10 @@ Run on the login node after `source /home/rshenoy/BBRSim/bb_env.sh` (pandas, a f
 Prints, for both polarizations:
   1. convergence: passes completed and the last rows of each convergence table, and the solve time;
   2. transmission T = OutgoingPower / IngoingPower per incidence key, candidate against reference, with
-     the relative difference;
+     the relative difference. A schema-2 candidate (16 columns, read with its dataset sidecar beside the Ephi
+     directories) divides by its InterceptFactor as well, T = OutgoingPower / (IngoingPower x InterceptFactor), after
+     the dark-record check; the reference stays schema 1. Sections 3 and 4 then compare a 2.0 table with a 1.0 one
+     as stored: for a like-for-like comparison use bbsim.compare;
   3. self-consistency at normal incidence (theta = 180 deg), where physics fixes the answer for this
      doubly mirror-symmetric gap: (0, 180) Ephi=0 and (90, 180) Ephi=1 are the same incident field (E along
      the gap), (45, 180) must be half of it for each polarization, and (0, 180) Ephi=1 and (90, 180) Ephi=0
@@ -21,6 +24,7 @@ Prints, for both polarizations:
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -28,14 +32,30 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from bbsim import compare  # noqa: E402
+from bbsim.schema import INTERCEPT_FACTOR  # noqa: E402
+
 KEYS = ["IWavePhi", "IWaveTheta"]
 WG = ["Ex", "Ey", "Ez"]
 FF = ["rEtheta", "rEphi"]
 
 
-def transmission(df: pd.DataFrame) -> pd.Series:
+def transmission(df: pd.DataFrame, sidecar: dict | None = None) -> pd.Series:
+    """T per incidence key from the key's first row. A 2.0 table (it has InterceptFactor) needs its sidecar: the
+    dark records are validated first (OR-038: t_flux and every OutgoingPower of a dark key exactly 0, else
+    ValueError, nothing repaired) and T = OutgoingPower / (IngoingPower x InterceptFactor). 1.0 is unchanged."""
     first = df.drop_duplicates(KEYS).set_index(KEYS)
-    return first["OutgoingPower"] / first["IngoingPower"]
+    if INTERCEPT_FACTOR not in df.columns:
+        return first["OutgoingPower"] / first["IngoingPower"]
+    if sidecar is None:
+        raise ValueError("a 2.0 (16-column) table is read only with its dataset sidecar: pass sidecar=")
+    where = "the 2.0 waveguide table"
+    table = compare._v2_table(df, sidecar, None, None, where)
+    problems = compare._dark_contradictions(df, table.records, table.index, table.ephi, where)
+    if problems:
+        raise ValueError("; ".join(problems))
+    return first["OutgoingPower"] / (first["IngoingPower"] * first[INTERCEPT_FACTOR])
 
 
 def magnitude(df: pd.DataFrame, prefixes: list[str]) -> np.ndarray:
@@ -94,7 +114,14 @@ def main(argv: list[str] | None = None) -> int:
             d = root / f"{stem}_Ephi={e}"
             data[(side, e, "wg")] = pd.read_csv(d / "waveguide.csv")
             data[(side, e, "ff")] = pd.read_csv(d / "far_field.csv")
-    t = {(side, e): transmission(data[(side, e, "wg")]) for side in ("cand", "ref") for e in (0, 1)}
+    sidecar = None
+    if any(INTERCEPT_FACTOR in data[("cand", e, "wg")].columns for e in (0, 1)):   # a schema-2 candidate
+        path = compare.sidecar_path(job / f"{stem}_Ephi=0")
+        if path is None:
+            raise ValueError(f"the 2.0 candidate {job / stem} has no dataset sidecar ({stem}.dataset.json) beside it")
+        sidecar = json.loads(path.read_text())
+    t = {(side, e): transmission(data[(side, e, "wg")], sidecar if side == "cand" else None)
+         for side in ("cand", "ref") for e in (0, 1)}
 
     print("== 2. transmission per key (rel = candidate / reference - 1)")
     print(f"  {'phi':>5} {'theta':>6} | {'ref E0':>10} {'cand E0':>10} {'rel E0':>8} | {'ref E1':>10} {'cand E1':>10} {'rel E1':>8}")
