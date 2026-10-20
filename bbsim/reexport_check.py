@@ -59,6 +59,7 @@ import pandas as pd
 from bbsim import dataset_v2, schema
 from bbsim.compare import Check
 from bbsim.convergence import qualify
+from bbsim.dataset_v2 import key_text
 from bbsim.extract import ExitGrid
 from bbsim.manifest import REPO_ROOT, sha256_file, write_json
 from bbsim.naming import dataset_dir_name
@@ -98,22 +99,16 @@ class _Refused(ValueError):
 
 # --- small helpers ---------------------------------------------------------------------------------------------------
 
-def _key_text(key: tuple[float, float]) -> str:
-    return f"(phi, theta) = ({key[0]:g}, {key[1]:g}) deg"
-
-
 def _where(ephi: int, key: tuple[float, float]) -> str:
-    return f"Ephi={ephi} at {_key_text(key)}"
+    return f"Ephi={ephi} at {key_text(key)}"
 
 
 def _number(value: object, where: str) -> float:
-    """A finite real number; anything else (bool, string, null, NaN, infinity) is refused."""
-    if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
-        raise _Refused(f"{where} must be a number, got {value!r}")
-    number = float(value)
-    if not math.isfinite(number):
-        raise _Refused(f"{where} is not finite: {value!r}")
-    return number
+    """``dataset_v2.finite_number``, refused as this module refuses (bool, string, null, NaN, infinity)."""
+    try:
+        return dataset_v2.finite_number(value, where)
+    except dataset_v2.DatasetV2Error as exc:
+        raise _Refused(str(exc)) from exc
 
 
 def _integer(value: object, where: str) -> int:
@@ -123,14 +118,13 @@ def _integer(value: object, where: str) -> int:
 
 
 def _get(mapping: object, *path: str, where: str, default: object = _MISSING) -> Any:
-    node = mapping
-    for name in path:
-        if not isinstance(node, Mapping) or name not in node:
-            if default is _MISSING:
-                raise _Refused(f"{where} lacks {'.'.join(path)}")
-            return default
-        node = node[name]
-    return node
+    """``dataset_v2.require``; a missing step returns ``default`` when one is given, else is refused."""
+    try:
+        return dataset_v2.require(mapping, *path, where=where)
+    except dataset_v2.DatasetV2Error as exc:
+        if default is _MISSING:
+            raise _Refused(str(exc)) from exc
+        return default
 
 
 def _read_json(path: Path, what: str) -> dict:
@@ -159,13 +153,6 @@ def _same_value(a: object, b: object, rel: float = 1e-12) -> bool:
     if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
         return len(a) == len(b) and all(_same_value(x, y, rel) for x, y in zip(a, b))
     return a == b
-
-
-def _key_index(keys: Sequence[tuple[float, float]], phi: float, theta: float) -> int | None:
-    for k, (p, t) in enumerate(keys):
-        if abs(p - phi) <= KEY_DEG and abs(t - theta) <= KEY_DEG:
-            return k
-    return None
 
 
 def _phi_theta(record: object, where: str) -> tuple[float, float]:
@@ -197,17 +184,17 @@ def _match_records(records: object, keys: Sequence[tuple[float, float]], where: 
         except _Refused as exc:
             problems.append(str(exc))
             continue
-        k = _key_index(keys, phi, theta)
+        k = dataset_v2.key_position(keys, phi, theta)
         if k is None:
-            problems.append(f"{where} has a record at {_key_text((phi, theta))}, outside the declared grid")
+            problems.append(f"{where} has a record at {key_text((phi, theta))}, outside the declared grid")
         elif k in found:
             repeated = ": Ephi=0 and Ephi=1 each appear twice" if polarized else ""
-            problems.append(f"{where} has two records at {_key_text(keys[k])}{repeated}")
+            problems.append(f"{where} has two records at {key_text(keys[k])}{repeated}")
         else:
             found[k] = record
     missing = [keys[k] for k in range(len(keys)) if k not in found]
     if missing:
-        problems.append(f"{where} lacks {len(missing)} declared keys, the first at {_key_text(missing[0])}")
+        problems.append(f"{where} lacks {len(missing)} declared keys, the first at {key_text(missing[0])}")
     return found, problems
 
 
@@ -216,14 +203,6 @@ def _strict(records: object, keys: Sequence[tuple[float, float]], where: str, **
     if problems:
         raise _Refused("; ".join(problems))
     return found
-
-
-def _row_keys(phis: np.ndarray, thetas: np.ndarray, keys: Sequence[tuple[float, float]]) -> np.ndarray:
-    """The declared key index of every table row, -1 for a row at no declared key."""
-    index = np.full(len(phis), -1, dtype=int)
-    for k, (phi, theta) in enumerate(keys):
-        index[(np.abs(phis - phi) <= KEY_DEG) & (np.abs(thetas - theta) <= KEY_DEG)] = k
-    return index
 
 
 def _row(name: str, rule: str, failures: list[str], summary: str, values: dict | None = None) -> Check:
@@ -235,33 +214,6 @@ def _row(name: str, rule: str, failures: list[str], summary: str, values: dict |
     else:
         detail = f"{rule}: {summary}"
     return Check(name, not failures, "fail", detail, {**(values or {}), "failures": failures})
-
-
-def _exit_grid(record: object, where: str) -> tuple[ExitGrid, tuple[float, float]]:
-    """The declared exit lattice as an ``ExitGrid`` (mm) for ``dataset_v2.node_weights``, and its steps in metres.
-
-    Each axis's declared step must span min to max in count - 1 steps, to ``dataset_v2.NODE_TOL`` of the step."""
-    lo, hi, steps_m, counts = [0.0], [0.0], [], []
-    for axis in ("y_e", "z_e"):
-        rec = _get(record, axis, where=where)
-        lo_m = _number(_get(rec, "min", where=f"{where}.{axis}"), f"{where}.{axis}.min")
-        hi_m = _number(_get(rec, "max", where=f"{where}.{axis}"), f"{where}.{axis}.max")
-        step_m = _number(_get(rec, "step", where=f"{where}.{axis}"), f"{where}.{axis}.step")
-        count = _integer(_get(rec, "count", where=f"{where}.{axis}"), f"{where}.{axis}.count")
-        if step_m <= 0.0 or count < 1:
-            raise _Refused(f"{where}.{axis}: step {step_m!r} m and count {count} must be positive")
-        if count > 1 and abs((hi_m - lo_m) / (count - 1) - step_m) > dataset_v2.NODE_TOL * step_m:
-            raise _Refused(f"{where}.{axis}: the declared step {step_m!r} m does not span {lo_m!r} to {hi_m!r} m in "
-                           f"{count - 1} steps")
-        lo.append(lo_m * 1e3)
-        hi.append(hi_m * 1e3)
-        steps_m.append(step_m)
-        counts.append(count)
-    steps_mm = (0.0, steps_m[0] * 1e3, steps_m[1] * 1e3)
-    grid = ExitGrid(lo_mm=tuple(lo), hi_mm=tuple(hi), resolution_mm=steps_mm, step_mm=steps_mm)
-    if tuple(grid.counts[1:]) != tuple(counts):
-        raise _Refused(f"{where}: the declared counts {counts} are not the lattice's {list(grid.counts[1:])}")
-    return grid, (steps_m[0], steps_m[1])
 
 
 # --- the result ------------------------------------------------------------------------------------------------------
@@ -523,7 +475,11 @@ class _Acceptance:
                     grid_f, axis, "count", where="the fresh exit_field.grid"):
                 problems.append(f"exit_field.grid.{axis}.count: source {grid_s[axis]['count']!r}, "
                                 f"fresh {grid_f[axis]['count']!r}")
-        self.grid, self.h_m = _exit_grid(grid_f, "the fresh sidecar's exit_field.grid")
+        try:
+            self.grid = dataset_v2.declared_grid(grid_f, "the fresh sidecar's exit_field.grid")
+        except dataset_v2.DatasetV2Error as exc:
+            raise _Refused(str(exc)) from exc
+        self.h_m = (float(grid_f["y_e"]["step"]), float(grid_f["z_e"]["step"]))   # validated by declared_grid
 
         cs_s = _get(s, "exit_field", "cross_section", where="the source sidecar")
         cs_f = _get(f, "exit_field", "cross_section", where="the fresh sidecar")
@@ -574,7 +530,7 @@ class _Acceptance:
                         i, j = (int(v) for v in np.argwhere(bad)[0])
                         problems.append(f"{where} holds {int(bad.sum())} non-finite values, the first in "
                                         f"{frame.columns[j + 1]} on row {i}, at "
-                                        f"{_key_text((numeric[i, 1], numeric[i, 2]))}")
+                                        f"{key_text((numeric[i, 1], numeric[i, 2]))}")
                         continue
                     store[ephi] = np.column_stack([np.full(len(frame), np.nan), numeric])
                     job.freq_labels[(name, ephi)] = set(frame.iloc[:, 0].astype(str))
@@ -605,22 +561,23 @@ class _Acceptance:
                     problems.append(f"{where}: the source has {len(src)} rows, the fresh {len(fresh)}")
                     aligned = False
                     continue
-                index_s = _row_keys(src[:, _WG["IWavePhi"]], src[:, _WG["IWaveTheta"]], keys)
-                index_f = _row_keys(fresh[:, _WG["IWavePhi"]], fresh[:, _WG["IWaveTheta"]], keys)
+                index_s = dataset_v2.key_index(src[:, _WG["IWavePhi"]], src[:, _WG["IWaveTheta"]], keys)
+                index_f = dataset_v2.key_index(fresh[:, _WG["IWavePhi"]], fresh[:, _WG["IWaveTheta"]], keys)
                 if (index_f < 0).any() or (index_s < 0).any():
-                    problems.append(f"{where}: rows at keys outside the declared grid")
+                    problems.append(f"{where}: rows at keys outside the declared grid, or within the key tolerance of "
+                                    "two declared keys")
                     aligned = False
                     continue
                 if not np.array_equal(index_s, index_f):
                     i = int(np.flatnonzero(index_s != index_f)[0])
-                    problems.append(f"{where}: the keys differ from row {i} on (source {_key_text(keys[index_s[i]])}, "
-                                    f"fresh {_key_text(keys[index_f[i]])})")
+                    problems.append(f"{where}: the keys differ from row {i} on (source {key_text(keys[index_s[i]])}, "
+                                    f"fresh {key_text(keys[index_f[i]])})")
                     aligned = False
                     continue
                 rows = [np.flatnonzero(index_f == k) for k in range(len(keys))]
                 empty = [keys[k] for k, r in enumerate(rows) if r.size == 0]
                 if empty:
-                    problems.append(f"{where}: no rows at the declared {_key_text(empty[0])}")
+                    problems.append(f"{where}: no rows at the declared {key_text(empty[0])}")
                     aligned = False
                     continue
                 if kind == "waveguide":
@@ -683,8 +640,7 @@ class _Acceptance:
 
     @staticmethod
     def _case_values(table: np.ndarray, phi: float, theta: float) -> np.ndarray:
-        mask = (np.abs(table[:, _WG["IWavePhi"]] - phi) <= KEY_DEG) & (np.abs(table[:, _WG["IWaveTheta"]] - theta)
-                                                                        <= KEY_DEG)
+        mask = dataset_v2.key_index(table[:, _WG["IWavePhi"]], table[:, _WG["IWaveTheta"]], [(phi, theta)]) == 0
         return table[mask, FIELDS]
 
     def _order_raw_tables(self) -> Check:
@@ -752,7 +708,7 @@ class _Acceptance:
                             self.keys, where)
             out = {}
             for k, record in found.items():
-                at = f"{where} at {_key_text(self.keys[k])}"
+                at = f"{where} at {key_text(self.keys[k])}"
                 w = {e: _number(record.get(f"w{e}"), f"{at}: w{e}") for e in (0, 1)}
                 dark = {}
                 for e in (0, 1):
@@ -885,9 +841,9 @@ class _Acceptance:
             found = _strict(per_key.get(str(ephi)) if isinstance(per_key, Mapping) else None, self.keys, where,
                             key_of=_rim_key)
             for k, record in found.items():
-                n = _integer(record.get("unsolved_inside_zeroed"), f"{where} at {_key_text(self.keys[k])}")
+                n = _integer(record.get("unsolved_inside_zeroed"), f"{where} at {key_text(self.keys[k])}")
                 if n < 0:
-                    raise _Refused(f"{where} at {_key_text(self.keys[k])}: a negative zero-fill count {n}")
+                    raise _Refused(f"{where} at {key_text(self.keys[k])}: a negative zero-fill count {n}")
                 out[(ephi, k)] = n
         return out
 
@@ -947,12 +903,12 @@ class _Acceptance:
             for k, record in sorted(found.items()):
                 polarizations = record.get("polarizations")
                 if not isinstance(polarizations, Mapping):
-                    problems.append(f"{where} at {_key_text(self.keys[k])}: polarizations must be an object with "
+                    problems.append(f"{where} at {key_text(self.keys[k])}: polarizations must be an object with "
                                     "'0' and '1'")
                     continue
                 extra = sorted(set(polarizations) - {"0", "1"})
                 if extra:
-                    problems.append(f"{where} at {_key_text(self.keys[k])}: unexpected polarizations {extra}")
+                    problems.append(f"{where} at {key_text(self.keys[k])}: unexpected polarizations {extra}")
                 for ephi in (0, 1):
                     at = f"the raw powers of {_where(ephi, self.keys[k])}"
                     if str(ephi) not in polarizations:
@@ -980,7 +936,7 @@ class _Acceptance:
                             self.keys, where)
             out = {}
             for k, record in found.items():
-                at = f"{where} at {_key_text(self.keys[k])}"
+                at = f"{where} at {key_text(self.keys[k])}"
                 polarizations = record.get("polarizations")
                 if not isinstance(polarizations, Mapping) or set(polarizations) != {"0", "1"}:
                     raise _Refused(f"{at}: polarizations must hold exactly '0' and '1'")
@@ -1097,15 +1053,15 @@ class _Acceptance:
         per_key = self._transmittance()
         problems = []
         for k, key in enumerate(self.keys):
-            c = _number(found[k].get("c_k"), f"{where} at {_key_text(key)}: c_k")
+            c = _number(found[k].get("c_k"), f"{where} at {key_text(key)}: c_k")
             recomputed = dataset_v2.c_key(key[0], key[1], self.theta_list)
             rel = _relative(c, recomputed)
-            self._note("intercept_factor", rel, _key_text(key), INTERCEPT_REL)
+            self._note("intercept_factor", rel, key_text(key), INTERCEPT_REL)
             if not rel <= INTERCEPT_REL:
-                problems.append(f"at {_key_text(key)}: the sidecar's c_key {c!r} against {recomputed!r} recomputed "
+                problems.append(f"at {key_text(key)}: the sidecar's c_key {c!r} against {recomputed!r} recomputed "
                                 "from the declared grid")
             if not _relative(per_key[k]["c_k"], c) <= INTERCEPT_REL:
-                problems.append(f"at {_key_text(key)}: transmittance.per_key c_k {per_key[k]['c_k']!r} against "
+                problems.append(f"at {key_text(key)}: transmittance.per_key c_k {per_key[k]['c_k']!r} against "
                                 f"c_key {c!r}")
             for ephi in (0, 1):
                 first = float(self.fresh.waveguide[ephi][self.rows[ephi][k][0], INTERCEPT])
@@ -1166,9 +1122,9 @@ class _Acceptance:
             except _Refused as exc:
                 problems.append(str(exc))
                 continue
-            k = _key_index(self.keys, phi, theta)
+            k = dataset_v2.key_position(self.keys, phi, theta)
             if ephi not in (0, 1) or k is None:
-                problems.append(f"{at}: Ephi={ephi} at {_key_text((phi, theta))} is not a declared record")
+                problems.append(f"{at}: Ephi={ephi} at {key_text((phi, theta))} is not a declared record")
             elif (ephi, k) in seen:
                 problems.append(f"{at}: a second record of {_where(ephi, self.keys[k])}")
             else:

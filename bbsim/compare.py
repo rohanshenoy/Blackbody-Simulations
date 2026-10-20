@@ -25,7 +25,6 @@ table are read by position, never by label (HF-038).
 from __future__ import annotations
 
 import json
-import math
 import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
@@ -36,6 +35,7 @@ import numpy as np
 import pandas as pd
 
 from bbsim import dataset_v2
+from bbsim.dataset_v2 import DatasetV2Error, key_text
 from bbsim.extract import ExitGrid
 from bbsim.schema import (EXIT_FIELD_SLOTS, FAR_FIELD_COLUMNS, INTERCEPT_FACTOR, KEY_COLUMNS, WAVEGUIDE_COLUMNS,
                           WAVEGUIDE_COLUMNS_V2)
@@ -45,7 +45,6 @@ _COLUMNS_BY_SCHEMA = {SCHEMA_1: list(WAVEGUIDE_COLUMNS), SCHEMA_2: list(WAVEGUID
 SIDECAR_SUFFIX = ".dataset.json"
 _EPHI_DIR = re.compile(r"^(?P<stem>.+)_Ephi=(?P<ephi>[0-9]+)$")
 _OUTGOING = WAVEGUIDE_COLUMNS_V2.index("OutgoingPower")      # the same position in 1.0
-KEY_TOL_DEG = dataset_v2.KEY_TOL_DEG                          # sidecar per-key records against table keys
 MAX_LISTED = 5
 
 
@@ -134,6 +133,13 @@ def _header(directory: Path) -> list[str]:
         raise ComparisonInputError(f"{path} is unreadable: {exc}") from exc
 
 
+def _read_table(path: Path) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path)
+    except (OSError, ValueError) as exc:
+        raise ComparisonInputError(f"{path} is unreadable: {exc}") from exc
+
+
 def _read_sidecar(path: Path) -> dict:
     try:
         data = json.loads(Path(path).read_text())
@@ -204,10 +210,6 @@ def _listing(name: str, problems: list[str], ok_detail: str, values: dict | None
 
 # --- CDX-030: every numeric value finite, before anything is compared -------------------------------------------------
 
-def _key_text(key: tuple[float, float]) -> str:
-    return f"(phi, theta) = ({key[0]:g}, {key[1]:g}) deg"
-
-
 def _shown(value: object) -> str:
     if isinstance(value, str):
         return repr(value)
@@ -219,7 +221,7 @@ def _shown(value: object) -> str:
 
 def _key_at(df: pd.DataFrame, i: int) -> str:
     try:
-        return f", at {_key_text((float(df[KEY_COLUMNS[0]].iloc[i]), float(df[KEY_COLUMNS[1]].iloc[i])))}"
+        return f", at {key_text((float(df[KEY_COLUMNS[0]].iloc[i]), float(df[KEY_COLUMNS[1]].iloc[i])))}"
     except (KeyError, IndexError, TypeError, ValueError):
         return ""
 
@@ -247,29 +249,21 @@ def _check_finite(name: str, tables: list[tuple[str, pd.DataFrame]]) -> Check:
 # --- Schema 2: the sidecar's per-key records and the dark rule (OR-034, OR-038) ---------------------------------------
 
 def _get(mapping: object, *path: str, where: str) -> Any:
-    node = mapping
-    for name in path:
-        if not isinstance(node, Mapping) or name not in node:
-            raise ComparisonInputError(f"{where} lacks {'.'.join(path)}")
-        node = node[name]
-    return node
+    try:
+        return dataset_v2.require(mapping, *path, where=where)
+    except DatasetV2Error as exc:
+        raise ComparisonInputError(str(exc)) from exc
 
 
 def _number(value: object, where: str, positive: bool = False, nonnegative: bool = False) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ComparisonInputError(f"{where} must be a number, got {value!r}")
-    number = float(value)
-    if not math.isfinite(number) or (positive and number <= 0.0) or (nonnegative and number < 0.0):
-        kind = "positive " if positive else "non-negative " if nonnegative else ""
-        raise ComparisonInputError(f"{where} must be a finite {kind}number, got {value!r}")
+    """``dataset_v2.finite_number``, refused as this module refuses, with an optional sign condition."""
+    try:
+        number = dataset_v2.finite_number(value, where)
+    except DatasetV2Error as exc:
+        raise ComparisonInputError(str(exc)) from exc
+    if (positive and number <= 0.0) or (nonnegative and number < 0.0):
+        raise ComparisonInputError(f"{where} must be {'positive' if positive else 'non-negative'}, got {value!r}")
     return number
-
-
-def _find_key(keys: list[tuple[float, float]], key: tuple[float, float]) -> int | None:
-    for k, (phi, theta) in enumerate(keys):
-        if abs(phi - key[0]) <= KEY_TOL_DEG and abs(theta - key[1]) <= KEY_TOL_DEG:
-            return k
-    return None
 
 
 @dataclass(frozen=True)
@@ -300,8 +294,8 @@ def _v2_records(sidecar: Mapping, where: str) -> _V2Records:
         at = f"{where} transmittance.per_key[{i}]"
         key = (_number(_get(rec, "phi_deg", where=at), f"{at}.phi_deg"),
                _number(_get(rec, "theta_deg", where=at), f"{at}.theta_deg"))
-        if _find_key(keys, key) is not None:
-            raise ComparisonInputError(f"{at}: a second record at {_key_text(key)}")
+        if dataset_v2.key_position(keys, *key) is not None:
+            raise ComparisonInputError(f"{at}: a second record at {key_text(key)}")
         keys.append(key)
         c_k.append(_number(_get(rec, "c_k", where=at), f"{at}.c_k", positive=True))
         pols = _get(rec, "polarizations", where=at)
@@ -318,11 +312,11 @@ def _v2_records(sidecar: Mapping, where: str) -> _V2Records:
         at = f"{where} exit_field.scale.per_key[{i}]"
         key = (_number(_get(rec, "phi_deg", where=at), f"{at}.phi_deg"),
                _number(_get(rec, "theta_deg", where=at), f"{at}.theta_deg"))
-        k = _find_key(keys, key)
+        k = dataset_v2.key_position(keys, *key)
         if k is None:
-            raise ComparisonInputError(f"{at}: {_key_text(key)} has no transmittance.per_key record")
+            raise ComparisonInputError(f"{at}: {key_text(key)} has no transmittance.per_key record")
         if w[0][k] is not None:
-            raise ComparisonInputError(f"{at}: a second record at {_key_text(key)}")
+            raise ComparisonInputError(f"{at}: a second record at {key_text(key)}")
         for e in (0, 1):
             w[e][k] = _number(_get(rec, f"w{e}", where=at), f"{at}.w{e}", positive=True)
             flag = _get(rec, f"dark{e}", where=at)
@@ -331,29 +325,18 @@ def _v2_records(sidecar: Mapping, where: str) -> _V2Records:
             dark[e][k] = flag
     missing = [keys[k] for k in range(len(keys)) if w[0][k] is None]
     if missing:
-        raise ComparisonInputError(f"{where}: exit_field.scale.per_key lacks {_key_text(missing[0])} "
+        raise ComparisonInputError(f"{where}: exit_field.scale.per_key lacks {key_text(missing[0])} "
                                    f"({len(missing)} key(s) missing)")
     return _V2Records(keys, c_k, t_flux, abs_re_s, {e: [float(v) for v in w[e]] for e in (0, 1)},
                       {e: [bool(v) for v in dark[e]] for e in (0, 1)})
 
 
 def _row_index(df: pd.DataFrame, records: _V2Records, where: str) -> np.ndarray:
-    """The declared key of every row: every row at a declared key, every declared key with rows."""
-    phis = df[KEY_COLUMNS[0]].to_numpy(dtype=float)
-    thetas = df[KEY_COLUMNS[1]].to_numpy(dtype=float)
-    index = np.full(len(df), -1, dtype=int)
-    for k, (phi, theta) in enumerate(records.keys):
-        mask = (np.abs(phis - phi) <= KEY_TOL_DEG) & (np.abs(thetas - theta) <= KEY_TOL_DEG)
-        if not mask.any():
-            raise ComparisonInputError(f"{where}: the sidecar declares {_key_text((phi, theta))} but the table has no "
-                                       "rows there")
-        index[mask] = k
-    unmatched = np.flatnonzero(index < 0)
-    if unmatched.size:
-        i = int(unmatched[0])
-        raise ComparisonInputError(f"{where}: {unmatched.size} row(s) at keys the sidecar does not declare, the first "
-                                   f"at data row {i}{_key_at(df, i)}")
-    return index
+    """``dataset_v2.row_keys`` against the sidecar's keys: every row at one declared key, every key with rows."""
+    try:
+        return dataset_v2.row_keys(df, records.keys, where)
+    except DatasetV2Error as exc:
+        raise ComparisonInputError(str(exc)) from exc
 
 
 def _ephi_of(df: pd.DataFrame, directory: Path | None, where: str) -> int:
@@ -379,7 +362,7 @@ def _dark_contradictions(df: pd.DataFrame, records: _V2Records, index: np.ndarra
     for k, key in enumerate(records.keys):
         if not records.dark[ephi][k]:
             continue
-        at = f"{where} Ephi={ephi} at {_key_text(key)}"
+        at = f"{where} Ephi={ephi} at {key_text(key)}"
         t = records.t_flux[ephi][k]
         if t != 0.0:
             problems.append(f"{at}: dark{ephi} is true but the sidecar's t_flux is {t!r}, not exactly 0")
@@ -393,9 +376,10 @@ def _dark_contradictions(df: pd.DataFrame, records: _V2Records, index: np.ndarra
     return problems
 
 
-def _v2_lattice(sidecar: Mapping, where: str) -> tuple[str, ExitGrid | None]:
-    """The exit cross-section's shape and, for a rectangle, the declared lattice as an ``ExitGrid`` (mm) for
-    ``dataset_v2.node_weights``; each axis's step must span min to max in count - 1 steps (HF-040)."""
+def _v2_lattice(sidecar: Mapping, where: str) -> tuple[str, ExitGrid]:
+    """The exit cross-section's shape and the declared lattice (``dataset_v2.declared_grid``, the parser the re-export
+    acceptance uses, so both refuse the same grids). ``exit_field.quadrature`` must be the shape's; a rectangle's
+    weights come from each point's node on the lattice, a disc's are 1 (HF-040)."""
     shape = _get(sidecar, "exit_field", "cross_section", "shape", where=where)
     if shape not in dataset_v2.QUADRATURE_BY_SHAPE:
         raise ComparisonInputError(f"{where}: exit_field.cross_section.shape {shape!r} is not one of "
@@ -404,29 +388,10 @@ def _v2_lattice(sidecar: Mapping, where: str) -> tuple[str, ExitGrid | None]:
     if quadrature != dataset_v2.QUADRATURE_BY_SHAPE[shape]:
         raise ComparisonInputError(f"{where}: exit_field.quadrature {quadrature!r} is not the {shape}'s "
                                    f"{dataset_v2.QUADRATURE_BY_SHAPE[shape]!r}")
-    if shape == "disc":
-        return shape, None
-    lo, hi, steps, counts = [0.0], [0.0], [0.0], []
-    for axis in ("y_e", "z_e"):
-        at = f"{where} exit_field.grid.{axis}"
-        rec = _get(sidecar, "exit_field", "grid", axis, where=where)
-        lo_m = _number(_get(rec, "min", where=at), f"{at}.min")
-        hi_m = _number(_get(rec, "max", where=at), f"{at}.max")
-        step_m = _number(_get(rec, "step", where=at), f"{at}.step", positive=True)
-        count = _get(rec, "count", where=at)
-        if isinstance(count, bool) or not isinstance(count, int) or count < 2:
-            raise ComparisonInputError(f"{at}.count must be an integer of at least 2, got {count!r}")
-        if abs((hi_m - lo_m) / (count - 1) - step_m) > dataset_v2.NODE_TOL * step_m:
-            raise ComparisonInputError(f"{at}: the step {step_m!r} m does not span {lo_m!r} to {hi_m!r} m in "
-                                       f"{count - 1} steps")
-        lo.append(lo_m * 1e3)
-        hi.append(hi_m * 1e3)
-        steps.append(step_m * 1e3)
-        counts.append(count)
-    grid = ExitGrid(lo_mm=tuple(lo), hi_mm=tuple(hi), resolution_mm=tuple(steps), step_mm=tuple(steps))
-    if list(grid.counts[1:]) != counts:
-        raise ComparisonInputError(f"{where}: the declared counts {counts} are not the lattice's "
-                                   f"{list(grid.counts[1:])}")
+    try:
+        grid = dataset_v2.declared_grid(_get(sidecar, "exit_field", "grid", where=where), f"{where} exit_field.grid")
+    except DatasetV2Error as exc:
+        raise ComparisonInputError(str(exc)) from exc
     return shape, grid
 
 
@@ -440,13 +405,28 @@ class _V2Table:
     ephi: int
 
 
-def _v2_table(df: pd.DataFrame, sidecar: dict | None, path: Path | None, directory: Path | None,
-              where: str) -> _V2Table:
+def _v2_table(df: pd.DataFrame, sidecar: dict | None, path: Path | None, directory: Path | None, where: str,
+              intercept_rel: float = Tolerances.intercept_rel) -> _V2Table:
+    """One 2.0 table read with its sidecar: the per-key records, every row's key, the polarization, and every row's
+    InterceptFactor equal to its key's ``transmittance.per_key`` c_k to ``intercept_rel`` (OR-034); a zero or
+    mismatched InterceptFactor is refused here, before any T is formed."""
     if sidecar is None:
         raise ComparisonInputError(f"{where}: no dataset sidecar beside {directory}; a 2.0 table is read only with "
                                    "its sidecar (dark flags, W, |Re S|, the declared grid)")
     records = _v2_records(sidecar, f"the sidecar {path}" if path else "the sidecar")
-    return _V2Table(sidecar, records, _row_index(df, records, where), _ephi_of(df, directory, where))
+    index = _row_index(df, records, where)
+    ephi = _ephi_of(df, directory, where)
+    c = np.asarray(records.c_k, dtype=float)[index]
+    f = df[INTERCEPT_FACTOR].to_numpy(dtype=float)
+    rel = np.abs(f - c) / c
+    bad = np.flatnonzero(~(f > 0.0) | ~(rel <= intercept_rel))
+    if bad.size:
+        i = int(bad[0])
+        raise ComparisonInputError(
+            f"{where} Ephi={ephi} at {key_text(records.keys[index[i]])}: InterceptFactor {float(f[i])!r} on data row "
+            f"{i} against the sidecar's c_k {float(c[i])!r} (relative difference {float(rel[i]):.3g}, limit "
+            f"{intercept_rel:g}; {bad.size} row(s))")
+    return _V2Table(sidecar, records, index, ephi)
 
 
 def legacy_view(waveguide: pd.DataFrame, sidecar: dict, ephi: int) -> pd.DataFrame:
@@ -567,7 +547,7 @@ def _check_intercept_factor(cand: pd.DataFrame, ref: pd.DataFrame, tol: Toleranc
         for key in sorted(_keys(df)):
             v = values[((df[KEY_COLUMNS[0]] == key[0]) & (df[KEY_COLUMNS[1]] == key[1])).to_numpy()]
             if np.any(v != v[0]):
-                failures.append(f"{label} {_key_text(key)}: InterceptFactor varies within the key "
+                failures.append(f"{label} {key_text(key)}: InterceptFactor varies within the key "
                                 f"({float(v.min())!r} to {float(v.max())!r})")
             first[label][key] = float(v[0])
     worst = 0.0
@@ -576,7 +556,7 @@ def _check_intercept_factor(cand: pd.DataFrame, ref: pd.DataFrame, tol: Toleranc
         rel = abs(c - r) / abs(r)
         worst = max(worst, rel)
         if not rel <= tol.intercept_rel:
-            failures.append(f"{_key_text(key)}: candidate {c!r} against reference {r!r} (relative {rel:.3g})")
+            failures.append(f"{key_text(key)}: candidate {c!r} against reference {r!r} (relative {rel:.3g})")
     compared = len(set(first["candidate"]) & set(first["reference"]))
     return _listing("waveguide.intercept_factor", failures,
                     f"{compared} keys equal (max relative diff {worst:.2e}), each constant within its key",
@@ -680,7 +660,8 @@ def _compare_waveguide(tables: dict[str, pd.DataFrame], resolved: dict[str, tupl
     for label in v2_sides:
         _, sidecar, path = resolved[label]
         try:
-            v2[label] = _v2_table(tables[label], sidecar, path, dirs[label], f"{label} waveguide.csv")
+            v2[label] = _v2_table(tables[label], sidecar, path, dirs[label], f"{label} waveguide.csv",
+                                  tol.intercept_rel)
         except ComparisonInputError as exc:
             problems.append(f"{label}: {exc}")
     checks.append(_listing("dataset.sidecar", problems,
@@ -708,10 +689,12 @@ def compare_datasets(candidate_dir: Path, reference_dir: Path, tol: Tolerances =
     candidate_dir, reference_dir = Path(candidate_dir), Path(reference_dir)
     dirs = {"candidate": candidate_dir, "reference": reference_dir}
 
-    waveguides = {label: pd.read_csv(d / "waveguide.csv") for label, d in dirs.items()}
-    resolved, problems = {}, []
+    # Every file is read and every schema resolved before anything is compared: a missing or unreadable file fails a
+    # check, it does not raise.
+    waveguides, resolved, problems = {}, {}, []
     for label, d in dirs.items():
         try:
+            waveguides[label] = _read_table(d / "waveguide.csv")
             resolved[label] = _resolve(d)
         except ComparisonInputError as exc:
             problems.append(f"{label}: {exc}")
@@ -719,12 +702,23 @@ def compare_datasets(candidate_dir: Path, reference_dir: Path, tol: Tolerances =
     mixed = not problems and versions["candidate"] != versions["reference"]
     checks = [_schema_check("dataset.schema", problems, versions, mixed)]
     if problems:
-        expected = _COLUMNS_BY_SCHEMA[next(iter(versions.values()), SCHEMA_1)]
-        checks.append(_check_columns("waveguide", waveguides["candidate"], waveguides["reference"], expected))
+        if len(waveguides) == 2:                                    # readable tables with an unknown column list
+            expected = _COLUMNS_BY_SCHEMA[next(iter(versions.values()), SCHEMA_1)]
+            checks.append(_check_columns("waveguide", waveguides["candidate"], waveguides["reference"], expected))
     else:
         checks += _compare_waveguide(waveguides, resolved, dirs, tol)
 
-    cf, rf = pd.read_csv(candidate_dir / "far_field.csv"), pd.read_csv(reference_dir / "far_field.csv")
+    far, unreadable = {}, []
+    for label, d in dirs.items():
+        try:
+            far[label] = _read_table(d / "far_field.csv")
+        except ComparisonInputError as exc:
+            unreadable.append(f"{label}: {exc}")
+    if unreadable:
+        checks.append(Check("far_field.columns", False, "fail", "; ".join(unreadable)))
+        return ComparisonResult(str(candidate_dir), str(reference_dir), checks, asdict(tol), mixed_schema=mixed,
+                                schemas=versions)
+    cf, rf = far["candidate"], far["reference"]
     cols = _check_columns("far_field", cf, rf, FAR_FIELD_COLUMNS)
     checks.append(cols)
     if cols.passed:
@@ -816,7 +810,7 @@ def _pair_stats_v2(tables, v2: list[_V2Table], lattice: tuple[str, ExitGrid | No
              / (float(df["IngoingPower"].iloc[0]) * float(df[INTERCEPT_FACTOR].iloc[0])) for df in (a, b)]
         dark = []
         for table in v2:
-            k = _find_key(table.records.keys, key)
+            k = dataset_v2.key_position(table.records.keys, *key)
             dark.append(bool(k is not None and table.records.dark[table.ephi][k]))
         masked = any(dark)
         try:
@@ -922,13 +916,16 @@ def compare_polarization_pair(candidate: tuple[Path, Path], reference: tuple[Pat
     resolved: dict[str, list[tuple]] = {}
     versions: dict[str, str] = {}
     problems: list[str] = []
+    tables: dict[str, list[tuple[pd.DataFrame, pd.DataFrame]]] = {}
     for label, dirs in sides.items():
-        found = []
+        found, read = [], []
         for i, d in enumerate(dirs):
             try:
+                read.append((_read_table(d / "waveguide.csv"), _read_table(d / "far_field.csv")))
                 found.append(_resolve(d))
             except ComparisonInputError as exc:
                 problems.append(f"{label} directory {i + 1}: {exc}")
+        tables[label] = read
         if len(found) == 2 and found[0][0] != found[1][0]:
             problems.append(f"{label}: directory 1 is schema {found[0][0]} and directory 2 schema {found[1][0]}; the "
                             "two polarizations of one dataset share one schema")
@@ -942,8 +939,6 @@ def compare_polarization_pair(candidate: tuple[Path, Path], reference: tuple[Pat
 
     if problems:
         return result()
-    tables = {label: [(pd.read_csv(d / "waveguide.csv"), pd.read_csv(d / "far_field.csv")) for d in dirs]
-              for label, dirs in sides.items()}
     finite = _check_finite("pair.finite", [(f"{label} directory {i + 1} {name}", df)
                                            for label, pair in tables.items() for i, (wg, ff) in enumerate(pair)
                                            for name, df in (("waveguide.csv", wg), ("far_field.csv", ff))])
@@ -962,7 +957,7 @@ def compare_polarization_pair(candidate: tuple[Path, Path], reference: tuple[Pat
             if sidecar0 is not None and sidecar0 != sidecar1:
                 raise ComparisonInputError(f"the two directories' sidecars differ ({path0}, {path1}): not one dataset")
             v2[label] = [_v2_table(tables[label][i][0], sidecar0, path0, sides[label][i],
-                                   f"{label} directory {i + 1} waveguide.csv") for i in (0, 1)]
+                                   f"{label} directory {i + 1} waveguide.csv", tol.intercept_rel) for i in (0, 1)]
             lattice[label] = _v2_lattice(sidecar0, f"the sidecar {path0}")
         except ComparisonInputError as exc:
             problems.append(f"{label}: {exc}")

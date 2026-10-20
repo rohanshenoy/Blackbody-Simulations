@@ -1,5 +1,7 @@
 """Arithmetic of the 2.0 dataset: the per-key divisor, quadrature weights, the field scale, rho and the
-far-field hemisphere power; ``build`` assembles them into the 2.0 tables and sidecar blocks.
+far-field hemisphere power; ``build`` assembles them into the 2.0 tables and sidecar blocks. It also holds the readers
+the 2.0 producer and consumers share (``key_text``, ``key_index``, ``row_keys``, ``declared_grid``, ...), so the runner,
+``bbsim.compare`` and ``bbsim.reexport_check`` read a key, a row's key and a declared lattice the same way.
 
 Everything here is pure: arrays and numbers in, numbers out, no AEDT. The runner supplies one ``Extracted`` per
 polarization (the raw 1.0-labelled tables and the per-key exit flux and |Re S|), the exit lattice and the declared
@@ -662,8 +664,126 @@ class DatasetV2Result:
     rho_per_key: list[dict[str, Any]] = dataclasses.field(default_factory=list)
 
 
-def _key_text(key: tuple[float, float]) -> str:
+# --- Readers shared by the 2.0 producer and consumers (bbsim.compare, bbsim.reexport_check) -------------------------
+#
+# One implementation of each, so that a declared key, a row's key and a declared exit lattice are read the same way by
+# the runner, the comparison and the re-export acceptance (HF-040, HF-052).
+
+KEY_UNMATCHED = -1     # key_index: a row at no declared key
+KEY_AMBIGUOUS = -2     # key_index: a row within KEY_TOL_DEG of two declared keys
+
+
+def key_text(key: tuple[float, float]) -> str:
+    """``(phi, theta) = (45, 135) deg``: how every diagnostic names an incidence key."""
     return f"(phi, theta) = ({key[0]:g}, {key[1]:g}) deg"
+
+
+def finite_number(value: object, where: str) -> float:
+    """A finite real number (int, float or their numpy types); a bool, a string, None, NaN or an infinity is refused."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.integer, np.floating)):
+        raise DatasetV2Error(f"{where} must be a number, got {value!r}")
+    number = float(value)
+    if not math.isfinite(number):
+        raise DatasetV2Error(f"{where} is not finite: {value!r}")
+    return number
+
+
+def require(mapping: object, *path: str, where: str) -> Any:
+    """The value at ``path`` in nested mappings; a missing step is refused, naming the whole path."""
+    node = mapping
+    for name in path:
+        if not isinstance(node, Mapping) or name not in node:
+            raise DatasetV2Error(f"{where} lacks {'.'.join(path)}")
+        node = node[name]
+    return node
+
+
+def key_position(keys: Sequence[tuple[float, float]], phi: float, theta: float) -> int | None:
+    """The index of the declared key within KEY_TOL_DEG of (phi, theta) on both angles, or None."""
+    for k, (p, t) in enumerate(keys):
+        if abs(p - phi) <= KEY_TOL_DEG and abs(t - theta) <= KEY_TOL_DEG:
+            return k
+    return None
+
+
+def key_index(phis: np.ndarray, thetas: np.ndarray, keys: Sequence[tuple[float, float]]) -> np.ndarray:
+    """The declared key index of every row (within KEY_TOL_DEG on both angles): KEY_UNMATCHED for a row at no
+    declared key, KEY_AMBIGUOUS for a row within the tolerance of two declared keys."""
+    phis = np.asarray(phis, dtype=float)
+    thetas = np.asarray(thetas, dtype=float)
+    index = np.full(phis.shape, KEY_UNMATCHED, dtype=int)
+    for k, (phi, theta) in enumerate(keys):
+        mask = (np.abs(phis - phi) <= KEY_TOL_DEG) & (np.abs(thetas - theta) <= KEY_TOL_DEG)
+        taken = index != KEY_UNMATCHED
+        index[mask & taken] = KEY_AMBIGUOUS
+        index[mask & ~taken] = k
+    return index
+
+
+def row_keys(table: pd.DataFrame, keys: Sequence[tuple[float, float]], where: str) -> np.ndarray:
+    """``key_index`` of a table's rows, refused unless every row lies at exactly one declared key and every declared
+    key has rows."""
+    try:
+        phis = table["IWavePhi"].to_numpy(dtype=float)
+        thetas = table["IWaveTheta"].to_numpy(dtype=float)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DatasetV2Error(f"{where}: unreadable IWavePhi / IWaveTheta: {exc}") from exc
+    if not (np.all(np.isfinite(phis)) and np.all(np.isfinite(thetas))):
+        raise DatasetV2Error(f"{where}: non-finite IWavePhi / IWaveTheta values")
+    index = key_index(phis, thetas, keys)
+    ambiguous = np.flatnonzero(index == KEY_AMBIGUOUS)
+    if ambiguous.size:
+        i = int(ambiguous[0])
+        raise DatasetV2Error(f"{where}: rows at {key_text((float(phis[i]), float(thetas[i])))} match two declared keys")
+    for k, key in enumerate(keys):
+        if not np.any(index == k):
+            raise DatasetV2Error(f"{where} has no rows at the declared key {key_text(key)}")
+    unmatched = np.flatnonzero(index == KEY_UNMATCHED)
+    if unmatched.size:
+        first = (float(phis[unmatched[0]]), float(thetas[unmatched[0]]))
+        raise DatasetV2Error(f"{where} has {unmatched.size} rows at keys outside the declared grid, the first at "
+                             f"{key_text(first)}")
+    return index
+
+
+def declared_grid(record: object, where: str = "exit_field.grid") -> ExitGrid:
+    """The exit lattice a sidecar declares (``exit_field.grid``: ``y_e`` and ``z_e``, each ``min``, ``max``, ``count``
+    and ``step`` in metres) as an ``ExitGrid`` in mm, for ``node_weights``. The one parser of a declared grid.
+
+    Refused: a missing axis or field; a min, max or step that is not a finite number; a step that is not positive; a
+    count that is not an integer of at least 2 (with one node the first and last node coincide, so the wall weight
+    and the step are undefined, as the producer refuses); a step that does not span min to max in count - 1 steps, to
+    ``NODE_TOL`` of the step; counts that the lattice would not reproduce.
+    """
+    from .extract import ExitGrid                       # local: this module stays free of the extraction imports
+
+    lo, hi, steps_mm, counts = [0.0], [0.0], [0.0], []
+    for axis in ("y_e", "z_e"):
+        at = f"{where}.{axis}"
+        rec = require(record, axis, where=where)
+        lo_m = finite_number(require(rec, "min", where=at), f"{at}.min")
+        hi_m = finite_number(require(rec, "max", where=at), f"{at}.max")
+        step_m = finite_number(require(rec, "step", where=at), f"{at}.step")
+        count = require(rec, "count", where=at)
+        if isinstance(count, (bool, np.bool_)) or not isinstance(count, (int, np.integer)):
+            raise DatasetV2Error(f"{at}.count must be an integer, got {count!r}")
+        if step_m <= 0.0:
+            raise DatasetV2Error(f"{at}.step must be positive, got {step_m!r}")
+        if count < 2:
+            raise DatasetV2Error(f"{at}.count is {int(count)}: an exit lattice needs at least 2 nodes per axis "
+                                 "(with fewer the first and last node coincide, so the wall weight and the step are "
+                                 "undefined)")
+        if abs((hi_m - lo_m) / (count - 1) - step_m) > NODE_TOL * step_m:
+            raise DatasetV2Error(f"{at}: the step {step_m!r} m does not span {lo_m!r} to {hi_m!r} m in "
+                                 f"{int(count) - 1} steps")
+        lo.append(lo_m * 1e3)
+        hi.append(hi_m * 1e3)
+        steps_mm.append(step_m * 1e3)
+        counts.append(int(count))
+    grid = ExitGrid(lo_mm=tuple(lo), hi_mm=tuple(hi), resolution_mm=tuple(steps_mm), step_mm=tuple(steps_mm))
+    if list(grid.counts[1:]) != counts:
+        raise DatasetV2Error(f"{where}: the declared counts {counts} are not the lattice's {list(grid.counts[1:])}")
+    return grid
 
 
 def _positive_finite(name: str, value: object) -> float:
@@ -711,31 +831,6 @@ def _checked_order_check(order_check: object) -> dict[str, Any]:
     return dict(order_check)
 
 
-def _row_keys(table: pd.DataFrame, keys: list[tuple[float, float]], where: str) -> np.ndarray:
-    """Index of the declared key of every row; every declared key needs rows, and every row a declared key."""
-    try:
-        phis = table["IWavePhi"].to_numpy(dtype=float)
-        thetas = table["IWaveTheta"].to_numpy(dtype=float)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise DatasetV2Error(f"{where}: unreadable IWavePhi / IWaveTheta: {exc}") from exc
-    if not (np.all(np.isfinite(phis)) and np.all(np.isfinite(thetas))):
-        raise DatasetV2Error(f"{where}: non-finite IWavePhi / IWaveTheta values")
-    index = np.full(len(table), -1, dtype=int)
-    for k, (phi, theta) in enumerate(keys):
-        mask = (np.abs(phis - phi) <= KEY_TOL_DEG) & (np.abs(thetas - theta) <= KEY_TOL_DEG)
-        if not mask.any():
-            raise DatasetV2Error(f"{where} has no rows at the declared key {_key_text((phi, theta))}")
-        if np.any(index[mask] >= 0):
-            raise DatasetV2Error(f"{where}: rows at {_key_text((phi, theta))} match two declared keys")
-        index[mask] = k
-    unmatched = np.flatnonzero(index < 0)
-    if unmatched.size:
-        first = (float(phis[unmatched[0]]), float(thetas[unmatched[0]]))
-        raise DatasetV2Error(f"{where} has {unmatched.size} rows at keys outside the declared grid, the first at "
-                             f"{_key_text(first)}")
-    return index
-
-
 def _key_powers(powers: object, keys: list[tuple[float, float]], where: str) -> list[float]:
     """The per-key powers of one polarization, in declared-key order: exactly one finite value per declared key."""
     if not isinstance(powers, Mapping):
@@ -746,23 +841,21 @@ def _key_powers(powers: object, keys: list[tuple[float, float]], where: str) -> 
             phi, theta = (float(x) for x in raw_key)
         except (TypeError, ValueError) as exc:
             raise DatasetV2Error(f"{where}: key {raw_key!r} is not a (phi, theta) pair") from exc
-        matches = [k for k, (p, t) in enumerate(keys)
-                   if abs(p - phi) <= KEY_TOL_DEG and abs(t - theta) <= KEY_TOL_DEG]
-        if not matches:
-            raise DatasetV2Error(f"{where} has a value at {_key_text((phi, theta))}, outside the declared grid")
-        k = matches[0]
+        k = key_position(keys, phi, theta)
+        if k is None:
+            raise DatasetV2Error(f"{where} has a value at {key_text((phi, theta))}, outside the declared grid")
         if out[k] is not None:
-            raise DatasetV2Error(f"{where} has two values at {_key_text(keys[k])}")
+            raise DatasetV2Error(f"{where} has two values at {key_text(keys[k])}")
         try:
             number = float(value)
         except (TypeError, ValueError):
             number = math.nan
         if isinstance(value, bool) or not math.isfinite(number):
-            raise DatasetV2Error(f"{where} at {_key_text(keys[k])} is not a finite number: {value!r}")
+            raise DatasetV2Error(f"{where} at {key_text(keys[k])} is not a finite number: {value!r}")
         out[k] = number
     missing = [keys[k] for k, v in enumerate(out) if v is None]
     if missing:
-        raise DatasetV2Error(f"{where} lacks the declared key {_key_text(missing[0])} "
+        raise DatasetV2Error(f"{where} lacks the declared key {key_text(missing[0])} "
                              f"({len(missing)} declared keys missing)")
     return [float(v) for v in out]                              # type: ignore[arg-type]
 
@@ -849,20 +942,20 @@ def build(extracted: Mapping[int, Extracted], grid: ExitGrid, cross_section: Map
                                  f"{list(ex.far_field.columns)}")
         _check_polarization_column(ex.waveguide, e, wg_where)
         _check_polarization_column(ex.far_field, e, ff_where)
-        row_key[e] = _row_keys(ex.waveguide, keys, wg_where)
-        ff_key[e] = _row_keys(ex.far_field, keys, ff_where)
+        row_key[e] = row_keys(ex.waveguide, keys, wg_where)
+        ff_key[e] = row_keys(ex.far_field, keys, ff_where)
         flux[e] = _key_powers(ex.flux_w, keys, f"the exit flux of Ephi={e}")
         absolute[e] = _key_powers(ex.abs_w, keys, f"the |Re S| integral of Ephi={e}")
         for k, a in enumerate(absolute[e]):
             if a < 0.0:
-                raise DatasetV2Error(f"the |Re S| integral of Ephi={e} at {_key_text(keys[k])} is negative: {a!r}")
+                raise DatasetV2Error(f"the |Re S| integral of Ephi={e} at {key_text(keys[k])} is negative: {a!r}")
         try:
             values_all[e] = ex.waveguide.iloc[:, schema.EXIT_FIELD_SLOTS].to_numpy(dtype=float)
         except (TypeError, ValueError) as exc:
             raise DatasetV2Error(f"{wg_where} has non-numeric exit-field values: {exc}") from exc
         bad = ~np.all(np.isfinite(values_all[e]), axis=1)
         if bad.any():
-            raise DatasetV2Error(f"{wg_where} at {_key_text(keys[row_key[e][np.flatnonzero(bad)[0]]])} has "
+            raise DatasetV2Error(f"{wg_where} at {key_text(keys[row_key[e][np.flatnonzero(bad)[0]]])} has "
                                  f"{int(bad.sum())} rows with non-finite exit-field values")
         if shape == "rectangle":                                # a rectangle's weights follow each point's node
             try:
@@ -877,7 +970,7 @@ def build(extracted: Mapping[int, Extracted], grid: ExitGrid, cross_section: Map
                 raise DatasetV2Error(f"{ff_where} has non-numeric values in {column}: {exc}") from exc
             if not finite.all():
                 raise DatasetV2Error(f"{ff_where} has non-finite values in {column}, the first at "
-                                     f"{_key_text(keys[ff_key[e][np.flatnonzero(~finite)[0]]])}")
+                                     f"{key_text(keys[ff_key[e][np.flatnonzero(~finite)[0]]])}")
 
     # Per key and polarization: W, dark, the sanity ratio, ff_over_flux; then rho on the pair.
     n_keys = len(keys)
@@ -890,7 +983,7 @@ def build(extracted: Mapping[int, Extracted], grid: ExitGrid, cross_section: Map
     for k, key in enumerate(keys):
         rows = {e: np.flatnonzero(row_key[e] == k) for e in (0, 1)}
         if rows[0].size != rows[1].size:
-            raise DatasetV2Error(f"at {_key_text(key)} Ephi=0 has {rows[0].size} exit points and Ephi=1 has "
+            raise DatasetV2Error(f"at {key_text(key)} Ephi=0 has {rows[0].size} exit points and Ephi=1 has "
                                  f"{rows[1].size}: BBRsim pairs the polarizations' rows by index")
         weights = {}
         if shape == "rectangle":
@@ -900,19 +993,19 @@ def build(extracted: Mapping[int, Extracted], grid: ExitGrid, cross_section: Map
                 try:
                     nodes[e] = _lattice_nodes(position_y[e][rows[e]], position_z[e][rows[e]], grid)
                 except DatasetV2Error as exc:
-                    raise DatasetV2Error(f"Ephi={e} at {_key_text(key)}: {exc}") from exc
+                    raise DatasetV2Error(f"Ephi={e} at {key_text(key)}: {exc}") from exc
             if not (np.array_equal(nodes[0][0], nodes[1][0]) and np.array_equal(nodes[0][1], nodes[1][1])):
-                raise DatasetV2Error(f"at {_key_text(key)} Ephi=0 and Ephi=1 hold their exit points at different "
+                raise DatasetV2Error(f"at {key_text(key)} Ephi=0 and Ephi=1 hold their exit points at different "
                                      "lattice nodes, row by row: BBRsim pairs the polarizations' rows by index")
             weights = {e: _node_weights(*nodes[e]) for e in (0, 1)}
         else:
             try:
                 weights = {e: quadrature_weights(shape, ny, nz, int(rows[e].size)) for e in (0, 1)}
             except DatasetV2Error as exc:
-                raise DatasetV2Error(f"at {_key_text(key)}: {exc}") from exc
+                raise DatasetV2Error(f"at {key_text(key)}: {exc}") from exc
         scaled = {}
         for e in (0, 1):
-            where = f"Ephi={e} at {_key_text(key)}"
+            where = f"Ephi={e} at {key_text(key)}"
             values = values_all[e][rows[e]]
             try:
                 w, is_dark = scale_factor(values, weights[e], h_y, h_z, flux[e][k], incoming)
@@ -928,7 +1021,7 @@ def build(extracted: Mapping[int, Extracted], grid: ExitGrid, cross_section: Map
         try:
             rho_values[k] = rho(scaled[0], scaled[1], weights[0], dark[0][k], dark[1][k])
         except DatasetV2Error as exc:
-            raise DatasetV2Error(f"at {_key_text(key)}: {exc}") from exc
+            raise DatasetV2Error(f"at {key_text(key)}: {exc}") from exc
 
     # Sanity bound (CDX-009) on reachable keys of non-weak flux; dark records are stored as 0 and never inside.
     lo_bound, hi_bound = SANITY_BOUNDS
@@ -940,7 +1033,7 @@ def build(extracted: Mapping[int, Extracted], grid: ExitGrid, cross_section: Map
                 continue
             r = ratio[e][k]
             if r is None or not lo_bound <= r <= hi_bound:
-                failures.append(f"Ephi={e} at {_key_text((phi, theta))}: flux / |Re S| = {r!r}")
+                failures.append(f"Ephi={e} at {key_text((phi, theta))}: flux / |Re S| = {r!r}")
     if failures:
         raise DatasetV2Error(f"exit flux over |Re S| outside [{lo_bound}, {hi_bound}] on reachable keys: "
                              + "; ".join(failures))
