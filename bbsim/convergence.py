@@ -9,8 +9,8 @@ AEDT 2025 R2 writes, per design variation, a header such as (HPC, job_tight1, cr
     Current   : 0.0036596
     Converged : Yes
 
-followed by the pass table. Only an explicit ``Converged : Yes`` with the achieved delta at or below the
-configured target qualifies; a missing or unreadable table never does.
+followed by the pass table. Only an explicit ``Converged : Yes`` with a finite, non-negative achieved delta at or
+below the configured target qualifies; a missing or unreadable table never does.
 """
 from __future__ import annotations
 
@@ -27,6 +27,15 @@ def _number(text: str | None) -> float | None:
     except (TypeError, ValueError):
         return None
     return value if math.isfinite(value) else None
+
+
+def _non_finite(text: str | None) -> str | None:
+    """The shown value (``nan``, ``inf``, ``-inf``) when ``text`` reads as a number that is not finite, else None."""
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isfinite(value) else str(value)
 
 
 def parse_convergence(text: str) -> dict:
@@ -46,17 +55,26 @@ def parse_convergence(text: str) -> dict:
 def qualify(text: str, target: float) -> dict:
     """The parsed table plus ``qualified`` and the ``reasons`` it does not qualify against ``target``."""
     parsed = parse_convergence(text)
+    fields = dict(_FIELD.findall(text or ""))
     reasons = []
     if parsed["converged"] is None:
         reasons.append("no 'Converged' line (table missing or unreadable)")
     elif parsed["converged"].lower() != "yes":
         reasons.append(f"AEDT reports Converged : {parsed['converged']}")
     if parsed["achieved"] is None:
-        reasons.append("no achieved delta")
+        shown = _non_finite(fields.get("Current"))
+        reasons.append("no achieved delta" if shown is None else f"achieved delta {shown} is not a finite number")
+    elif parsed["achieved"] < 0:
+        reasons.append(f"achieved delta {parsed['achieved']:g} is negative")
     elif parsed["achieved"] > target:
         reasons.append(f"achieved delta {parsed['achieved']:g} above the target {target:g}")
-    if parsed["target"] is not None and not math.isclose(parsed["target"], target, rel_tol=1e-9):
-        reasons.append(f"table target {parsed['target']:g} differs from the configured {target:g}")
+    if parsed["target"] is not None:
+        if not math.isclose(parsed["target"], target, rel_tol=1e-9):
+            reasons.append(f"table target {parsed['target']:g} differs from the configured {target:g}")
+    else:
+        shown = _non_finite(fields.get("Target"))
+        if shown is not None:
+            reasons.append(f"table target {shown} is not a finite number")
     if parsed["criterion"] is not None and parsed["criterion"] != CRITERION:
         reasons.append(f"criterion {parsed['criterion']!r}, expected {CRITERION!r}")
     return {**parsed, "qualified": not reasons, "reasons": reasons}
