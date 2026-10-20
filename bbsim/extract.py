@@ -19,6 +19,7 @@ import pandas as pd
 
 from bbsim.config import ExitFieldConfig
 from bbsim.geometry import FaceInfo, GeometryError
+from bbsim.hfss_setup import EXIT_FLUX_EXPRESSION, OUTGOING_POWER_EXPRESSION
 from bbsim.naming import frequency_label
 from bbsim.readers import FieldFileError, read_calculator_scalar, read_exit_field_fld, read_far_field_ffd, wait_for_file
 from bbsim.sampling import FarFieldGrid
@@ -403,8 +404,9 @@ def describe_exit_face(hfss: Any, ctx: ExtractionContext) -> ExitFaceGeometry:
     return ExitFaceGeometry(local, len(vertex_ids), method, cross_section, sagitta)
 
 
-def evaluate_outgoing_power(hfss: Any, ctx: ExtractionContext, ephi: int) -> dict[tuple[float, float], float]:
-    """The named expression ``outgoing_power`` (real Poynting flux through the exit face) per incident direction.
+def _evaluate_exit_expression(hfss: Any, ctx: ExtractionContext, ephi: int, expression: str,
+                              label: str) -> dict[tuple[float, float], float]:
+    """A named exit-face expression of the Fields Calculator per incident direction, in watts.
 
     Each value is written to a scratch file with ``CalculatorWrite`` and read back, as PyAEDT 1.7.0 evaluates
     expressions, with ``Phase`` among the intrinsics. The legacy script read the calculator stack instead
@@ -412,8 +414,8 @@ def evaluate_outgoing_power(hfss: Any, ctx: ExtractionContext, ephi: int) -> dic
     with the incident-angle keys of a single-direction plane wave, which ``field_variation`` now omits.
     """
     fields = hfss.odesign.GetModule("FieldsReporter")
-    path = ctx.scratch_dir / f"outgoing_power_{ctx.freq_label}_Ephi{ephi}.fld"
-    power: dict[tuple[float, float], float] = {}
+    path = ctx.scratch_dir / f"{expression}_{ctx.freq_label}_Ephi{ephi}.fld"
+    values: dict[tuple[float, float], float] = {}
     total = len(ctx.phi_values) * len(ctx.theta_values)
     for phi in ctx.phi_values:
         for theta in ctx.theta_values:
@@ -421,16 +423,37 @@ def evaluate_outgoing_power(hfss: Any, ctx: ExtractionContext, ephi: int) -> dic
                 path.unlink()
             args = field_variation(ctx, ephi, float(phi), float(theta)) + ["Phase:=", "0deg"]
             fields.CalcStack("clear")
-            fields.CopyNamedExprToStack("outgoing_power")
+            fields.CopyNamedExprToStack(expression)
             fields.CalculatorWrite(str(path), ["Solution:=", ctx.solution], args)
             wait_for_file(path, ctx.timeout_s)
             value = read_calculator_scalar(path)
             path.unlink()
             key = (float(phi), float(theta))
-            power[key] = value
-            log.info("[power %d/%d] phi=%s theta=%s Ephi=%s -> %.6e W", len(power), total, phi, theta, ephi, value)
+            values[key] = value
+            log.info("[%s %d/%d] phi=%s theta=%s Ephi=%s -> %.6e W", label, len(values), total, phi, theta, ephi, value)
     fields.CalcStack("clear")
-    return power
+    return values
+
+
+def evaluate_outgoing_power(hfss: Any, ctx: ExtractionContext, ephi: int) -> dict[tuple[float, float], float]:
+    """The named expression ``outgoing_power`` (|Re S| integrated over the exit face) per incident direction.
+
+    This is the schema-1 ``OutgoingPower``; ``evaluate_exit_powers`` adds the flux beside it for schema 2.
+    """
+    return _evaluate_exit_expression(hfss, ctx, ephi, OUTGOING_POWER_EXPRESSION, "power")
+
+
+def evaluate_exit_powers(hfss: Any, ctx: ExtractionContext, ephi: int
+                         ) -> tuple[dict[tuple[float, float], float], dict[tuple[float, float], float]]:
+    """``(|Re S| per key, exit flux Re S.n per key)`` of one polarization, each keyed ``(phi, theta)`` in degrees.
+
+    Both named expressions, ``outgoing_power`` and ``exit_flux`` (``hfss_setup.add_exit_flux_expression``), go
+    through the ``CalculatorWrite`` path of ``evaluate_outgoing_power``. Schema 2 stores the flux as
+    ``OutgoingPower`` and keeps |Re S| as a sanity bound (HF-039(1), CDX-009).
+    """
+    abs_by_key = _evaluate_exit_expression(hfss, ctx, ephi, OUTGOING_POWER_EXPRESSION, "power")
+    flux_by_key = _evaluate_exit_expression(hfss, ctx, ephi, EXIT_FLUX_EXPRESSION, "exit flux")
+    return abs_by_key, flux_by_key
 
 
 def _checked_exit_field(df: pd.DataFrame, ctx: ExtractionContext, face: ExitFaceGeometry, grid: ExitGrid | None,
@@ -471,10 +494,16 @@ def _checked_exit_field(df: pd.DataFrame, ctx: ExtractionContext, face: ExitFace
 
 
 def extract_waveguide(hfss: Any, ctx: ExtractionContext, ephi: int, face: ExitFaceGeometry,
-                      rim_log: dict | None = None) -> pd.DataFrame:
+                      rim_log: dict | None = None,
+                      exit_powers: tuple[dict, dict] | None = None) -> pd.DataFrame:
     """The waveguide table of one polarization. For a disc, ``retain_disc_lattice`` keeps the whole lattice inside
-    it; its per-key counts are appended to ``rim_log[str(ephi)]`` for the manifest."""
-    power = evaluate_outgoing_power(hfss, ctx, ephi)
+    it; its per-key counts are appended to ``rim_log[str(ephi)]`` for the manifest.
+
+    ``exit_powers`` is ``evaluate_exit_powers``' result for this polarization, evaluated beforehand: its |Re S|
+    fills the 1.0 ``OutgoingPower`` column and no expression is evaluated here (the flux is the caller's, for
+    schema 2). Without it the table is the schema-1 one, with ``outgoing_power`` evaluated here.
+    """
+    power = exit_powers[0] if exit_powers is not None else evaluate_outgoing_power(hfss, ctx, ephi)
 
     fields = hfss.odesign.GetModule("FieldsReporter")
     fields.CalcStack("clear")

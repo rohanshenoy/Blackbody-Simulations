@@ -23,6 +23,7 @@ from bbsim.sampling import FarFieldGrid, far_field_grid, incident_point_count
 EXIT_FACE_LIST = "outgoing"
 EXIT_CS = "outgoing_cs"
 OUTGOING_POWER_EXPRESSION = "outgoing_power"
+EXIT_FLUX_EXPRESSION = "exit_flux"
 
 
 def setup_arguments(frequency_ghz: float, max_delta_e: float, max_passes: int) -> list:
@@ -150,6 +151,23 @@ def add_outgoing_power_expression(hfss: Any) -> None:
     fields.EnterSurf(EXIT_FACE_LIST)
     fields.CalcOp("Integrate")
     fields.AddNamedExpression(OUTGOING_POWER_EXPRESSION, "Fields")
+
+
+def add_exit_flux_expression(hfss: Any) -> None:
+    """The exit flux Re(S).n: the real Poynting vector's z component integrated over the exit face list.
+
+    The exit face's outward normal is +z in the canonical pose, so ScalarZ is the flux (HF-039(1), CDX-009), where
+    ``outgoing_power`` integrates the magnitude |Re S|. It does not clear the named expressions, unlike
+    ``add_outgoing_power_expression``, so it can be added beside it, or to a solved design that holds it already
+    (``hpc/diagnose_poynting.py`` builds the same expression as ``dg_exit_flux_z``).
+    """
+    fields = hfss.odesign.GetModule("FieldsReporter")
+    fields.CalcStack("clear")
+    fields.CopyNamedExprToStack("Vector_RealPoynting")
+    fields.CalcOp("ScalarZ")
+    fields.EnterSurf(EXIT_FACE_LIST)
+    fields.CalcOp("Integrate")
+    fields.AddNamedExpression(EXIT_FLUX_EXPRESSION, "Fields")
 
 
 def create_setup_and_polarization_sweep(hfss: Any, frequency_ghz: float, max_delta_e: float,
