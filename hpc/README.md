@@ -537,6 +537,37 @@ currents on a slot about a tenth of a wavelength wide radiate (Codex found 0.18 
 hemisphere, CDX-015). If a copy cannot be removed, the run now says so and still exits 0; remove it by hand.
 Paste the round gap's `tail` and `ls`, the two blocks with their `tail` lines, and the `sacct` lines.
 
+## 8d. OR-035 check on the solved projects (batch, no solve)
+
+OR-035 changed two things the fake AEDT models but real AEDT has not yet shown. HF-045: a rectangle whose extent is
+not a whole number of exit-lattice steps gets the fitted step, with the ExportOnGrid stop padded by half a step, so
+both walls are nodes. CDX-023: exit points must lie on the exit plane x_e = 0 to 1e-12 m, and lattice bounds off it
+stop a run before its solve. `hpc/check_or035.sbatch` checks both on copies of the three solved projects, with no
+solve and one AEDT seat per project. (a) On crack1's copy, the runner's own lattice and export over the exit face's
+y lattice and z in [-0.01875, 0.01875] mm at the configured 1 um: 37.5 steps, so `fit_axis` gives 38 intervals of
+0.0375/38 mm and 39 nodes. (b) On all three copies, the exit-face outline in the exit frame, from the runner's own
+face description. It runs inside Rohan's one HPC batch on its own (B4), independent of step 9. crack1's copy carries
+its `.aedtresults` (about 2.5 GB) under `<job>/check_or035/` while the job runs. One paste:
+
+    cd /home/rshenoy/BBRSim/Blackbody-Simulations && git pull --ff-only fork linux-hpc-migration
+    mkdir -p /home/rshenoy/BBRSim/outputs
+    B4=$(sbatch --parsable hpc/check_or035.sbatch); B4=${B4%%;*}; echo "B4 job $B4"
+
+When it has left the queue (same shell, or put the job number in place of `$B4`):
+
+    sacct -j $B4 -o JobID,State,ExitCode,Elapsed,MaxRSS
+    grep -E '^(== |   \((a|b)\)|       |   HF-045|   copies|   note)' /home/rshenoy/BBRSim/outputs/check_or035-$B4.out
+
+Expected: (a) the fitted step 0.0375/38 mm (0.000986842105263158) with that spacing string in the ExportOnGrid
+call; `expect 101 x 39 = 3939 rows per key, z end nodes at -1.875e-05 and 1.875e-05 m to 1e-12 m`; 15 keys exported
+with `rows per key [3939]`; `HF-045: PASS`. (b) `max |x|` at most 1e-09 mm and PASS for crack1 and crack2 (4 vertices
+each) and the round gap (edge samples). The last line `== RESULT: PASS` with exit 0, and the copies removed. A FAIL
+in (a) means AEDT did not put a node on both walls, or gave another count, despite the padded stop; the runner's
+refusal is printed and the raw export of that key is kept in `<crack1 job>/check_or035/scratch/`. A FAIL in (b)
+names the project whose exit face lies off the plane. After a failure the copies are kept; remove each
+`<job>/check_or035/` by hand before a rerun (exit 2, "nothing started", if one exists). Paste the `grep` output and
+the `sacct` lines.
+
 ## 9. Schema-2 re-export of the three solved jobs, no solve (batch)
 
 The schema-2 tables (HF-050) for the three solved 2025 R2 jobs, crack1 and crack2 `job_tight1` (step 5d) and the round
