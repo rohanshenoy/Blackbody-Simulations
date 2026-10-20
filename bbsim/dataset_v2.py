@@ -400,10 +400,22 @@ def order_check_block(method: str, reference: dict) -> dict[str, Any]:
 
 
 def _require_version(name: str, value: object) -> str:
+    """A version string that is evidence: non-empty and not ``session.aedt_versions``' fallback ``"unknown (...)"``,
+    which two runs that both failed to read their version would share (Ruling 5)."""
     if not isinstance(value, str) or not value.strip():
         raise DatasetV2Error(f"column-order reference needs a non-empty {name} string (version evidence), "
                              f"got {value!r}")
+    if value.strip().lower().startswith("unknown"):
+        raise DatasetV2Error(f"column-order reference needs a known {name} (version evidence), got {value!r}: "
+                             "the version could not be read")
     return value
+
+
+def check_versions(aedt_version: object, pyaedt_version: object) -> None:
+    """Refuse current AEDT / PyAEDT versions that could not serve as reference evidence, as ``build_reference`` and
+    ``check_reference_compatible`` would; a runner calls it before a solve that would otherwise be wasted."""
+    _require_version("aedt_version", aedt_version)
+    _require_version("pyaedt_version", pyaedt_version)
 
 
 def _reference_case_rows(table: pd.DataFrame, ephi: int, phi: float, theta: float) -> np.ndarray:

@@ -212,14 +212,22 @@ class ExitFieldConfig:
             raise ConfigError(f"edge_samples must be an integer >= 8, got {self.edge_samples!r}")
 
 
+SCHEMAS = (1, 2)
+
+
 @dataclass(frozen=True)
 class OutputConfig:
     root: Path
     polarizations: tuple[int, ...] = (0, 1)
     export_timeout_s: float = 300.0
+    # The dataset schema the runner writes (HF-050): 2 for every new dataset; 1 keeps the 1.0 writer until the _v2
+    # trees pass BBRsim's tree check, and for diagnostics whose grid schema 2 cannot describe.
+    schema: int = 2
 
     def __post_init__(self) -> None:
         _finite("export_timeout_s", self.export_timeout_s)
+        if isinstance(self.schema, bool) or not isinstance(self.schema, int) or self.schema not in SCHEMAS:
+            raise ConfigError(f"schema must be the integer 1 or 2, got {self.schema!r}")
         if not self.polarizations or any(p not in (0, 1) for p in self.polarizations):
             raise ConfigError(f"polarizations must be a non-empty subset of [0, 1], got {list(self.polarizations)}")
         if len(set(self.polarizations)) != len(self.polarizations):
