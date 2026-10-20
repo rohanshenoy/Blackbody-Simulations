@@ -54,20 +54,27 @@ def _pair(df_0, df_1, phi, theta, coords, tol, what):
     return a, b
 
 
+def _major(version, what):
+    """The major (1 or 2) of a schema version text such as "1.0", "2.0" or "2": the text before the first ".".
+    Anything else (not a string, no numeric major, a major other than 1 or 2) is a ValueError."""
+    major = version.split(".")[0] if isinstance(version, str) else None
+    if major not in ("1", "2"):
+        raise ValueError(f"{what} {version!r} is not a 1.x or 2.x schema version")
+    return int(major)
+
+
 def _is_v2(schema, sidecar):
-    """True for a 2.x table, which needs a 2.x sidecar; False for 1.x, which must not be given one."""
-    major = str(schema).split(".")[0]
-    declared = sidecar.get("schema_version") if isinstance(sidecar, dict) else None
-    sidecar_major = declared.split(".")[0] if isinstance(declared, str) else None
-    if major == "2":
-        if sidecar_major != "2":
-            raise ValueError(f"schema {schema!r} is read with its 2.x dataset sidecar; got schema_version {declared!r}")
-        return True
-    if major != "1":
-        raise ValueError(f"schema must be '1.x' or '2.x', got {schema!r}")
-    if sidecar_major == "2":
-        raise ValueError(f"schema {schema!r} contradicts the 2.x sidecar: pass schema='2.0' to read a 2.0 table")
-    return False
+    """True for a 2.x table, which needs a 2.x sidecar; False for 1.x, whose sidecar (if any) must be 1.x too."""
+    major = _major(schema, "schema")
+    if sidecar is None:
+        if major == 2:
+            raise ValueError(f"schema {schema!r} is read with its 2.x dataset sidecar; none was given")
+        return False
+    declared = _major(sidecar.get("schema_version") if isinstance(sidecar, dict) else None,
+                      "the sidecar's schema_version")
+    if declared != major:
+        raise ValueError(f"schema {schema!r} contradicts the sidecar's schema_version {sidecar['schema_version']!r}")
+    return major == 2
 
 
 def _v1_frame(df):
@@ -221,7 +228,8 @@ def key_transmittances(phi_in, theta_in, df_0, df_1, schema="1.0", sidecar=None)
     """
     if _is_v2(schema, sidecar):
         return _transmittances_v2(phi_in, theta_in, df_0, df_1, sidecar)
-    _v1_frame(df_0), _v1_frame(df_1)
+    _v1_frame(df_0)
+    _v1_frame(df_1)
     a, b = _pair(df_0, df_1, phi_in, theta_in, ["X", "Y", "Z"], COORD_TOL_M, "exit points")
     t = []
     for rows in (a, b):
@@ -240,7 +248,8 @@ def key_transmittances(phi_in, theta_in, df_0, df_1, schema="1.0", sidecar=None)
 
 
 def _transmittances_v2(phi_in, theta_in, df_0, df_1, sidecar):
-    _v2_frame(df_0), _v2_frame(df_1)
+    _v2_frame(df_0)
+    _v2_frame(df_1)
     a, b = _pair(df_0, df_1, phi_in, theta_in, ["X", "Y", "Z"], COORD_TOL_M, "exit points")
     rec = _v2_key(sidecar, phi_in, theta_in, (a, b))
     t = []
@@ -271,12 +280,17 @@ def _transmittances_v2(phi_in, theta_in, df_0, df_1, sidecar):
     return t[0], t[1], cross / (math.sqrt(p0) * math.sqrt(p1))
 
 
-def _sidecar_of(directory):
-    """The sidecar path beside a ``<stem>_Ephi=<n>`` directory, or None when there is none."""
+def _stem(directory, ephi):
+    """The ``<ID>_<label>`` stem of a directory named ``<stem>_Ephi=<ephi>``; any other name is a ValueError."""
     match = _EPHI_DIR.match(os.path.basename(os.path.normpath(directory)))
-    if match is None:
-        return None
-    path = os.path.join(os.path.dirname(os.path.normpath(directory)), f"{match['stem']}.dataset.json")
+    if match is None or int(match["ephi"]) != ephi:
+        raise ValueError(f"{directory} must be a directory named <ID>_<label>_Ephi={ephi}")
+    return match["stem"]
+
+
+def _sidecar_of(directory, stem):
+    """The sidecar ``<stem>.dataset.json`` beside an Ephi directory, or None when there is none."""
+    path = os.path.join(os.path.dirname(os.path.normpath(directory)), f"{stem}.dataset.json")
     return path if os.path.isfile(path) else None
 
 
@@ -284,15 +298,20 @@ def load_datasets(ephi0_dir, ephi1_dir):
     """Load waveguide and far-field tables for the Ephi=0 and Ephi=1 datasets of one frequency, and the dataset
     sidecar beside them (``None`` for a 1.0 dataset without one).
 
-    A 2.x sidecar needs two 16-column 2.0 tables, a 16-column table needs a 2.x sidecar, and the two directories must
-    name the same sidecar (ValueError otherwise). Every dark record of a 2.x sidecar is validated against both tables
-    here, before any helper masks anything: t_flux and every OutgoingPower of a dark key exactly 0.
+    The directories must be named ``<stem>_Ephi=0`` and ``<stem>_Ephi=1`` with the same ``<ID>_<label>`` stem, and
+    name the same sidecar (ValueError otherwise). A 2.x sidecar needs two 16-column 2.0 tables, a 16-column table
+    needs a 2.x sidecar, and an unknown ``schema_version`` is refused. Every dark record of a 2.x sidecar is
+    validated against both tables here, before any helper masks anything: t_flux and every OutgoingPower of a dark
+    key exactly 0.
     """
-    wg0, wg1 = (pd.read_csv(os.path.join(d, "waveguide.csv")) for d in (ephi0_dir, ephi1_dir))
-    ff0, ff1 = (pd.read_csv(os.path.join(d, "far_field.csv")) for d in (ephi0_dir, ephi1_dir))
-    paths = [_sidecar_of(d) for d in (ephi0_dir, ephi1_dir)]
+    stems = (_stem(ephi0_dir, 0), _stem(ephi1_dir, 1))
+    if stems[0] != stems[1]:
+        raise ValueError(f"the directories belong to different datasets: stem {stems[0]!r} against {stems[1]!r}")
+    paths = [_sidecar_of(d, stems[0]) for d in (ephi0_dir, ephi1_dir)]
     if paths[0] != paths[1]:
         raise ValueError(f"the two directories name different sidecars: {paths[0]} and {paths[1]}")
+    wg0, wg1 = (pd.read_csv(os.path.join(d, "waveguide.csv")) for d in (ephi0_dir, ephi1_dir))
+    ff0, ff1 = (pd.read_csv(os.path.join(d, "far_field.csv")) for d in (ephi0_dir, ephi1_dir))
     sidecar = None
     if paths[0] is not None:
         try:
@@ -302,10 +321,7 @@ def load_datasets(ephi0_dir, ephi1_dir):
             raise ValueError(f"the sidecar {paths[0]} is unreadable: {exc}") from exc
         if not isinstance(sidecar, dict):
             raise ValueError(f"the sidecar {paths[0]} is not a JSON object")
-    declared = sidecar.get("schema_version") if sidecar else None
-    if sidecar is not None and not (isinstance(declared, str) and declared.split(".")[0] in ("1", "2")):
-        raise ValueError(f"the sidecar {paths[0]} declares schema_version {declared!r}: expected 1.x or 2.x")
-    v2 = sidecar is not None and declared.startswith("2.")
+    v2 = sidecar is not None and _major(sidecar.get("schema_version"), "the sidecar's schema_version") == 2
     for df in (wg0, wg1):
         if v2:
             _v2_frame(df)
@@ -376,7 +392,8 @@ def get_face_emission_distribution(phi_in, theta_in, polarization_0, polarizatio
     """
     if _is_v2(schema, sidecar):
         return _face_distribution_v2(phi_in, theta_in, polarization_0, polarization_1, df_0, df_1, sidecar)
-    _v1_frame(df_0), _v1_frame(df_1)
+    _v1_frame(df_0)
+    _v1_frame(df_1)
     f0, f1 = _pair(df_0, df_1, phi_in, theta_in, ["X", "Y", "Z"], COORD_TOL_M, "spatial coordinates")
 
     # Reconstruct complex E-fields
@@ -419,7 +436,8 @@ def get_face_emission_distribution(phi_in, theta_in, polarization_0, polarizatio
 def _face_distribution_v2(phi_in, theta_in, polarization_0, polarization_1, df_0, df_1, sidecar):
     """2.x exit positions: q_i = w_i |a E_t0,i + b E_t1,i|^2 normalized, E_t = (Ex, Ey) by position, w_i the
     dimensionless quadrature weights of the sidecar's lattice, a dark basis contributing nothing (E2 is |E_t|^2)."""
-    _v2_frame(df_0), _v2_frame(df_1)
+    _v2_frame(df_0)
+    _v2_frame(df_1)
     f0, f1 = _pair(df_0, df_1, phi_in, theta_in, ["X", "Y", "Z"], COORD_TOL_M, "spatial coordinates")
     rec = _v2_key(sidecar, phi_in, theta_in, (f0, f1))
     ex0, ey0 = _e_t(f0.iloc[:, V2_SLOTS].to_numpy(float))
@@ -443,10 +461,13 @@ def get_angular_emission_distribution(phi_in, theta_in, polarization_0, polariza
     for given incoming angle and polarization, using linear superposition of E-fields
     in spherical coordinates (rEtheta, rEphi).
 
-    Each row stands for sin(Theta) dTheta dPhi of solid angle (the constant steps cancel on normalization), and
-    rows with sin(Theta) cos(Phi) not above 1e-6 (the polar axis, the exit plane, directions behind it) carry none.
+    Each row stands for sin(Theta) dTheta dPhi of solid angle (the constant steps cancel on normalization). 1.0
+    keeps the rows with sin(Theta) cos(Phi) >= 1e-6 and 2.x keeps the rows above 1e-6 (as the field list says); the
+    others (the polar axis, the exit plane, directions behind it) carry none.
     Under 2.x the far field is the unscaled CSV rE and a dark basis contributes nothing; exit-area weights and the
-    exit E_t are not direction weights.
+    exit E_t are not direction weights. Called directly, it checks only the sidecar half of the dark rule (t_flux
+    exactly 0 for a dark basis), because far_field.csv carries no OutgoingPower; the waveguide helpers
+    (``key_transmittances``, ``get_face_emission_distribution``) and ``load_datasets`` check the table half.
 
     Parameters:
         phi_in (float): Incoming IWavePhi in degrees

@@ -42,19 +42,23 @@ FF = ["rEtheta", "rEphi"]
 
 
 def transmission(df: pd.DataFrame, sidecar: dict | None = None) -> pd.Series:
-    """T per incidence key from the key's first row. A 2.0 table (it has InterceptFactor) needs its sidecar: the
-    dark records are validated first (OR-038: t_flux and every OutgoingPower of a dark key exactly 0, else
-    ValueError, nothing repaired) and T = OutgoingPower / (IngoingPower x InterceptFactor). 1.0 is unchanged."""
+    """T per incidence key from the key's first row. A 2.0 table (it has InterceptFactor) needs its 2.x sidecar: the
+    table is checked against it (``compare.check_v2_waveguide``, which includes the dark records: t_flux and every
+    OutgoingPower of a dark key exactly 0, else ValueError, nothing repaired) and T = OutgoingPower / (IngoingPower
+    x InterceptFactor). A 1.0 table is unchanged, and must not be given a 2.x sidecar."""
     first = df.drop_duplicates(KEYS).set_index(KEYS)
+    declared = sidecar.get("schema_version") if isinstance(sidecar, dict) else None
+    sidecar_v2 = isinstance(declared, str) and declared.split(".")[0] == "2"
     if INTERCEPT_FACTOR not in df.columns:
+        if sidecar_v2:
+            raise ValueError(f"the table has no {INTERCEPT_FACTOR} column but its sidecar declares schema "
+                             f"{declared!r}: a 2.x sidecar belongs to a 2.0 table")
         return first["OutgoingPower"] / first["IngoingPower"]
     if sidecar is None:
         raise ValueError("a 2.0 (16-column) table is read only with its dataset sidecar: pass sidecar=")
-    where = "the 2.0 waveguide table"
-    table = compare._v2_table(df, sidecar, None, None, where)
-    problems = compare._dark_contradictions(df, table.records, table.index, table.ephi, where)
-    if problems:
-        raise ValueError("; ".join(problems))
+    if not sidecar_v2:
+        raise ValueError(f"a 2.0 table needs a sidecar declaring schema 2.x, got schema_version {declared!r}")
+    compare.check_v2_waveguide(df, sidecar)
     return first["OutgoingPower"] / (first["IngoingPower"] * first[INTERCEPT_FACTOR])
 
 

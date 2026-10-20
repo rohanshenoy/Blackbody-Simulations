@@ -429,6 +429,17 @@ def _v2_table(df: pd.DataFrame, sidecar: dict | None, path: Path | None, directo
     return _V2Table(sidecar, records, index, ephi)
 
 
+def check_v2_waveguide(df: pd.DataFrame, sidecar: dict | None, where: str = "the 2.0 waveguide table") -> None:
+    """Raise ``ComparisonInputError`` unless a 2.0 waveguide table is consistent with its sidecar: the sidecar present
+    and its per-key records well formed, every row at a declared key, one polarization, every InterceptFactor equal to
+    its key's c_k, and every dark record (t_flux and every OutgoingPower of its key exactly 0, OR-038) free of
+    contradiction. The checks of ``legacy_view`` and the native comparison, for readers that only need T."""
+    table = _v2_table(df, sidecar, None, None, where)
+    problems = _dark_contradictions(df, table.records, table.index, table.ephi, where)
+    if problems:
+        raise ComparisonInputError("; ".join(problems))
+
+
 def legacy_view(waveguide: pd.DataFrame, sidecar: dict, ephi: int) -> pd.DataFrame:
     """The schema-1.0 table a 2.0 waveguide table was made from, for mixed-version comparisons only (design 2.6).
 
