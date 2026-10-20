@@ -177,10 +177,16 @@ def create_setup_and_polarization_sweep(hfss: Any, frequency_ghz: float, max_del
     return setup_name(frequency_ghz), parametric_setup_name(frequency_ghz)
 
 
-def insert_far_field_sphere(hfss: Any, ff: FarFieldConfig, frequency_ghz: float) -> tuple[str, FarFieldGrid]:
+def far_field_sphere(ff: FarFieldConfig, frequency_ghz: float) -> tuple[str, FarFieldGrid]:
+    """The far-field sphere's name and grid for a run, without AEDT: what ``insert_far_field_sphere`` inserts, and
+    what a --from-solved run finds in the solved design."""
     grid = far_field_grid(ff.theta_lower_deg, ff.theta_upper_deg, ff.phi_lower_deg, ff.phi_upper_deg,
                           ff.a_mm, ff.b_mm, frequency_ghz, ff.fineness, ff.min_coarseness_deg, ff.max_coarseness_deg)
-    name = radiation_sphere_name(frequency_ghz)
+    return radiation_sphere_name(frequency_ghz), grid
+
+
+def insert_far_field_sphere(hfss: Any, ff: FarFieldConfig, frequency_ghz: float) -> tuple[str, FarFieldGrid]:
+    name, grid = far_field_sphere(ff, frequency_ghz)
     accepted = inspect.signature(hfss.insert_infinite_sphere).parameters
     hfss.insert_infinite_sphere(**far_field_sphere_kwargs(accepted, grid, name))
     return name, grid

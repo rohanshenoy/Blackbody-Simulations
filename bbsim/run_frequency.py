@@ -4,10 +4,15 @@ Two phases share one AEDT session: ``prepare_and_solve`` sets up the run design 
 solves it; ``extract_and_write`` extracts both polarizations into memory, checks them, and only then writes the
 CSVs, the manifest and the dataset sidecar (schema-2 design, sections 2.4 and 4). ``output.schema`` selects the
 writer: 2 by default (HF-050), 1 for the 1.0 tables until the ``_v2`` trees pass BBRsim's tree check.
+
+``--from-solved JOB_DIR`` replaces the first phase: a finished job's project and ``.aedtresults`` are copied into a
+new job beside it, the solved run design is opened, and ``extract_and_write`` writes schema 2 from the copy with no
+solve, under the source manifest's configuration (HF-050).
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import os
@@ -23,8 +28,8 @@ from typing import Any
 import numpy as np
 
 from bbsim import dataset_v2
-from bbsim.config import RunConfig, config_to_dict, load_config
-from bbsim.dataset_record import build_dataset_record, build_dataset_record_v2, modes_record_v2
+from bbsim.config import RunConfig, build_config, config_to_dict, load_config
+from bbsim.dataset_record import REEXPORT_TOOL, build_dataset_record, build_dataset_record_v2, modes_record_v2
 from bbsim.dataset_v2 import DatasetV2Error
 from bbsim.manifest import REPO_ROOT, build_manifest, git_commit, sha256_file, write_json
 from bbsim.naming import dataset_record_name, frequency_design_name, frequency_label, last_adaptive_solution
@@ -37,7 +42,12 @@ log = logging.getLogger("bbsim.run")
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Headless HFSS gap simulation for one frequency.")
-    p.add_argument("--config", type=Path, required=True, help="TOML run configuration (see configs/)")
+    p.add_argument("--config", type=Path, default=None,
+                   help="TOML run configuration (see configs/); required unless --from-solved")
+    p.add_argument("--from-solved", type=Path, default=None, metavar="JOB_DIR",
+                   help="Schema 2 re-export with no solve: copy this finished job's project and .aedtresults into a "
+                        "new job beside it (--job-id required) and extract from the copy; the configuration is the "
+                        "job's manifest's, so --config and the overrides below are refused")
     p.add_argument("--frequency-ghz", type=float, default=None)
     p.add_argument("--cores", type=int, default=None)
     p.add_argument("--output-root", default=None)
@@ -237,6 +247,31 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str, reference: dict | None =
         return extract_and_write(cfg, dirs, job_id, hfss, solved, t_start, reference, None)
 
 
+def _require_v2_exit_normal(cfg: RunConfig, exit_face: Any) -> None:
+    """Schema 2: exit_flux integrates ScalarZ of Re S, which is the flux Re S.n (HF-039(1), CDX-009) only on an exit
+    face whose outward normal is +z; any other pose is refused, a pose the config leaves unchecked included."""
+    if tuple(exit_face.outward_normal) != (0.0, 0.0, 1.0):
+        raise DatasetV2Error(
+            f"schema 2 stores the exit flux Integrate(ScalarZ(Re S)), which is Re S.n only when the exit face's "
+            f"outward normal is (0, 0, 1) (pose canonical-z); exit face {exit_face.id} has outward normal "
+            f"{list(exit_face.outward_normal)} (config pose {cfg.geometry.pose!r})")
+
+
+def _require_v2_lattice(cross_section: Mapping, lattice: Any) -> None:
+    """Schema 2: the quadrature weights and the modes need a rectangle or a disc on the manual exit lattice."""
+    shape = cross_section["shape"]
+    if shape not in dataset_v2.QUADRATURE_BY_SHAPE or lattice is None:
+        raise DatasetV2Error(f"schema 2 needs a rectangle or disc exit cross-section on the manual exit lattice "
+                             f"(quadrature weights, modes); got {shape!r}"
+                             + ("" if lattice is not None else " without a lattice"))
+
+
+def _require_v2_exit_face(cfg: RunConfig, solved: SolvedContext) -> None:
+    """Both schema-2 exit-face checks on a solved context, whichever path built it (fresh solve or --from-solved)."""
+    _require_v2_exit_normal(cfg, solved.exit_face)
+    _require_v2_lattice(solved.face_geometry.cross_section, solved.lattice)
+
+
 def _check_versions_for_reference(reference: Mapping | None, versions: Mapping[str, Any]) -> None:
     """Schema 2: the reference job's versions must be evidence; a supplied reference must match them (HF-041)."""
     aedt, pyaedt = versions.get("aedt"), versions.get("pyaedt")
@@ -306,12 +341,8 @@ def prepare_and_solve(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sta
     # Same order as legacy main(): variables, faces/boundaries, exit CS, calculator, setup, sphere, plane wave.
     clear_boundaries_and_excitations(hfss)
     entrance, exit_face = select_faces(hfss, cfg.geometry)
-    if cfg.output.schema == 2 and tuple(exit_face.outward_normal) != (0.0, 0.0, 1.0):
-        # Ruling 13: exit_flux integrates ScalarZ of Re S, which is Re S.n only on a face whose outward normal is +z.
-        raise DatasetV2Error(
-            f"schema 2 stores the exit flux Integrate(ScalarZ(Re S)), which is Re S.n only when the exit face's "
-            f"outward normal is (0, 0, 1) (pose canonical-z); exit face {exit_face.id} has outward normal "
-            f"{list(exit_face.outward_normal)} (config pose {cfg.geometry.pose!r})")
+    if cfg.output.schema == 2:
+        _require_v2_exit_normal(cfg, exit_face)   # before the solve; extract_and_write checks again
     solid = object_record(hfss, cfg.geometry.object)
     log.info("entrance face %s, exit face %s, material %s", entrance, exit_face, solid["material"])
     initialize_variables(hfss, exc.ei_v_per_m)
@@ -340,11 +371,7 @@ def prepare_and_solve(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sta
     if lattice is not None:
         log.info("exit lattice: %d points per incident angle (%s)", lattice.lattice_points, face_geometry.bounds_method)
     if cfg.output.schema == 2:
-        shape = face_geometry.cross_section["shape"]
-        if shape not in dataset_v2.QUADRATURE_BY_SHAPE or lattice is None:
-            raise DatasetV2Error(f"schema 2 needs a rectangle or disc exit cross-section on the manual exit lattice "
-                                 f"(quadrature weights, modes); got {shape!r}"
-                                 + ("" if lattice is not None else " without a lattice"))
+        _require_v2_lattice(face_geometry.cross_section, lattice)
     hfss.save_project()
 
     log.info("solving %s with %d cores (%d incident angles x 2 polarizations)", setup, cfg.solver.cores,
@@ -457,6 +484,8 @@ def extract_and_write(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sol
     if schema == 1 and reexport is not None:
         raise ValueError("a re-export record applies to schema 2 only; this run writes schema 1")
     check_before_aedt(cfg, reference)   # pure; repeated here for callers that did not come through run_job
+    if schema == 2:
+        _require_v2_exit_face(cfg, solved)   # every path in, a --from-solved context included
     ctx = solved.ctx
     freq = cfg.solver.frequency_ghz
     dataset_id = cfg.project.dataset_id
@@ -627,8 +656,277 @@ def extract_and_write(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sol
     return manifest_path
 
 
+# --- --from-solved: a fresh schema-2 extraction on a copy of a solved job, no solve (schema-2 design 2.4, HF-050) ----
+
+@dataclass(frozen=True)
+class SourceJob:
+    """A finished job to re-export: its directory, its manifest exactly as read (never modified), the run
+    configuration built from that manifest's ``config`` block with ``output.schema`` set to 2, its solved project
+    and ``.aedtresults`` folder, and the manifest's sha256."""
+
+    job_dir: Path
+    manifest: dict
+    config: RunConfig
+    project: Path
+    results: Path
+    manifest_sha256: str
+
+
+def _manifest_field(manifest: Mapping, section: str, key: str) -> Any:
+    block = manifest.get(section)
+    if not isinstance(block, Mapping) or key not in block:
+        raise ValueError(f"the source manifest has no {section}.{key}")
+    return block[key]
+
+
+def _check_source_records(cfg: RunConfig, manifest: Mapping) -> None:
+    """The re-export asks AEDT for the source's run design, solution, far-field sphere and incidence keys by the names
+    and grids this code derives from the source's config; refuse a source that recorded different ones, before any
+    copy, rather than halfway through the extraction."""
+    from bbsim.hfss_setup import far_field_sphere
+    from bbsim.naming import setup_name
+
+    freq = cfg.solver.frequency_ghz
+    exc = cfg.excitation
+    sphere, grid = far_field_sphere(cfg.far_field, freq)
+    derived = {
+        ("project", "run_design"): frequency_design_name(cfg.project.design, freq),
+        ("solver", "setup"): setup_name(freq),
+        ("far_field", "sphere"): sphere,
+        ("far_field", "theta_step_deg"): grid.theta_step_deg,
+        ("far_field", "phi_step_deg"): grid.phi_step_deg,
+        ("far_field", "points_per_angle"): grid.points_per_angle,
+        ("excitation", "incident_phi_deg"): incident_angle_values(exc.phi_lower_deg, exc.phi_upper_deg,
+                                                                  exc.phi_step_deg).tolist(),
+        ("excitation", "incident_theta_deg"): incident_angle_values(exc.theta_lower_deg, exc.theta_upper_deg,
+                                                                    exc.theta_step_deg).tolist(),
+    }
+
+    def same(recorded: Any, value: Any) -> bool:
+        if isinstance(value, str) or isinstance(recorded, str):
+            return recorded == value
+        try:
+            return bool(np.shape(recorded) == np.shape(value) and np.allclose(recorded, value, rtol=1e-12, atol=1e-9))
+        except (TypeError, ValueError):
+            return False
+
+    differ = [f"{section}.{key}: recorded {_manifest_field(manifest, section, key)!r}, derived {value!r}"
+              for (section, key), value in derived.items() if not same(_manifest_field(manifest, section, key), value)]
+    if differ:
+        raise ValueError("the source job's manifest records what this code would not reproduce from its config: "
+                         + "; ".join(differ))
+
+
+def load_source_job(job_dir: Path) -> SourceJob:
+    """Read and check a finished job for --from-solved, without changing it: its ``manifest.json``, its solved
+    project (``project/<name>.aedt``, the manifest's ``job_copy``) and that project's ``.aedtresults`` folder must
+    exist (design section 4). The configuration is a deep copy of the manifest's ``config`` block with
+    ``output.schema`` = 2, whether the source recorded 1 or nothing (HF-050); every other setting is the source's.
+    The job must sit in its dataset folder, where the fresh job goes."""
+    job_dir = Path(os.path.abspath(job_dir))
+    manifest_path = job_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"no manifest.json in {job_dir}: --from-solved needs a finished job")
+    manifest = json.loads(manifest_path.read_text())
+    if not isinstance(manifest, dict):
+        raise ValueError(f"{manifest_path} must hold a manifest object, got {type(manifest).__name__}")
+    project = job_dir / "project" / Path(_manifest_field(manifest, "project", "job_copy")).name
+    if not project.is_file():
+        raise FileNotFoundError(f"the source job's solved project {project} does not exist")
+    results = project.with_suffix(".aedtresults")
+    if not results.is_dir():
+        raise FileNotFoundError(f"the source job's solution folder {results} (.aedtresults) does not exist")
+    _manifest_field(manifest, "project", "run_design")
+    raw = manifest.get("config")
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"{manifest_path} has no config block")
+    raw = copy.deepcopy(dict(raw))
+    output = raw.get("output")
+    raw["output"] = {**(output if isinstance(output, Mapping) else {}), "schema": 2}
+    cfg = build_config(raw)
+    folder = f"{cfg.project.dataset_id}_{frequency_label(cfg.solver.frequency_ghz)}"
+    if job_dir.parent.name != folder:
+        raise ValueError(f"the source job {job_dir} is not in its dataset folder {folder}/, where the fresh job goes")
+    record = manifest["project"].get("dataset_id_record") or {}
+    if record.get("dataset_id") is not None and record["dataset_id"] != cfg.project.dataset_id:
+        raise ValueError(f"the source manifest's config dataset_id {cfg.project.dataset_id!r} disagrees with its "
+                         f"dataset_id record {record!r}")
+    _check_source_records(cfg, manifest)
+    return SourceJob(job_dir=job_dir, manifest=manifest, config=cfg, project=project, results=results,
+                     manifest_sha256=sha256_file(manifest_path))
+
+
+def reexport_job_dirs(source: SourceJob, job_id: str) -> JobDirs:
+    """The fresh job's directories, in the source's dataset folder (``<dataset>_<label>/job_<job_id>``); an existing
+    job directory, the source's own included, is refused."""
+    return create_job_dirs(source.job_dir.parent.parent, source.config.project.dataset_id,
+                           source.config.solver.frequency_ghz, job_id)
+
+
+def stage_solved_job(source: SourceJob, dirs: JobDirs) -> StagedProject:
+    """Copy the source's solved project and its ``.aedtresults`` into the fresh job, before any AEDT session, as
+    ``hpc/diagnose_poynting.py`` copies a solved job; AEDT opens only the copy, so the source is never written."""
+    job_project = dirs.project / source.project.name
+    shutil.copy2(source.project, job_project)
+    shutil.copytree(source.results, dirs.project / source.results.name)
+    source_sha, job_sha = sha256_file(source.project), sha256_file(job_project)
+    if job_sha != source_sha:
+        raise RuntimeError(f"the copy {job_project} does not hash to its source {source.project}")
+    record = source.manifest["project"].get("dataset_id_record") or {}
+    return StagedProject(source=source.project, source_sha=source_sha, job_project=job_project, job_sha=job_sha,
+                         recorded_id=record.get("dataset_id"),
+                         record=Path(record["path"]) if record.get("path") else None)
+
+
+def prepare_from_solved(source: SourceJob, dirs: JobDirs, job_id: str, hfss: Any, staged: StagedProject
+                        ) -> SolvedContext:
+    """Open the solved run design in the job's copy and rebuild the extraction context from its geometry, as
+    ``prepare_and_solve`` builds it, without setting up or solving anything. Both polarizations must be solved
+    already. ``staged`` is ``stage_solved_job``'s copy, which ``hfss`` opened. ``solve_s`` is None; the solve's mesh
+    and facet settings are the source manifest's."""
+    from bbsim.extract import ExtractionContext, describe_exit_face, exit_grid
+    from bbsim.geometry import select_faces
+    from bbsim.hfss_setup import (
+        EXIT_CS,
+        add_exit_flux_expression,
+        add_outgoing_power_expression,
+        aedt_messages,
+        far_field_sphere,
+        missing_polarizations,
+        set_total_fields,
+        solved_variations,
+    )
+    from bbsim.inventory import object_record
+    from bbsim.naming import parametric_setup_name, plane_wave_name, setup_name
+    from bbsim.session import aedt_versions
+
+    cfg = source.config
+    freq = cfg.solver.frequency_ghz
+    run_design = source.manifest["project"]["run_design"]
+    exc = cfg.excitation
+    phi_values = incident_angle_values(exc.phi_lower_deg, exc.phi_upper_deg, exc.phi_step_deg)
+    theta_values = incident_angle_values(exc.theta_lower_deg, exc.theta_upper_deg, exc.theta_step_deg)
+
+    versions = aedt_versions(hfss)
+    log.info("versions: %s", versions)
+    if run_design not in hfss.design_list:
+        raise RuntimeError(f"design {run_design!r} not in {staged.job_project}; designs: {list(hfss.design_list)}")
+    if hfss.design_name != run_design:
+        hfss.set_active_design(run_design)
+    if hfss.modeler.model_units != "mm":
+        raise RuntimeError(f"model units are {hfss.modeler.model_units!r}; the configuration assumes mm")
+    solution = last_adaptive_solution(freq)
+    variations = solved_variations(hfss, solution)
+    log.info("solved variations of %s: %s", solution, variations)
+    missing = missing_polarizations(variations, cfg.output.polarizations)
+    if missing:
+        raise RuntimeError(f"no solved variations for Ephi={missing} in {solution!r} of {staged.job_project} (copied "
+                           f"from {source.job_dir}): AEDT holds {variations}, and a re-export never solves")
+
+    entrance, exit_face = select_faces(hfss, cfg.geometry)
+    _require_v2_exit_normal(cfg, exit_face)
+    solid = object_record(hfss, cfg.geometry.object)
+    log.info("entrance face %s, exit face %s, material %s", entrance, exit_face, solid["material"])
+    # The field type is a post-processing setting: HPC step 8b set it on copies of these solved projects and then
+    # evaluated their fields. The source run set the same before its solve.
+    set_total_fields(hfss)
+    # HF-052: both named expressions are re-defined exactly as a fresh run defines them, the clear in
+    # add_outgoing_power_expression first. This supersedes the schema-2 design's "only exit_flux is added": every
+    # solve since the schema-2 runner (b2af196) saves exit_flux in its run design, and what AEDT does when a name
+    # is added twice is unverified. Named expressions are calculator definitions; they do not touch the solution.
+    add_outgoing_power_expression(hfss)
+    add_exit_flux_expression(hfss)
+    sphere, grid = far_field_sphere(cfg.far_field, freq)   # the solved design holds this sphere (load_source_job)
+
+    ctx = ExtractionContext(
+        frequency_ghz=freq, solution=solution, sphere_name=sphere,
+        phi_values=phi_values, theta_values=theta_values, grid=grid, exit_field=cfg.exit_field,
+        exit_face=exit_face, exit_cs_name=EXIT_CS, exit_cs_x=cfg.geometry.exit_cs_x, exit_cs_y=cfg.geometry.exit_cs_y,
+        scratch_dir=dirs.scratch, timeout_s=cfg.output.export_timeout_s,
+        incoming_power_w=incoming_power_w(exc.ei_v_per_m, entrance.area_mm2),
+    )
+    face_geometry = describe_exit_face(hfss, ctx)
+    lattice = exit_grid(face_geometry, cfg.exit_field) if cfg.exit_field.manual else None
+    _require_v2_lattice(face_geometry.cross_section, lattice)
+    log.info("exit lattice: %d points per incident angle (%s)", lattice.lattice_points, face_geometry.bounds_method)
+    solver = source.manifest.get("solver") or {}
+    mesh = solver.get("initial_mesh_settings") or {}
+    return SolvedContext(
+        ctx=ctx, face_geometry=face_geometry, lattice=lattice, entrance=entrance, exit_face=exit_face, solid=solid,
+        setup=setup_name(freq), parametric=parametric_setup_name(freq), sphere=sphere, grid=grid,
+        plane_wave=plane_wave_name(freq), wall_facets=solver.get("wall_facets"),
+        mesh_inherited=mesh.get("inherited_from_base_design"), mesh_requested=mesh.get("requested"),
+        variations=variations, messages=aedt_messages(hfss), solve_s=None, source=staged.source,
+        source_sha=staged.source_sha, job_project=staged.job_project, job_sha=staged.job_sha,
+        recorded_id=staged.recorded_id, record=staged.record, run_design=run_design, versions=versions,
+    )
+
+
+def run_from_solved(source: SourceJob, dirs: JobDirs, job_id: str, reference: dict | None = None) -> Path:
+    """--from-solved: copy the source's solved project and results, open the copy, extract and write schema 2 with
+    no solve. The convergence tables are exported fresh from the opened design and qualified against the source's
+    target (CDX-025); the sidecar records ``provenance.reexport`` and the manifest ``solver.reused_solution``."""
+    from bbsim.session import aedt_session, aedt_versions
+
+    t_start = time.perf_counter()
+    cfg = source.config
+    check_before_aedt(cfg, reference)
+    staged = stage_solved_job(source, dirs)
+    reexport = {"source_job": str(source.job_dir), "source_manifest_sha256": source.manifest_sha256,
+                "tool": REEXPORT_TOOL, "git_commit": git_commit()}
+    with aedt_session(staged.job_project, source.manifest["project"]["run_design"], cfg.project.aedt_version) as hfss:
+        _check_versions_for_reference(reference, aedt_versions(hfss))
+        solved = prepare_from_solved(source, dirs, job_id, hfss, staged)
+        return extract_and_write(cfg, dirs, job_id, hfss, solved, t_start, reference, reexport)
+
+
+_FROM_SOLVED_EXCLUDES = (("--config", "config"), ("--frequency-ghz", "frequency_ghz"), ("--cores", "cores"),
+                         ("--output-root", "output_root"), ("--project", "project"), ("--polarizations", "polarizations"),
+                         ("--aedt-version", "aedt_version"))
+
+
+def _main_from_solved(args: argparse.Namespace) -> int:
+    given = [flag for flag, attr in _FROM_SOLVED_EXCLUDES if getattr(args, attr) is not None]
+    if given:
+        print(f"refused: --from-solved takes its configuration from the source job's manifest; drop {', '.join(given)}",
+              file=sys.stderr)
+        return 2
+    if not args.job_id:
+        print("refused: --from-solved needs --job-id, the fresh job beside the source (for example tight1_v2)",
+              file=sys.stderr)
+        return 2
+    reference = None
+    try:
+        source = load_source_job(args.from_solved)
+        if args.column_order_reference is not None:
+            reference = load_reference(args.column_order_reference)
+        check_before_aedt(source.config, reference)
+        dirs = reexport_job_dirs(source, args.job_id)
+    except (OSError, ValueError) as exc:
+        print(f"refused before the job started: {exc}", file=sys.stderr)
+        return 2
+    _setup_logging(dirs.logs / "run.log", args.log_level)
+    write_json(dirs.root / "effective_config.json", config_to_dict(source.config))
+    log.info("job %s -> %s: schema-2 re-export of %s, no solve", args.job_id, dirs.root, source.job_dir)
+    if reference is not None:
+        log.info("column-order reference from %s (%s, %s)", args.column_order_reference, reference.get("source_job"),
+                 reference.get("aedt_version"))
+    try:
+        manifest = run_from_solved(source, dirs, args.job_id, reference)
+    except Exception:  # noqa: BLE001 - report and exit non-zero; the session is already released
+        log.exception("re-export failed")
+        return 1
+    log.info("done; manifest at %s", manifest)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.from_solved is not None:
+        return _main_from_solved(args)
+    if args.config is None:
+        print("refused: one of --config or --from-solved is required", file=sys.stderr)
+        return 2
     cfg = load_config(args.config, overrides_from_args(args))
     if not cfg.project.path.is_file():
         print(f"prepared project not found: {cfg.project.path} (run prepare_hfss_project.py first, or pass --project)",
