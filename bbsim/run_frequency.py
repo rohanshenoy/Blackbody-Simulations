@@ -245,7 +245,21 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str, reference: dict | None =
             # A stale or unreadable version would stop the run after its licensed solve; it costs seconds here.
             _check_versions_for_reference(reference, aedt_versions(hfss))
         solved = prepare_and_solve(cfg, dirs, job_id, hfss, staged)
-        return extract_and_write(cfg, dirs, job_id, hfss, solved, t_start, reference, None)
+        try:
+            return extract_and_write(cfg, dirs, job_id, hfss, solved, t_start, reference, None)
+        except Exception:
+            # The licensed solve is saved in the job's copy (prepare_and_solve) and nothing here removes it; say so,
+            # so that a failed check after it never ends in deleting the job and solving again.
+            log.error(solved_project_kept_message(solved.job_project))
+            raise
+
+
+def solved_project_kept_message(job_project: Path) -> str:
+    """The run log's line when a check after a finished solve fails: it names the solved project and its solution
+    folder, which stay in the job, and says why they must not be deleted."""
+    return (f"the solve finished but a check after it failed: the solved project {job_project} and its solution "
+            f"folder {job_project.with_suffix('.aedtresults')} are kept; do not delete this job (move it aside), "
+            f"because a re-extraction can reuse the solve instead of solving again")
 
 
 def _require_vacuum(solid: Mapping[str, Any]) -> None:

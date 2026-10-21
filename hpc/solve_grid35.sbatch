@@ -13,15 +13,18 @@
 # Preflight, before any AEDT session (exit 2, "nothing started"): the config loads with the extra args as the runner
 # reads them; it declares the 35 keys; the runner's own pre-AEDT check passes (schema 2, both polarizations, a
 # theta = 90 deg key, and a column-order reference on every job but crack1 at 500 GHz); a --column-order-reference
-# file exists; the prepared project exists; the job directory does not exist yet (this script never deletes: remove a
-# failed attempt's job_grid35_1 by hand before a rerun).
+# file exists; the prepared project exists; the job directory does not exist yet. This script never deletes. A failed
+# attempt's job_grid35_1 whose logs/run.log shows the solve finished holds a licensed solve that a later re-extraction
+# can reuse (HF-052): do not delete it; move it aside (mv job_grid35_1 job_grid35_1_failed), keep it and report the
+# failure. A rerun solves again, so submit one only on purpose.
 #
 # After the solve it prints, from the job's manifest and sidecar: per polarization the convergence qualification
 # (qualified, achieved delta against the target, passes), the declared key count, the sidecar's transmittance.cell_90
 # and, for the reference job, its column-order cases. The last line is "== RESULT: PASS" with exit 0 only if the runner
 # exited 0, the manifest records solver.qualified true, the schema-2 sidecar declares 35 keys, its cell_90 equals
 # 0.036633054690581604 to 1e-12 relative (theta 90 to 180 deg by 15 deg, OR-036), and the reference job wrote a passed
-# column-order reference; otherwise "== RESULT: FAIL <reasons>" with exit 1. It never exits 0 on a failure.
+# column-order reference; otherwise "== RESULT: FAIL <reasons>" with exit 1. It never exits 0 on a failure. When the
+# job's logs/run.log shows the solve finished, the FAIL line ends by saying the solved project is kept.
 # Resources are first guesses from the 15-key runs times 35/15 in time; memory does not grow with the key count:
 # crack1 about 20 min and 2.8 GB, crack2 about 34 min and 4.8 GB (the largest), the round gap about 10 min and 2.5 GB.
 #SBATCH --job-name=bbsim_grid35
@@ -124,7 +127,8 @@ if not cfg.project.path.is_file():
     refuse(f"the prepared project {cfg.project.path} does not exist")
 job = Path(cfg.output.root) / f"{cfg.project.dataset_id}_{frequency_label(cfg.solver.frequency_ghz)}" / "job_grid35_1"
 if job.exists():
-    refuse(f"the job directory {job} exists from an earlier attempt: remove it by hand before a rerun")
+    refuse(f"the job directory {job} exists from an earlier attempt: move it aside (mv {job} {job}_failed) and keep "
+           "it if its logs/run.log shows the solve finished; a rerun solves again")
 writes_reference = reference is None and is_reference_job(cfg)
 print(f"preflight: ok; {n_phi} x {n_theta} = 35 keys, schema {cfg.output.schema}, job {job}"
       + ("; the reference job: it writes scratch/column_order_reference.json" if writes_reference
@@ -243,6 +247,11 @@ if [ "$src" -ne 0 ]; then
 fi
 rm -f "$REASONS"
 if [ -n "$FAILED" ]; then
+  # A licensed solve that finished is kept whatever failed after it (HF-052): never delete the job.
+  if grep -q "solve finished in" "$JOB/logs/run.log" 2>/dev/null; then
+    FAILED="$FAILED; the solve finished ($JOB/logs/run.log): the solved project in $JOB/project is kept, do not delete"
+    FAILED="$FAILED the job: move it aside (mv $JOB ${JOB}_failed) and report"
+  fi
   echo "== RESULT: FAIL $FAILED"
   exit 1
 fi

@@ -634,8 +634,10 @@ T about 1e-44) pass `exit_field.values` within eps like every other key.
 
 Anything else ends `== RESULT: FAIL <what failed>`: exit 2 with "nothing started" names the preflight's reason;
 exit 1 names the failed re-export or acceptance (a failed crack1 re-export means the other two did not start).
-Before a rerun, remove a failed attempt's `job_*_v2` directory by hand; the runner refuses an existing one, and
-the script never deletes anything. Paste the `grep` and `sed` output and the `sacct` lines.
+Which job may be removed: a failed `job_*_v2` holds only a copy of its source's solved project, re-creatable by
+rerunning the re-export, so remove it by hand before a rerun (the runner refuses an existing one, and the script
+never deletes anything). Never remove the sources `job_tight1` and `job_reference1`: their solves are the
+originals. Paste the `grep` and `sed` output and the `sacct` lines.
 
 ### 9d. Assemble the two `_v2` trees (batch B2)
 
@@ -720,7 +722,7 @@ runner refuses a missing reference before the job starts too). One paste:
 When all three have left the queue (same shell, or put the job numbers in place of `$G1`, `$G2`, `$G3`):
 
     sacct -j $G1,$G2,$G3 -o JobID,State,ExitCode,Elapsed,MaxRSS
-    for j in $G1 $G2 $G3; do grep -E '^(== |host=|preflight: |   (manifest|Ephi=|sidecar|cell_90|column-order|reference passed))|wrote the schema-2 sidecar|convergence target|done; manifest at|job failed|refused|bbsim.run: aedt: |Error:|Exception:' /home/rshenoy/BBRSim/outputs/solve_grid35-$j.out; done
+    for j in $G1 $G2 $G3; do grep -E '^(== |host=|preflight: |   (manifest|Ephi=|sidecar|cell_90|column-order|reference passed))|wrote the schema-2 sidecar|solve finished|convergence target|done; manifest at|job failed|refused|bbsim.run: aedt: |Error:|Exception:' /home/rshenoy/BBRSim/outputs/solve_grid35-$j.out; done
     du -sh /home/rshenoy/BBRSim/outputs/*/job_grid35_1 /home/rshenoy/BBRSim/outputs/*/job_grid35_1/project/*.aedtresults
 
 Expected, for each: the `host=` line with the commit that ran; `preflight: ok; 5 x 7 = 35 keys, schema 2`; the run
@@ -734,8 +736,11 @@ the 15-key runs times 35/15 (time grows with the keys, memory does not): crack1 
 8.7 min, 2.8 GB), crack2 about 34 min and 4.8 GB (14.4 min, 4.8 GB), the round gap about 10 min and 2.5 GB (4 min
 16 s, 2.5 GB). Record `Elapsed`, `MaxRSS` and the `du -sh` sizes: they size the job array. Anything else ends
 `== RESULT: FAIL <reasons>` with exit 1 (the runner's exit code, `solver.qualified`, the key count, cell_90,
-crack1's reference), or exit 2 with "nothing started". Before a rerun, remove a failed attempt's `job_grid35_1` by
-hand; the script never deletes anything. Paste the `grep` and `du` output and the `sacct` lines.
+crack1's reference), or exit 2 with "nothing started". The script never deletes anything. A failed job whose
+`logs/run.log` shows the solve finished (`solve finished in ... s`; its FAIL line then ends by saying the solved
+project is kept) holds a licensed solve that a later re-extraction can reuse: do not delete it. Move it aside
+(`mv job_grid35_1 job_grid35_1_failed`), keep it and report the failure; rerun only on purpose, because a rerun
+solves again. Paste the `grep` and `du` output and the `sacct` lines.
 
 ### 10b. Key-by-key acceptance against the 15-key solves (batch C2)
 
