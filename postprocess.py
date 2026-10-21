@@ -462,7 +462,7 @@ def get_angular_emission_distribution(phi_in, theta_in, polarization_0, polariza
     in spherical coordinates (rEtheta, rEphi).
 
     Each row stands for sin(Theta) dTheta dPhi of solid angle (the constant steps cancel on normalization). 1.0
-    keeps the rows with sin(Theta) cos(Phi) >= 1e-6 and 2.x keeps the rows above 1e-6 (as the field list says); the
+    keeps the rows with sin(Theta) cos(Phi) >= 1e-6 and 2.x keeps the rows above 1e-6 (the 2.0 field list, HF-047); the
     others (the polar axis, the exit plane, directions behind it) carry none.
     Under 2.x the far field is the unscaled CSV rE and a dark basis contributes nothing; exit-area weights and the
     exit E_t are not direction weights. Called directly, it checks only the sidecar half of the dark rule (t_flux

@@ -3,7 +3,7 @@
 Built only from the run manifest as written to disk, so the sidecar cannot disagree with it. Pure:
 no AEDT; scipy is imported only for the schema-1 circular-guide Bessel zeros (the 2.0 path needs none).
 Canonical labels p, l, g (propagation, long, gap) are the Geant4 crack-local x, y, z and equal the exit-CS
-axes X, Y, Z. Schema 2.0 (docs/superpowers/specs/2026-10-13-schema-2-sidecar-fields.md, section 2) is built from
+axes X, Y, Z. Schema 2.0 (the sidecar field list of ledger HF-047 and HF-048) is built from
 the same shared core as 1.0, so the blocks the two schemas have in common cannot drift apart.
 """
 from __future__ import annotations
@@ -35,7 +35,7 @@ MODEL_KIND_V2 = "screen_free_abc"
 CONVENTIONS_V2 = {"time_dependence": "exp(+j omega t)", "phasor": "peak"}
 PLANE_TOLERANCE_M_V2 = 1e-12   # X = 0 on every row; BBRsim's tolerance (CDX-023)
 REEXPORT_TOOL = "bbsim reexport_v2"
-# Circular-guide cutoff zeros, to the digits the field list fixes (no scipy on the 2.0 path):
+# Circular-guide cutoff zeros, to the digits the schema-2.0 field list fixes (HF-047, OR-031; no scipy on the 2.0 path):
 X11P = 1.8411837813   # first zero of J1'  -> TE11
 X01 = 2.4048255577    # first zero of J0   -> TM01
 X21P = 3.0542369282   # first zero of J2'  -> TE21
@@ -352,7 +352,7 @@ def _reexport_record(reexport: Mapping[str, Any]) -> dict[str, Any]:
 def build_dataset_record_v2(manifest: Mapping[str, Any], manifest_sha256: str,
                             files: Mapping[str, Mapping[str, Any]], blocks: Mapping[str, Any],
                             reexport: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """The schema-2.0 sidecar for one solved frequency (field list, section 2).
+    """The schema-2.0 sidecar for one solved frequency (HF-047, HF-048).
 
     The 1.0 core (provenance, frames, excitation, far_field, exit_field, symmetry, boundaries, geometry, files)
     plus the 2.0 additions. ``blocks`` is ``dataset_v2.DatasetV2Result.blocks``: its ``transmittance``,

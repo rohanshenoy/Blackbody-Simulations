@@ -4,7 +4,7 @@ Schema, keys, grids and IngoingPower must match; transmission must agree within
 tolerance; field distributions are reported (warning only) because solver
 versions differ.
 
-Both dataset schemas are read (schema-2 design, section 2.6). A directory's schema comes from the dataset sidecar
+Both dataset schemas are read (HF-052). A directory's schema comes from the dataset sidecar
 beside it (``<stem>.dataset.json`` next to ``<stem>_Ephi=<n>``, as a job root and an assembled tree hold it), else from
 its waveguide.csv column list (``dataset_schema``); anything else fails a check and is never guessed.
 
@@ -441,7 +441,7 @@ def check_v2_waveguide(df: pd.DataFrame, sidecar: dict | None, where: str = "the
 
 
 def legacy_view(waveguide: pd.DataFrame, sidecar: dict, ephi: int) -> pd.DataFrame:
-    """The schema-1.0 table a 2.0 waveguide table was made from, for mixed-version comparisons only (design 2.6).
+    """The schema-1.0 table a 2.0 waveguide table was made from, for mixed-version comparisons only (HF-052).
 
     OutgoingPower becomes the key's ``transmittance.per_key[].polarizations[ephi].outgoing_power_abs_re_s_w`` (the
     |Re S| numerator of 1.0), IngoingPower stays A I, the six exit-field values (by position) are divided by the
@@ -809,7 +809,7 @@ def _pair_stats(tables, tol: Tolerances):
 
 
 def _pair_stats_v2(tables, v2: list[_V2Table], lattice: tuple[str, ExitGrid | None], tol: Tolerances):
-    """Per key of one native 2.0 pair (schema-2 design 2.6, HF-042): T_p = OutgoingPower / (IngoingPower *
+    """Per key of one native 2.0 pair (HF-042, OR-034): T_p = OutgoingPower / (IngoingPower *
     InterceptFactor); exit Re rho on E_t = (Ex, Ey), read by position, with the dimensionless quadrature weights of the
     declared lattice (trapezoid by each point's node for a rectangle, 1 for a disc); dark masking: a key where either
     basis is dark has rho 0 for the exit and the far field, its stored fields unread, and is not judged for rho."""

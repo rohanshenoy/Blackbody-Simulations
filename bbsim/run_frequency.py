@@ -2,7 +2,7 @@
 
 Two phases share one AEDT session: ``prepare_and_solve`` sets up the run design in the job's own project copy and
 solves it; ``extract_and_write`` extracts both polarizations into memory, checks them, and only then writes the
-CSVs, the manifest and the dataset sidecar (schema-2 design, sections 2.4 and 4). ``output.schema`` selects the
+CSVs, the manifest and the dataset sidecar (HF-050, HF-052). ``output.schema`` selects the
 writer: 2 by default (HF-050), 1 for the 1.0 tables until the ``_v2`` trees pass BBRsim's tree check.
 
 ``--from-solved JOB_DIR`` replaces the first phase: a finished job's project and ``.aedtresults`` are copied into a
@@ -164,7 +164,7 @@ def is_reference_job(cfg: RunConfig) -> bool:
 
 
 def load_reference(path: Path) -> dict:
-    """The column-order reference object (field list, section 2) from a JSON file, such as the reference job's
+    """The column-order reference object (HF-041) from a JSON file, such as the reference job's
     ``scratch/column_order_reference.json``. Its content is validated against the run's versions later."""
     reference = json.loads(Path(path).read_text())
     if not isinstance(reference, dict):
@@ -175,8 +175,8 @@ def load_reference(path: Path) -> dict:
 def check_before_aedt(cfg: RunConfig, reference: Mapping | None) -> None:
     """Refuse, from the configuration alone and before any job copy or AEDT session, a run whose output cannot be
     written: under schema 1 a column-order reference (schema 1 neither needs nor applies it); under schema 2
-    anything but both polarizations, a declared theta grid without a 90 deg key and one above it (``cell_90``,
-    Ruling 4), and a missing reference on any job but the reference job (HF-041)."""
+    anything but both polarizations, a declared theta grid without a 90 deg key and one above it (``cell_90`` is
+    defined by that band, HF-049 and OR-036), and a missing reference on any job but the reference job (HF-041)."""
     if cfg.output.schema == 1:
         if reference is not None:
             raise ValueError("a column-order reference applies to schema 2 only; this run writes schema 1 "
@@ -359,7 +359,7 @@ def prepare_and_solve(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sta
     create_exit_face_list(hfss, exit_face, name=EXIT_FACE_LIST)
     assign_radiation_boundaries(hfss, entrance, exit_face)
     create_exit_coordinate_system(hfss, exit_face, cfg.geometry.exit_cs_x, cfg.geometry.exit_cs_y, name=EXIT_CS)
-    # add_outgoing_power_expression clears every named expression, so the flux is added after it (Ruling 14).
+    # add_outgoing_power_expression clears every named expression, so the flux is added after it.
     add_outgoing_power_expression(hfss)
     add_exit_flux_expression(hfss)
     setup, parametric = create_setup_and_polarization_sweep(hfss, freq, cfg.solver.max_delta_e, cfg.solver.max_passes)
@@ -424,7 +424,7 @@ POSITION_MATCH_M = 1e-12
 
 
 def _require_shared_exit_points(waveguide0: Any, waveguide1: Any) -> None:
-    """Ruling 12: row by row, the Ephi=0 and Ephi=1 tables must hold the same key and the same exit point to
+    """Row by row, the Ephi=0 and Ephi=1 tables must hold the same key and the same exit point to
     ``POSITION_MATCH_M`` in X, Y and Z; ``dataset_v2.build`` compares lattice nodes only. Names the first key."""
     keys0 = waveguide0[KEY_COLUMNS].to_numpy(dtype=float)
     keys1 = waveguide1[KEY_COLUMNS].to_numpy(dtype=float)
@@ -465,7 +465,8 @@ def _column_order_check(cfg: RunConfig, dirs: JobDirs, solved: SolvedContext,
 
 
 def _write_reference_evidence(scratch: Path, reference: Mapping, raw: Mapping[int, Any]) -> None:
-    """Ruling 6: the reference job keeps the two raw tables it hashed, byte for byte, and the reference object."""
+    """The reference job keeps the two raw tables it hashed, byte for byte, and the reference object, so its
+    ``raw_table_sha256`` can be checked against files on disk (HF-041)."""
     for e in (0, 1):
         path = scratch / f"column_order_reference_Ephi{e}.csv"
         path.write_bytes(raw[e].to_csv(index=False).encode())
@@ -478,7 +479,7 @@ def extract_and_write(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sol
                       reference: dict | None = None, reexport: dict | None = None) -> Path:
     """Extract every polarization into memory, check, then write the CSVs, the manifest and the sidecar.
 
-    Order (schema-2 design, section 2.4): both polarizations are extracted and checked for finite values; under
+    Order (HF-052): both polarizations are extracted and checked for finite values; under
     schema 2 the column-order reference is measured (the reference job) or validated (every other job), the 2.0
     tables and sidecar blocks are built (``dataset_v2.build``); then the pairing and lattice checks. Only then is
     anything written, so a failure leaves no CSV, manifest or sidecar. Schema 1 writes the 1.0 tables and sidecar
@@ -611,7 +612,8 @@ def extract_and_write(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sol
                           "band_rel": RIM_BAND_REL, "per_key": rim_log} if rim_log else None}
     extra: dict[str, Any] = {}
     if result is not None:
-        # Fresh pre-clamp powers (field list section 3), and the diagnostics that are not sidecar fields.
+        # Fresh pre-clamp powers (manifest-only provenance; reexport_check derives the dark flags from them), and the
+        # diagnostics that are not sidecar fields.
         exit_field["raw_powers_per_key"] = result.raw_powers_per_key
         extra["transmittance_checks"] = {"flux_over_abs_re_s": result.flux_over_abs_re_s,
                                          "rho_per_key": result.rho_per_key}
@@ -666,7 +668,7 @@ def extract_and_write(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sol
     return manifest_path
 
 
-# --- --from-solved: a fresh schema-2 extraction on a copy of a solved job, no solve (schema-2 design 2.4, HF-050) ----
+# --- --from-solved: a fresh schema-2 extraction on a copy of a solved job, no solve (HF-050) ------------------------
 
 @dataclass(frozen=True)
 class SourceJob:
@@ -730,7 +732,7 @@ def _check_source_records(cfg: RunConfig, manifest: Mapping) -> None:
 def load_source_job(job_dir: Path) -> SourceJob:
     """Read and check a finished job for --from-solved, without changing it: its ``manifest.json``, its solved
     project (``project/<name>.aedt``, the manifest's ``job_copy``) and that project's ``.aedtresults`` folder must
-    exist (design section 4). The configuration is a deep copy of the manifest's ``config`` block with
+    exist. The configuration is a deep copy of the manifest's ``config`` block with
     ``output.schema`` = 2, whether the source recorded 1 or nothing (HF-050); every other setting is the source's.
     The job must sit in its dataset folder, where the fresh job goes."""
     job_dir = Path(os.path.abspath(job_dir))
@@ -842,7 +844,7 @@ def prepare_from_solved(source: SourceJob, dirs: JobDirs, job_id: str, hfss: Any
     # evaluated their fields. The source run set the same before its solve.
     set_total_fields(hfss)
     # HF-052: both named expressions are re-defined exactly as a fresh run defines them, the clear in
-    # add_outgoing_power_expression first. This supersedes the schema-2 design's "only exit_flux is added": every
+    # add_outgoing_power_expression first, not exit_flux alone: every
     # solve since the schema-2 runner (b2af196) saves exit_flux in its run design, and what AEDT does when a name
     # is added twice is unverified. Named expressions are calculator definitions; they do not touch the solution.
     add_outgoing_power_expression(hfss)

@@ -403,7 +403,7 @@ def order_check_block(method: str, reference: dict) -> dict[str, Any]:
 
 def _require_version(name: str, value: object) -> str:
     """A version string that is evidence: non-empty and not ``session.aedt_versions``' fallback ``"unknown (...)"``,
-    which two runs that both failed to read their version would share (Ruling 5)."""
+    which two runs that both failed to read their version would share (HF-041)."""
     if not isinstance(value, str) or not value.strip():
         raise DatasetV2Error(f"column-order reference needs a non-empty {name} string (version evidence), "
                              f"got {value!r}")
@@ -609,7 +609,7 @@ def check_reference_compatible(reference: dict, aedt_version: str, pyaedt_versio
 
 # --- The 2.0 tables and sidecar blocks from one job's raw extraction (CDX-009, HF-040, HF-042, OR-034, OR-038) ----
 #
-# Strings are verbatim from the field list (docs/superpowers/specs/2026-10-13-schema-2-sidecar-fields.md, section 2).
+# Strings are verbatim from the schema-2.0 sidecar field list (ledger HF-047, HF-048); BBRsim's reader compares them.
 
 TRANSMITTANCE_DEFINITION = "OutgoingPower / (IngoingPower * InterceptFactor)"
 TRANSMITTANCE_NUMERATOR = "exit_flux_re_s_dot_n"
@@ -625,7 +625,7 @@ CROSS_TERM_DEFINITION = ("Re rho = sum_i w_i Re(E_t0,i . conj E_t1,i) / sqrt(sum
                          "sum_i w_i abs(E_t1,i)^2)")
 CROSS_TERM_ABOVE_LIMIT = "warn_once"
 FAR_FIELD_NORMALIZATION = "pattern_only"
-# Declared keys and table rows match within this, in degrees (field list: per-key lists matched to 1e-9).
+# Declared keys and table rows match within this, in degrees (HF-048: per-key lists matched to 1e-9).
 KEY_TOL_DEG = 1e-9
 _FAR_FIELD_NUMERIC = ("IWavePhi", "IWaveTheta", "Phi", "Theta",
                       "rEphi_real", "rEphi_imag", "rEtheta_real", "rEtheta_imag")
@@ -879,7 +879,7 @@ def build(extracted: Mapping[int, Extracted], grid: ExitGrid, cross_section: Map
     Y and Z as BBRsim finds it, for a rectangle; uniform for a disc), the scale W and the dark flag
     (``scale_factor``), the sanity ratio flux / |Re S|, the far-field hemisphere power over the stored flux, and
     Re rho on the scaled fields. ``cell_90`` is computed once over the whole declared theta list, so a grid without
-    theta = 90 deg is refused for every run (Ruling 4).
+    theta = 90 deg is refused for every run (HF-049, OR-036: ``cell_90`` is defined by the band below 90 deg).
 
     Row order within a key is free for a rectangle: W and the blocks do not depend on it. Tables keep their rows
     in input order and every stored value in its position: OutgoingPower becomes the key's stored flux (0 when
@@ -912,7 +912,7 @@ def build(extracted: Mapping[int, Extracted], grid: ExitGrid, cross_section: Map
     order_block = _checked_order_check(order_check)
 
     keys = _declared_keys(phi_values, theta_values)
-    cell90 = cell_90(theta_values)                              # Ruling 4: refuses a grid without theta = 90 deg
+    cell90 = cell_90(theta_values)                              # refuses a grid without theta = 90 deg
     band_lo, band_hi = cell_90_band_deg(theta_values)
     c_values = [c_key(phi, theta, theta_values) for phi, theta in keys]
 

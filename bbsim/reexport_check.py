@@ -1,4 +1,4 @@
-"""Acceptance of a schema-2 re-export against its schema-1 source (schema-2 design, section 2.5).
+"""Acceptance of a schema-2 re-export against its schema-1 source (HF-050, HF-052; CDX-026).
 
 Usage::
 
