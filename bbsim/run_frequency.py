@@ -31,6 +31,7 @@ from bbsim import dataset_v2
 from bbsim.config import RunConfig, build_config, config_to_dict, load_config
 from bbsim.dataset_record import REEXPORT_TOOL, build_dataset_record, build_dataset_record_v2, modes_record_v2
 from bbsim.dataset_v2 import DatasetV2Error
+from bbsim.geometry_spec import is_vacuum, vacuum_refusal
 from bbsim.manifest import REPO_ROOT, build_manifest, git_commit, sha256_file, write_json
 from bbsim.naming import dataset_record_name, frequency_design_name, frequency_label, last_adaptive_solution
 from bbsim.paths import JobDirs, create_job_dirs, default_job_id
@@ -247,6 +248,14 @@ def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str, reference: dict | None =
         return extract_and_write(cfg, dirs, job_id, hfss, solved, t_start, reference, None)
 
 
+def _require_vacuum(solid: Mapping[str, Any]) -> None:
+    """CDX-029: the sidecar declares vacuum-guide cutoffs and BBRsim refuses any other material (BBR025), so a gap
+    solid that is not vacuum is refused under both schemas before the solve or any extraction. The material is
+    never relabelled."""
+    if not is_vacuum(solid["material"]):
+        raise RuntimeError(f"gap solid {solid['name']!r}: {vacuum_refusal(solid['material'])}")
+
+
 def _require_v2_exit_normal(cfg: RunConfig, exit_face: Any) -> None:
     """Schema 2: exit_flux integrates ScalarZ of Re S, which is the flux Re S.n (HF-039(1), CDX-009) only on an exit
     face whose outward normal is +z; any other pose is refused, a pose the config leaves unchecked included."""
@@ -344,6 +353,7 @@ def prepare_and_solve(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sta
     if cfg.output.schema == 2:
         _require_v2_exit_normal(cfg, exit_face)   # before the solve; extract_and_write checks again
     solid = object_record(hfss, cfg.geometry.object)
+    _require_vacuum(solid)
     log.info("entrance face %s, exit face %s, material %s", entrance, exit_face, solid["material"])
     initialize_variables(hfss, exc.ei_v_per_m)
     create_exit_face_list(hfss, exit_face, name=EXIT_FACE_LIST)
@@ -826,6 +836,7 @@ def prepare_from_solved(source: SourceJob, dirs: JobDirs, job_id: str, hfss: Any
     entrance, exit_face = select_faces(hfss, cfg.geometry)
     _require_v2_exit_normal(cfg, exit_face)
     solid = object_record(hfss, cfg.geometry.object)
+    _require_vacuum(solid)
     log.info("entrance face %s, exit face %s, material %s", entrance, exit_face, solid["material"])
     # The field type is a post-processing setting: HPC step 8b set it on copies of these solved projects and then
     # evaluated their fields. The source run set the same before its solve.

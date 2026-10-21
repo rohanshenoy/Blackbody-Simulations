@@ -19,6 +19,20 @@ class GeometrySpecError(ValueError):
 
 
 DATASET_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+VACUUM = "vacuum"
+
+
+def is_vacuum(material: Any) -> bool:
+    """The consumer's test (CDX-029): BBRsim accepts a gap whose material, lowercased with ``str.lower()`` and nothing
+    else (no strip), equals "vacuum". The producer applies exactly that, so it is never looser."""
+    return isinstance(material, str) and material.lower() == VACUUM
+
+
+def vacuum_refusal(material: Any) -> str:
+    """Why a gap solid of ``material`` is refused: the sidecar declares vacuum-guide cutoffs and BBRsim transports a
+    vacuum guide, so a filled guide needs a contract change."""
+    return (f"material {material!r} is not vacuum: the dataset sidecar declares vacuum-guide cutoffs and BBRsim "
+            "transports a vacuum guide, so a filled guide needs a contract change (CDX-029)")
 
 
 def _non_empty(where: str, name: str, value: Any) -> None:
@@ -55,6 +69,8 @@ class CylinderSolid:
 
     def __post_init__(self) -> None:
         _non_empty("solid", "material", self.material)
+        if not is_vacuum(self.material):
+            raise GeometrySpecError(f"[solid] {vacuum_refusal(self.material)}")
         for name in ("radius_mm", "length_mm"):
             value = getattr(self, name)
             if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
