@@ -13,7 +13,10 @@
 # job array): each job's manifest.json must record solver.qualified true, and the job prints one line per
 # polarization with its qualification, the achieved delta against the target (a --from-solved job records the
 # re-qualification at its source's target, CDX-025); each job holds exactly one sidecar, named by its dataset_id and
-# frequency_label, and both Ephi directories with exactly the three files; no dataset appears twice; every sidecar
+# frequency_label, and both Ephi directories with exactly the three files; a job whose sidecar records
+# provenance.reexport (a --from-solved re-export) holds reexport_check.json with passed true, and a job holding
+# grid_acceptance.json records passed true there (HF-052, CDX-026), each printed as an "acceptance:" line, so the
+# tree never relies on Slurm's dependency alone; no dataset appears twice; every sidecar
 # declares the same schema major (one schema per tree); the jobs hold exactly <expected_files> files. An existing
 # non-empty <tree_dir> is refused: nothing is overwritten or deleted, ever. Then the files are copied,
 # SHA256SUMS is written and checked with sha256sum -c, and its line count must equal <expected_files>.
@@ -134,6 +137,34 @@ for job in jobs:
         problems.append(f"{sidecars[0]}: schema_version {version!r} is not a version string")
         continue
     print(f"   dataset {stem}, schema_version {version}")
+    # Acceptance verdicts (HF-052, CDX-026): a re-export only after reexport_check passed on it, and a job that holds
+    # a grid acceptance only if that passed. The Slurm dependency is not the gate; the job's own record is.
+    provenance = record.get("provenance")
+    gates = []
+    if isinstance(provenance, dict) and provenance.get("reexport") is not None:
+        gates.append(("reexport_check.json", "a re-export (its sidecar records provenance.reexport)"))
+    if (job / "grid_acceptance.json").exists():
+        gates.append(("grid_acceptance.json", "a job holding grid_acceptance.json"))
+    if not gates:
+        print("   acceptance: none required (no provenance.reexport in its sidecar, no grid_acceptance.json)")
+    for name, what in gates:
+        path = job / name
+        if not path.exists():
+            print(f"   acceptance: no {name}")
+            problems.append(f"{job}: no {name}; {what} is assembled only after its acceptance passed")
+            continue
+        try:
+            verdict = read(path)
+        except (OSError, ValueError) as exc:
+            print(f"   acceptance: {name} unreadable ({exc})")
+            problems.append(f"{job}: {name} unreadable ({exc}); {what} is assembled only after its acceptance "
+                            "passed")
+            continue
+        passed = verdict.get("passed")
+        print(f"   acceptance: {name} passed {json.dumps(passed)} ({verdict.get('verdict')})")
+        if passed is not True:
+            problems.append(f"{job}: {name} records passed {json.dumps(passed)}, not true; {what} is assembled "
+                            "only after its acceptance passed")
     if stem in seen:
         problems.append(f"dataset {stem} is in both {seen[stem]} and {job}; a tree holds each dataset once")
         continue

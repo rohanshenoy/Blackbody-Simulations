@@ -45,9 +45,11 @@ declaration that a manifest or a CSV header contradicts fails before any value i
    qualify and agree field by field with the fresh qualification, and with the source manifest's record if it has one.
 
 Missing, malformed or non-finite input fails the row that needs it; nothing is compared with NaN. Every row, the
-largest deviations and the verdict go to ``<fresh>/reexport_check.json``; the printed table ends in
-``REEXPORT: PASS`` or ``REEXPORT: FAIL <n>`` (n failing rows). Exit code 0 on PASS, 1 on FAIL, 2 when a job
-directory or the --poynting file is missing.
+largest deviations and the verdict go to ``<fresh>/reexport_check.json``, written after the table is printed and
+only into a fresh job whose sidecar declares schema 2.x, so a swapped --source/--fresh never writes into a schema-1
+source; a report that cannot be written is named on its own ``report:`` line and fails the run, without a traceback.
+The printed table ends in ``REEXPORT: PASS`` or ``REEXPORT: FAIL <n>`` (n failing rows, the report counted). Exit
+code 0 on PASS, 1 on FAIL, 2 when a job directory or the --poynting file is missing.
 """
 from __future__ import annotations
 
@@ -78,6 +80,7 @@ from bbsim.manifest import REPO_ROOT, sha256_file, write_json
 from bbsim.naming import dataset_dir_name
 
 REPORT_NAME = "reexport_check.json"
+FRESH_MAJOR = "2"          # the report goes only into a fresh job whose sidecar declares this schema major
 SOURCE_SCHEMA = "1.0"
 FRESH_SCHEMA = "2.0"
 SUPPORTED = f"a schema {SOURCE_SCHEMA!r} source re-exported as schema {FRESH_SCHEMA!r}"
@@ -185,8 +188,9 @@ def _strict(records: object, keys: Sequence[tuple[float, float]], where: str, **
 
 @dataclass
 class ReexportResult(RowVerdicts):
-    """The rows in the design's order, the largest deviation of each compared quantity (value, limit, where), the
-    tolerances used, and the verdict."""
+    """The rows in order, the largest deviation of each compared quantity (value, limit, where), the tolerances
+    used, where the JSON report goes and whether it was written, and the verdict. A report that could not be written
+    fails the run."""
 
     source: str
     fresh: str
@@ -194,10 +198,19 @@ class ReexportResult(RowVerdicts):
     checks: list[Check]
     largest_deviation: dict[str, dict[str, Any]]
     tolerances: dict[str, float]
+    report_target: str | None = None   # <fresh>/reexport_check.json for a declared schema-2 fresh job, else None
+    report: str | None = None          # the JSON written (``write_report``)
+    report_error: str | None = None    # why it could not be written
+
+    @property
+    def passed(self) -> bool:
+        return super().passed and self.report_error is None
 
     @property
     def verdict(self) -> str:
-        return "REEXPORT: PASS" if self.passed else f"REEXPORT: FAIL {len(self.failures)}"
+        if self.passed:
+            return "REEXPORT: PASS"
+        return f"REEXPORT: FAIL {len(self.failures) + (1 if self.report_error else 0)}"
 
     def to_dict(self) -> dict[str, Any]:
         return {"source": self.source, "fresh": self.fresh, "poynting": self.poynting, "passed": self.passed,
@@ -206,6 +219,21 @@ class ReexportResult(RowVerdicts):
                 "largest_deviations": {k: dict(v) for k, v in self.largest_deviation.items()}}
 
     def format_table(self) -> str:
+        return self.format_rows() + "\n" + self.format_footer()
+
+    def format_footer(self) -> str:
+        """The report line and the verdict: what ``main`` prints after writing the report."""
+        if self.report:
+            report = f"report: {self.report}"
+        elif self.report_error:
+            report = f"report: {self.report_error}"
+        else:
+            report = ("report: not written (the fresh job's sidecar does not declare schema 2.x; a schema-1 source "
+                      "is never written)")
+        return "\n".join(["", report, "", self.verdict])
+
+    def format_rows(self) -> str:
+        """The header, the rows and the largest deviations: what ``main`` prints before writing the report."""
         lines = [f"source:   {self.source}", f"fresh:    {self.fresh}"]
         if self.poynting:
             lines.append(f"poynting: {self.poynting}")
@@ -217,7 +245,6 @@ class ReexportResult(RowVerdicts):
             lines += ["", "largest deviations:"]
             for name, d in self.largest_deviation.items():
                 lines.append(f"  {name:16} {d['value']:.3g} (limit {d['limit']:.3g}) at {d['where']}")
-        lines += ["", self.verdict]
         return "\n".join(lines)
 
 
@@ -1203,9 +1230,25 @@ def poynting_problems(source_job: Path, poynting: Path) -> list[str]:
 
 # --- entry points ----------------------------------------------------------------------------------------------------
 
-def check(source_job: Path, fresh_job: Path, poynting: Path | None = None, eps: float = EPS) -> ReexportResult:
-    """Run the acceptance of ``fresh_job`` (schema 2) against ``source_job`` (schema 1) and write
-    ``<fresh_job>/reexport_check.json``. ``poynting`` is step 8b's poynting.json for the source job, or None.
+def write_report(result: ReexportResult) -> None:
+    """Write ``result.to_dict()`` to ``result.report_target`` (nothing when it is None). An OSError is recorded in
+    ``result.report_error``, which fails the run, and never raised."""
+    if result.report_target is None:
+        return
+    try:
+        write_json(Path(result.report_target), result.to_dict())
+    except OSError as exc:
+        result.report_error = f"{result.report_target} could not be written ({exc}); the run fails"
+        return
+    result.report = result.report_target
+
+
+def check(source_job: Path, fresh_job: Path, poynting: Path | None = None, eps: float = EPS,
+          write: bool = True) -> ReexportResult:
+    """Run the acceptance of ``fresh_job`` (schema 2) against ``source_job`` (schema 1) and, with ``write``, write
+    ``<fresh_job>/reexport_check.json`` (``write_report``); only into a fresh job whose sidecar declares schema 2.x,
+    so that a swapped call never writes into a schema-1 source. ``poynting`` is step 8b's poynting.json for the
+    source job, or None.
 
     Raises ``FileNotFoundError`` when a job directory or the poynting file is missing (a usage error); every
     problem with the jobs' contents becomes a failing row instead.
@@ -1223,9 +1266,12 @@ def check(source_job: Path, fresh_job: Path, poynting: Path | None = None, eps: 
     tolerances = {"eps": float(eps), "scale_rel": SCALE_REL, "normalization_rel": NORMALIZATION_REL,
                   "intercept_rel": INTERCEPT_REL, "abs_re_s_rel": ABS_RE_S_REL, "poynting_rel": POYNTING_REL,
                   "stored_rel": STORED_REL, "coord_m": COORD_M, "key_deg": KEY_DEG, "dark_rel": DARK_REL}
+    version = acceptance.fresh.sidecar.get("schema_version")
+    target = fresh_job / REPORT_NAME if isinstance(version, str) and version.split(".")[0] == FRESH_MAJOR else None
     result = ReexportResult(str(source_job), str(fresh_job), None if poynting is None else str(poynting), checks,
-                            acceptance.largest, tolerances)
-    write_json(fresh_job / REPORT_NAME, result.to_dict())
+                            acceptance.largest, tolerances, report_target=None if target is None else str(target))
+    if write:
+        write_report(result)
     return result
 
 
@@ -1259,11 +1305,13 @@ def main(argv: list[str] | None = None) -> int:
         print("reexport_check: --fresh is required unless --preflight is given", file=sys.stderr)
         return 2
     try:
-        result = check(args.source, args.fresh, args.poynting)
+        result = check(args.source, args.fresh, args.poynting, write=False)
     except FileNotFoundError as exc:
         print(f"reexport_check: {exc}", file=sys.stderr)
         return 2
-    print(result.format_table())
+    print(result.format_rows(), flush=True)     # the table reaches the log before the report is written
+    write_report(result)
+    print(result.format_footer())
     return 0 if result.passed else 1
 
 

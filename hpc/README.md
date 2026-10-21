@@ -612,7 +612,7 @@ The records it compares against are step 8c's `<job_tight1>/diagnose_poynting/po
 When it has left the queue (same shell, or put the job number in place of `$B1`):
 
     sacct -j $B1 -o JobID,State,ExitCode,Elapsed,MaxRSS
-    grep -E '^(== |PREFLIGHT|preflight: |REEXPORT|(PASS|FAIL) |   (manifest|Ephi=|sidecar|ff_over_flux|reference|column-order|\(no summary|\(the reference))|wrote the schema-2 sidecar|done; manifest at|failed|refused|earlier attempt|reexport_check: |bbsim.run: aedt: |Error:|Exception:' /home/rshenoy/BBRSim/outputs/reexport_v2-$B1.out
+    grep -E '^(== |PREFLIGHT|preflight: |REEXPORT|report: |(PASS|FAIL) |   (manifest|Ephi=|sidecar|ff_over_flux|reference|column-order|\(no summary|\(the reference))|wrote the schema-2 sidecar|done; manifest at|failed|refused|earlier attempt|reexport_check: |bbsim.run: aedt: |Error:|Exception:' /home/rshenoy/BBRSim/outputs/reexport_v2-$B1.out
     sed -n '/^largest deviations:/,/^REEXPORT/p' /home/rshenoy/BBRSim/outputs/reexport_v2-$B1.out
 
 Expected: three `PREFLIGHT: PASS` lines. Each re-export's log ends with the schema-2 sidecar written and
@@ -630,7 +630,10 @@ this run shows for the first time, beyond PASS: re-defining both named expressio
 `outgoing_power` and `exit_flux`), `export_convergence` and `EditSources(TotalFields)` work on a reopened solved
 design (an AEDT failure there names itself in the log before anything is written); the `convergence` row passes,
 so the reopened design's convergence tables equal the source's; and the dark keys that carry only noise (theta 0,
-T about 1e-44) pass `exit_field.values` within eps like every other key.
+T about 1e-44) are judged by the `exit_field.dark` row (W = 1 and the source values kept within eps), not by
+`exit_field.values`, which covers the records with a fitted W. Each table is printed before its
+`reexport_check.json` is written into the fresh job, on a `report:` line; a report that cannot be written (for
+example a full `/home`) fails that dataset on that line.
 
 Anything else ends `== RESULT: FAIL <what failed>`: exit 2 with "nothing started" names the preflight's reason;
 exit 1 names the failed re-export or acceptance (a failed crack1 re-export means the other two did not start).
@@ -644,7 +647,10 @@ originals. Paste the `grep` and `sed` output and the `sacct` lines.
 `hpc/assemble_tree.sbatch <tree_dir> <expected_files> <job_dir>...` gates every job before copying anything:
 `solver.qualified` true in its manifest (OR-027: assembly takes qualified runs only), printed with one line per
 polarization; one sidecar named by its dataset; both `_Ephi` directories with `waveguide.csv`, `far_field.csv` and
-`manifest.json`; no dataset twice; one schema major per tree; the expected file count. It refuses an existing
+`manifest.json`; the acceptance verdicts (HF-052, CDX-026), each printed as an `acceptance:` line: a re-export
+(its sidecar records `provenance.reexport`) must hold `reexport_check.json` with `passed` true (step 9c), and a job
+holding `grid_acceptance.json` (step 10b) must record `passed` true there, so the tree never rests on the Slurm
+dependency alone; no dataset twice; one schema major per tree; the expected file count. It refuses an existing
 non-empty tree directory. It lays the tree out as steps 5e and 8a did, and writes and checks `SHA256SUMS`. The
 schema-1 trees `cracks_500GHz_2025r2` and `testworld_2025r2` stay as they are. One paste (after 9b; the
 dependency waits for it; same shell as 9b, or put B1's job number in place of `$B1`):
@@ -662,7 +668,8 @@ When both have left the queue:
     for j in $A $W; do grep -v ': OK$' /home/rshenoy/BBRSim/outputs/assemble_tree-$j.out; done
 
 Expected, per tree: every job's two polarization lines read `qualified true` with the achieved delta against 0.005;
-every dataset `schema_version 2.0`; `copied 14` (cracks) and `copied 21` (test world) files;
+every dataset `schema_version 2.0`; every job's `acceptance: reexport_check.json passed true (REEXPORT: PASS)`;
+`copied 14` (cracks) and `copied 21` (test world) files;
 `SHA256SUMS: 14 files, all OK` and `21 files`; the last line `== RESULT: PASS` with exit 0. A refusal names the job
 and its reason, and nothing is copied; a tree directory that exists and is not empty is never touched. If B1 failed,
 Slurm cancels both (`--kill-on-invalid-dep`).
@@ -778,8 +785,9 @@ silently. If a solve failed, Slurm cancels this job (`--kill-on-invalid-dep`).
 
 ### 10c. Assemble the two 35-key trees (batch C3)
 
-The same `hpc/assemble_tree.sbatch` as step 9d, with the same gate (qualified runs only, one schema major per tree,
-the expected file count), into two new trees beside the schema-1 and `_v2` ones: one grid per dataset per tree
+The same `hpc/assemble_tree.sbatch` as step 9d, with the same gate (qualified runs only, the acceptance verdicts,
+one schema major per tree, the expected file count; here each job's `grid_acceptance.json` from step 10b must
+record `passed` true), into two new trees beside the schema-1 and `_v2` ones: one grid per dataset per tree
 (OR-036), which BBRsim's schema-2 reader enforces once G4-032 lands (one grid and one schema major per dataset ID).
 One paste (same shell as 10b):
 
@@ -796,7 +804,8 @@ When both have left the queue:
     for j in $GT1 $GT2; do grep -v ': OK$' /home/rshenoy/BBRSim/outputs/assemble_tree-$j.out; done
 
 Expected, as step 9d: every job's two polarization lines `qualified true` against 0.005; every dataset
-`schema_version 2.0`; `copied 14` (cracks) and `copied 21` (test world); `SHA256SUMS: 14 files, all OK` and
+`schema_version 2.0`; every job's `acceptance: grid_acceptance.json passed true (GRID35: PASS)`; `copied 14`
+(cracks) and `copied 21` (test world); `SHA256SUMS: 14 files, all OK` and
 `21 files`; the last line `== RESULT: PASS` with exit 0. A refusal names the job and its reason, and nothing is
 copied. If the acceptance failed, Slurm cancels both (`--kill-on-invalid-dep`).
 
