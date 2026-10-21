@@ -789,6 +789,27 @@ def reexport_job_dirs(source: SourceJob, job_id: str) -> JobDirs:
                            source.config.solver.frequency_ghz, job_id)
 
 
+def check_before_copy(source: SourceJob, reference: Mapping | None) -> None:
+    """--from-solved: refuse, before the source's project and ``.aedtresults`` (about 2.5 GB) are copied or AEDT
+    starts, what the configuration and this checkout can refuse: ``check_before_aedt``; a source whose manifest
+    records a gap material that is not vacuum (CDX-029); and a supplied column-order reference measured with other
+    exporter files or another PyAEDT (HF-041). The AEDT-side checks after the copy is opened stay the authority:
+    the AEDT version and the solid's material as AEDT reports it."""
+    from bbsim.session import pyaedt_version
+
+    check_before_aedt(source.config, reference)
+    geometry = source.manifest.get("geometry")
+    if isinstance(geometry, Mapping) and "material" in geometry and not is_vacuum(geometry["material"]):
+        raise ValueError(f"the source job's manifest records gap {vacuum_refusal(geometry['material'])}")
+    if reference is not None:
+        try:
+            installed = pyaedt_version()
+        except ImportError as exc:
+            raise DatasetV2Error(f"PyAEDT cannot be imported ({exc}), so the column-order reference cannot be "
+                                 "checked against it") from exc
+        dataset_v2.check_reference_before_aedt(dict(reference), installed, REPO_ROOT)
+
+
 def stage_solved_job(source: SourceJob, dirs: JobDirs) -> StagedProject:
     """Copy the source's solved project and its ``.aedtresults`` into the fresh job, before any AEDT session, as
     ``hpc/diagnose_poynting.py`` copies a solved job; AEDT opens only the copy, so the source is never written."""
@@ -897,7 +918,7 @@ def run_from_solved(source: SourceJob, dirs: JobDirs, job_id: str, reference: di
 
     t_start = time.perf_counter()
     cfg = source.config
-    check_before_aedt(cfg, reference)
+    check_before_copy(source, reference)
     staged = stage_solved_job(source, dirs)
     reexport = {"source_job": str(source.job_dir), "source_manifest_sha256": source.manifest_sha256,
                 "tool": REEXPORT_TOOL, "git_commit": git_commit()}
@@ -927,7 +948,7 @@ def _main_from_solved(args: argparse.Namespace) -> int:
         source = load_source_job(args.from_solved)
         if args.column_order_reference is not None:
             reference = load_reference(args.column_order_reference)
-        check_before_aedt(source.config, reference)
+        check_before_copy(source, reference)
         dirs = reexport_job_dirs(source, args.job_id)
     except (OSError, ValueError) as exc:
         print(f"refused before the job started: {exc}", file=sys.stderr)

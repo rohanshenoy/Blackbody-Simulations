@@ -88,10 +88,16 @@ def aedt_session(project_path: Path | None, design: str | None, version: str = "
             log.exception("release_desktop failed")
 
 
-def aedt_versions(hfss: Any) -> dict[str, str]:
+def pyaedt_version() -> str:
+    """The installed PyAEDT's version string, exactly as ``aedt_versions`` records it; needs no AEDT session, so a
+    run can compare it with a column-order reference before copying anything."""
     import ansys.aedt.core as core
 
-    versions = {"pyaedt": str(getattr(core, "__version__", "unknown"))}
+    return str(getattr(core, "__version__", "unknown"))
+
+
+def aedt_versions(hfss: Any) -> dict[str, str]:
+    versions = {"pyaedt": pyaedt_version()}
     try:
         versions["aedt"] = str(hfss.odesktop.GetVersion())
     except Exception as exc:  # noqa: BLE001

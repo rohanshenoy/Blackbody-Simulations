@@ -545,9 +545,23 @@ def check_reference_compatible(reference: dict, aedt_version: str, pyaedt_versio
     must discriminate. Then every exporter hash and both versions must equal the current ones; the first
     mismatch is named.
     """
+    _check_reference(reference, aedt_version, pyaedt_version, repo_root, with_aedt=True)
+
+
+def check_reference_before_aedt(reference: dict, pyaedt_version: str, repo_root: Path) -> None:
+    """``check_reference_compatible`` without the AEDT version, which only an open AEDT session can read: the
+    reference's shape and verdict, its exporter hashes against this checkout's files and its PyAEDT version against
+    the installed one. A run calls it before copying a solved project; ``check_reference_compatible`` stays the
+    authority once the session is open."""
+    _check_reference(reference, None, pyaedt_version, repo_root, with_aedt=False)
+
+
+def _check_reference(reference: dict, aedt_version: str | None, pyaedt_version: str, repo_root: Path, *,
+                     with_aedt: bool) -> None:
     if not isinstance(reference, Mapping):
         raise DatasetV2Error(f"the column-order reference must be an object, got {type(reference).__name__}")
-    _require_version("current aedt_version", aedt_version)
+    if with_aedt:
+        _require_version("current aedt_version", aedt_version)
     _require_version("current pyaedt_version", pyaedt_version)
     if set(reference) != set(_REFERENCE_KEYS):
         raise DatasetV2Error(
@@ -600,7 +614,8 @@ def check_reference_compatible(reference: dict, aedt_version: str, pyaedt_versio
             raise DatasetV2Error(
                 f"the column-order reference was measured with a different {name} (reference sha256 "
                 f"{exporter[name]}, current {current[name]}): export the reference again")
-    for name, now in (("aedt_version", aedt_version), ("pyaedt_version", pyaedt_version)):
+    current_versions = (("aedt_version", aedt_version),) if with_aedt else ()
+    for name, now in (*current_versions, ("pyaedt_version", pyaedt_version)):
         if reference[name] != now:
             raise DatasetV2Error(
                 f"the column-order reference was measured with {name} {reference[name]!r}, the current one is "
