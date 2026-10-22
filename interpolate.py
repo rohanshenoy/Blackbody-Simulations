@@ -11,12 +11,6 @@ import numpy as np
 from scipy.interpolate import RegularGridInterpolator, griddata
 import matplotlib.pyplot as plt
 
-frequencies = [500, 550, 600]
-project_name = "InfParallelPlate"
-design_name = "interpolate"
-repo_root = os.path.dirname(os.path.abspath(__file__))
-sim_data_location = os.path.join(repo_root, "HFSSSimData")
-
 def filter_by_variables(predictor_variables, response_variables, df):
     # Keep only predictor + response columns
     df_filtered = df[predictor_variables + response_variables].drop_duplicates()
@@ -75,103 +69,62 @@ def interpolate_and_save(df, predictor_variables, response_variables, output_fol
 
     return export_df  # return the interpolated DataFrame for further use
 
-#%%
 
-for freq in frequencies:
-    for Ephi in [0, 1]:
-        freq_sim_data_location = f"{project_name}_{design_name}_{freq}GHz_Ephi={Ephi}"
-        freq_sim_data_folder = os.path.join(sim_data_location, freq_sim_data_location)
+def main(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(description="Interpolate refined S21 grids onto a fine angular grid.")
+    parser.add_argument("--sim-data-root",
+                        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "HFSSSimData"))
+    parser.add_argument("--project", default="InfParallelPlate")
+    parser.add_argument("--design", default="interpolate")
+    parser.add_argument("--frequencies", type=int, nargs="+", default=[500, 550, 600])
+    args = parser.parse_args(argv)
 
-        waveguide_path = os.path.join(freq_sim_data_folder, "refined_waveguide.csv")
-        far_field_path = os.path.join(freq_sim_data_folder, "refined_far_field.csv")
+    for freq in args.frequencies:
+        for Ephi in [0, 1]:
+            freq_sim_data_location = f"{args.project}_{args.design}_{freq}GHz_Ephi={Ephi}"
+            freq_sim_data_folder = os.path.join(args.sim_data_root, freq_sim_data_location)
+            waveguide_path = os.path.join(freq_sim_data_folder, "refined_waveguide.csv")
+            far_field_path = os.path.join(freq_sim_data_folder, "refined_far_field.csv")
 
-        if os.path.exists(waveguide_path):
+            if not os.path.exists(waveguide_path):
+                print(f"Missing file: {waveguide_path}")
+                continue  # the legacy loop crashed on an undefined DataFrame here
             waveguide_df = pd.read_csv(waveguide_path)
             print(f"Loaded refined_waveguide.csv for freq={freq} GHz, Ephi={Ephi}")
-            
             # Add a outgoing power fraction column
             waveguide_df["OutgoingPowerFraction"] = (
                 waveguide_df["OutgoingPower"] / waveguide_df["IngoingPower"]
             ).clip(upper=1.0)
-        else:
-            print(f"Missing file: {waveguide_path}")
 
-        if os.path.exists(far_field_path):
-            far_field_df = pd.read_csv(far_field_path)
-            print(f"Loaded refined_far_field.csv for freq={freq} GHz, Ephi={Ephi}")
-        else:
-            print(f"Missing file: {far_field_path}")
-        
-        S21_predictor_variables = ["IWaveTheta", "IWavePhi"]
-        S21_response_variables = ["OutgoingPowerFraction"]
-        S21_df = filter_by_variables(S21_predictor_variables, S21_response_variables,
-                                               waveguide_df)
-        
-        exit_E_predictor_variables = ["IWaveTheta", "IWavePhi", "X", "Y", "Z"]
-        exit_E_response_variables = ["Ex_real", "Ey_real", "Ez_real", "Ex_imag", "Ey_imag", "Ez_imag"]
-        exit_E_df = filter_by_variables(exit_E_predictor_variables, exit_E_response_variables,
-                                               waveguide_df)
-        
-        far_field_E_predictor_variables = ["IWaveTheta", "IWavePhi", "Theta", "Phi"]
-        far_field_E_response_variables = ["rEphi_real", "rEphi_imag", "rEtheta_real", "rEtheta_imag"]
-        far_field_E_df = filter_by_variables(far_field_E_predictor_variables, far_field_E_response_variables,
-                                               far_field_df)
-        
-        # Dictionary of resolutions
-        # resolutions = {
-        #     "IWaveTheta": 0.1, # degrees
-        #     "IWavePhi": 0.1, # degrees
-        #     "X": 1e-5, # meters
-        #     "Y": 1e-5, # meters
-        #     "Z": 1e-5, # meters
-        #     "Theta": 0.1, # degrees
-        #     "Phi": 0.1 # degrees
-        # }
-        
-        S21_resolutions = {
-            "IWaveTheta": 0.1, # degrees
-            "IWavePhi": 0.1, # degrees
-        }
-        
-        S21_interpolated_df = interpolate_and_save(
-            df=S21_df,
-            predictor_variables=S21_predictor_variables,
-            response_variables=S21_response_variables,
-            output_folder=freq_sim_data_folder,
-            resolutions=S21_resolutions,
-            method='linear',
-            save_to_csv = True
-        )
-        
-        # THE CODE BELOW TAKES TOO LONG TO RUN. Need a different approach, POD + modal coefficients perhaps
-        # exit_E_resolutions = {
-        #     "IWaveTheta": 0.1, # degrees
-        #     "IWavePhi": 0.1, # degrees
-        #     "X": 1e-5, # meters
-        #     "Y": 1e-5, # meters
-        #     "Z": 1e-5, # meters
-        # }
-        
-        # exit_E_interpolated_df = interpolate_and_save(
-        #     df=exit_E_df,
-        #     predictor_variables=exit_E_predictor_variables,
-        #     response_variables=exit_E_response_variables,
-        #     output_folder=freq_sim_data_folder,
-        #     resolutions=exit_E_resolutions,
-        #     method='linear', 
-        #     save_to_csv = False
-        # )
-        
-        # PLOT THE INTERPOLATED S21 GRID
-        # plt.figure(figsize=(8,6))
-        # plt.imshow(
-        #     S21_grid, 
-        #     extent=[Theta_grid.min(), Theta_grid.max(), Phi_grid.min(), Phi_grid.max()],
-        #     origin='lower',
-        #     aspect='auto',
-        #     cmap='viridis'
-        # )
-        # plt.colorbar(label='S21 (OutgoingPowerFraction)')
-        # plt.xlabel('IWaveTheta [degrees]')
-        # plt.ylabel('IWavePhi [degrees]')
-        # plt.title('Interpolated S21 Heatmap')
+            if os.path.exists(far_field_path):
+                far_field_df = pd.read_csv(far_field_path)
+                print(f"Loaded refined_far_field.csv for freq={freq} GHz, Ephi={Ephi}")
+            else:
+                print(f"Missing file: {far_field_path}")
+                far_field_df = None
+
+            S21_predictor_variables = ["IWaveTheta", "IWavePhi"]
+            S21_response_variables = ["OutgoingPowerFraction"]
+            S21_df = filter_by_variables(S21_predictor_variables, S21_response_variables, waveguide_df)
+
+            S21_resolutions = {
+                "IWaveTheta": 0.1,  # degrees
+                "IWavePhi": 0.1,  # degrees
+            }
+            interpolate_and_save(
+                df=S21_df,
+                predictor_variables=S21_predictor_variables,
+                response_variables=S21_response_variables,
+                output_folder=freq_sim_data_folder,
+                resolutions=S21_resolutions,
+                method='linear',
+                save_to_csv=True,
+            )
+            # The exit-field and far-field interpolations in the original script were commented out
+            # as too slow ("POD + modal coefficients perhaps"); far_field_df is loaded for that future work.
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

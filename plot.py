@@ -293,30 +293,40 @@ def plot_far_field_by_incoming_angle(csv_path,
     ax.set_yticklabels([f"{int(round(val))}" for val in y_ticks])
 
     plt.tight_layout()
-#%%
-waveguide_data = "C:/Users/Jason Wang/spyder/projects/Blackbody/Blackbody-Simulations/HFSSSimData/InfParallelPlate_bbsim13_500GHz_Ephi=1/waveguide.csv"
-far_field_data = "C:/Users/Jason Wang/spyder/projects/Blackbody/Blackbody-Simulations/HFSSSimData/InfParallelPlate_bbsim13_500GHz_Ephi=1/far_field.csv"
-#%%
-pivot = load_and_pivot(waveguide_data)
 
-plot_outgoing_power_heatmap(pivot, r"$P_{out}$ vs $\theta_{in}$ and $\phi_{in}$ (E$_\phi$=1)")
-#%%
-plot_outgoing_power_by_incoming_angle(waveguide_data, fixed_param=r"$\theta_{in}$", fixed_values=[165, 180])
-#%%
-plot_outgoing_power_by_incoming_angle(waveguide_data, fixed_param=r"$\phi_{in}$", fixed_values=[0, 12, 24])
-#%%
-plot_exit_field_by_incoming_angle(csv_path=waveguide_data, theta_in =180, phi_in = 0, fixed_coord="X", x_axis="Z", y_axis="Y", fixed_value=0)
-#%%
-plot_far_field_by_incoming_angle_fixed(
-    csv_path=far_field_data,
-    theta_in_list=[180],
-    phi_in_list=[0],
-    fixed_param=r"$\theta_{out}$",
-    fixed_value=90
-)
-#%%
-plot_far_field_by_incoming_angle(
-    csv_path=far_field_data,
-    theta_in=180,
-    phi_in=0
-)
+
+def main(argv=None):
+    import argparse
+    import os
+    parser = argparse.ArgumentParser(description="Plot HFSS gap exports (waveguide.csv, far_field.csv).")
+    parser.add_argument("dataset_dir", help="Directory containing waveguide.csv and far_field.csv")
+    parser.add_argument("--out-dir", default=None, help="Save PNGs here instead of opening windows")
+    parser.add_argument("--theta-in", type=float, default=180.0)
+    parser.add_argument("--phi-in", type=float, default=0.0)
+    args = parser.parse_args(argv)
+    if args.out_dir:
+        plt.switch_backend("Agg")
+
+    waveguide_data = os.path.join(args.dataset_dir, "waveguide.csv")
+    far_field_data = os.path.join(args.dataset_dir, "far_field.csv")
+
+    pivot = load_and_pivot(waveguide_data)
+    plot_outgoing_power_heatmap(pivot, r"$P_{out}$ vs $\theta_{in}$ and $\phi_{in}$")
+    plot_outgoing_power_by_incoming_angle(waveguide_data, fixed_param=r"$\theta_{in}$", fixed_values=[args.theta_in])
+    plot_exit_field_by_incoming_angle(csv_path=waveguide_data, theta_in=args.theta_in, phi_in=args.phi_in,
+                                      fixed_coord="X", x_axis="Z", y_axis="Y", fixed_value=0)
+    plot_far_field_by_incoming_angle_fixed(csv_path=far_field_data, theta_in_list=[args.theta_in],
+                                           phi_in_list=[args.phi_in], fixed_param=r"$\theta_{out}$", fixed_value=90)
+    plot_far_field_by_incoming_angle(csv_path=far_field_data, theta_in=args.theta_in, phi_in=args.phi_in)
+
+    if args.out_dir:
+        os.makedirs(args.out_dir, exist_ok=True)
+        for i, num in enumerate(plt.get_fignums(), start=1):
+            plt.figure(num).savefig(os.path.join(args.out_dir, f"figure_{i:02d}.png"), dpi=150)
+    else:
+        plt.show()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

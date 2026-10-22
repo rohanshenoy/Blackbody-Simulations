@@ -1,0 +1,20 @@
+{
+  "renames": [
+    {
+      "source_design": "crack1Rohan",
+      "source_object": "crack1",
+      "new_design": "parallel_plate_gap_50um",
+      "new_object": "gap",
+      "dataset_id": "InfParallelPlate_crack1Rohan",
+      "gap_um": 50
+    },
+    {
+      "source_design": "crack2",
+      "source_object": "crack2",
+      "new_design": "parallel_plate_gap_100um",
+      "new_object": "gap",
+      "dataset_id": "InfParallelPlate_crack2",
+      "gap_um": 100
+    }
+  ]
+}
