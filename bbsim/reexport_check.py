@@ -10,7 +10,8 @@ of its solved project (HF-050). On the HPC this is the gate before the ``_v2`` t
 checkout that made the re-export: the embedded column-order reference is checked against this checkout's exporter
 files, as the runner checks it.
 
-``--preflight`` runs before the re-export, so that ``hpc/reexport_v2.sbatch`` refuses before any AEDT session starts:
+``--preflight`` runs before the re-export, so that ``reexport.sbatch`` (bbrsim-bridge scripts/hpc/hfss) refuses
+before any AEDT session starts:
 the --poynting record must exist, be made on this source (its ``manifest_sha256``) and hold every key of the source
 manifest's excitation lists for both polarizations, each with a finite ``exit.flux_z_w``. It reads step 8b's record
 with the same parser as the ``powers.poynting`` row below (``read_poynting``). It prints ``PREFLIGHT: PASS`` and
@@ -39,7 +40,8 @@ declaration that a manifest or a CSV header contradicts fails before any value i
    raw flux otherwise (OR-038); t_flux = OutgoingPower / (A I);
    IngoingPower = A I; InterceptFactor constant within each key and equal to c_key, itself recomputed from the
    declared grid, to 1e-12 (OR-034); the fresh |Re S| equal to the source's OutgoingPower to 1e-4; with
-   ``--poynting`` (hpc/diagnose_poynting.py's poynting.json), the raw flux equal to step 8b's ``flux_z_w`` to 1e-4,
+   ``--poynting`` (step 8b's poynting.json, written by ``diagnose_poynting.py``, archived in bbrsim-bridge
+   scripts/hpc/hfss/archive/), the raw flux equal to step 8b's ``flux_z_w`` to 1e-4,
    absolute 1e-12 A I at zero (CDX-009).
 7. Convergence (CDX-025): the source's saved tables re-qualified at its recorded target; both polarizations must
    qualify and agree field by field with the fresh qualification, and with the source manifest's record if it has one.
@@ -1165,7 +1167,7 @@ class _Acceptance:
 
 def read_poynting(data: object, keys: Sequence[tuple[float, float]], manifest_sha256: str
                   ) -> tuple[dict[tuple[int, int], float], list[str]]:
-    """The exit ``flux_z_w`` of every (Ephi, key index) in step 8b's record (``hpc/diagnose_poynting.py``'s
+    """The exit ``flux_z_w`` of every (Ephi, key index) in step 8b's record (the archived ``diagnose_poynting.py``'s
     ``poynting.json``), and what is wrong with the record, each problem named: made on another job than the one whose
     manifest hashes to ``manifest_sha256``; a record unreadable, off ``keys`` or repeated; a polarization absent; the
     declared keys a polarization lacks. ``keys`` are the declared (phi, theta) keys in degrees."""
