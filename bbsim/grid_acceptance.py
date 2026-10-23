@@ -31,9 +31,16 @@ Rows, in order (the first stops the rest when it fails, as nothing else can be r
 4. grid.reference: the reference sidecar declares every shared key.
 5. tables: both polarizations' ``waveguide.csv`` of both jobs readable, their leading columns Freq, Ephi, IWavePhi,
    IWaveTheta, OutgoingPower, IngoingPower (the same in both schemas, read by position), every key angle finite.
-6. powers.ingoing: IngoingPower finite, positive and constant within each table, and equal between the new and the
+6. tables.keys: every table's rows lie at exactly one key of its own sidecar's declared product grid, every declared
+   key has rows, every key the same number, and that number is the same in both polarizations of a job (CDX-040: the
+   nine shared keys alone must not certify a table that lacks the other 26).
+7. tables.identity: every row's Freq is its sidecar's frequency_label and its Ephi the directory's polarization
+   (CDX-040). BBRsim reads the polarization from the directory name, never this column; the row checks only that
+   the producer's record is consistent. Rows 6 and 7 read ``waveguide.csv`` only: BBRsim checks ``far_field.csv``'s
+   keys, Freq and rows per key at load (BBR007, BBR009, BBR012).
+8. powers.ingoing: IngoingPower finite, positive and constant within each table, and equal between the new and the
    reference tables, to 1e-9 relative (same geometry, same Ei: the key's constant A I).
-7. transmittance.shared_keys: per shared key and polarization, where T_ref >= 1e-3 x the polarization's largest
+9. transmittance.shared_keys: per shared key and polarization, where T_ref >= 1e-3 x the polarization's largest
    T_ref over the shared keys, |T_new - T_ref| <= t_rel_tol x T_ref; keys below that band are reported as noise and
    do not fail (crack1's E-along-slot polarization at normal incidence carries T about 1e-10); a noise row whose
    T_new lies inside the band carries a note saying so.
@@ -84,7 +91,7 @@ KEY_DEG = dataset_v2.KEY_TOL_DEG
 NEW_MAJOR, REFERENCE_MAJOR = "2", "1"
 # The waveguide table's first six columns, the same labels and positions in schema 1.0 and 2.0.
 LEADING_COLUMNS = ["Freq", "Ephi", "IWavePhi", "IWaveTheta", "OutgoingPower", "IngoingPower"]
-PHI, THETA, OUTGOING, INGOING = 2, 3, 4, 5
+FREQ, EPHI, PHI, THETA, OUTGOING, INGOING = 0, 1, 2, 3, 4, 5
 
 
 # --- small helpers ---------------------------------------------------------------------------------------------------
@@ -187,8 +194,9 @@ class _Job:
     label: str
     root: Path
     sidecar: dict = field(default_factory=dict)
-    # Per Ephi, the columns this acceptance reads, as floats: phi, theta, IngoingPower, and (reference only)
-    # OutgoingPower. The new job's stored OutgoingPower, the schema-2 flux, is never read.
+    # Per Ephi, the columns this acceptance reads: Freq as strings ("freq"), and as floats Ephi, phi, theta,
+    # IngoingPower and (reference only) OutgoingPower. The new job's stored OutgoingPower, the schema-2 flux, is
+    # never read.
     tables: dict[int, dict[str, np.ndarray]] = field(default_factory=dict)
 
     def waveguide(self, ephi: int) -> Path:
@@ -216,6 +224,7 @@ class _Acceptance:
             return checks
         for name, step in (("identity", self._identity), ("grid.new", self._grid_new),
                            ("grid.reference", self._grid_reference), ("tables", self._tables),
+                           ("tables.keys", self._table_keys), ("tables.identity", self._table_identity),
                            ("powers.ingoing", self._ingoing), ("transmittance.shared_keys", self._transmittance)):
             checks.append(self._guard(name, step))
         return checks
@@ -280,7 +289,7 @@ class _Acceptance:
     def _tables(self) -> Check:
         problems = []
         for job in (self.new, self.reference):
-            columns = {"phi": PHI, "theta": THETA, "in": INGOING}
+            columns = {"ephi": EPHI, "phi": PHI, "theta": THETA, "in": INGOING}
             if job is self.reference:
                 columns["out"] = OUTGOING
             for ephi in (0, 1):
@@ -291,15 +300,16 @@ class _Acceptance:
                     if header[:len(LEADING_COLUMNS)] != LEADING_COLUMNS:
                         raise _Refused(f"{at} ({path}) begins {header[:len(LEADING_COLUMNS)]}, not "
                                        f"{LEADING_COLUMNS}")
-                    raw = pd.read_csv(path, usecols=sorted(columns.values()), header=0)
+                    raw = pd.read_csv(path, usecols=[FREQ, *sorted(columns.values())], header=0,
+                                      dtype={LEADING_COLUMNS[FREQ]: str}, keep_default_na=False)
                 except _Refused as exc:
                     problems.append(str(exc))
                     continue
                 except (OSError, ValueError) as exc:
                     problems.append(f"{at} is unreadable: {exc}")
                     continue
-                values = {name: pd.to_numeric(raw.iloc[:, sorted(columns.values()).index(pos)],
-                                              errors="coerce").to_numpy(dtype=float)
+                read = [FREQ, *sorted(columns.values())]
+                values = {name: pd.to_numeric(raw.iloc[:, read.index(pos)], errors="coerce").to_numpy(dtype=float)
                           for name, pos in columns.items()}
                 bad = ~(np.isfinite(values["phi"]) & np.isfinite(values["theta"]))
                 if bad.any():
@@ -309,6 +319,7 @@ class _Acceptance:
                 if not len(values["phi"]):
                     problems.append(f"{at} has no rows")
                     continue
+                values["freq"] = np.asarray(raw[LEADING_COLUMNS[FREQ]].tolist(), dtype=object)
                 job.tables[ephi] = values
         summary = "" if problems else "; ".join(
             f"{job.label} {len(job.tables[0]['phi'])} / {len(job.tables[1]['phi'])} rows (Ephi=0 / 1)"
@@ -320,7 +331,80 @@ class _Acceptance:
         table = job.tables[ephi]
         return np.flatnonzero((np.abs(table["phi"] - key[0]) <= KEY_DEG) & (np.abs(table["theta"] - key[1]) <= KEY_DEG))
 
-    # -- 6. IngoingPower ------------------------------------------------------------------------------------------
+    # -- 6, 7. the tables' actual keys and identity (CDX-040) ----------------------------------------------------------
+    def _declared_keys(self, job: _Job) -> list[tuple[float, float]]:
+        where = f"the {job.label} sidecar"
+        phis = _axis(job.sidecar, "incident_phi_deg", where)
+        thetas = _axis(job.sidecar, "incident_theta_deg", where)
+        return [(p, t) for p in phis for t in thetas]
+
+    def _table_keys(self) -> Check:
+        problems: list[str] = []
+        summary: list[str] = []
+        for job in (self.new, self.reference):
+            keys = self._declared_keys(job)
+            per_key_rows: dict[int, int] = {}
+            for ephi in (0, 1):
+                at = f"the {job.label} Ephi={ephi} table"
+                if ephi not in job.tables:
+                    problems.append(f"{at} is not usable (tables)")
+                    continue
+                table = job.tables[ephi]
+                index = dataset_v2.key_index(table["phi"], table["theta"], keys)
+                off = np.flatnonzero(index < 0)
+                if off.size:
+                    i = int(off[0])
+                    problems.append(f"{at}: {off.size} rows at no single declared key, the first at "
+                                    f"{key_text((float(table['phi'][i]), float(table['theta'][i])))}")
+                    continue
+                counts = np.bincount(index, minlength=len(keys))
+                missing = np.flatnonzero(counts == 0)
+                if missing.size:
+                    problems.append(f"{at}: {missing.size} declared keys have no rows, the first "
+                                    f"{key_text(keys[int(missing[0])])}")
+                    continue
+                uneven = np.flatnonzero(counts != counts[0])
+                if uneven.size:
+                    k = int(uneven[0])
+                    problems.append(f"{at}: {int(counts[k])} rows at {key_text(keys[k])} against {int(counts[0])} at "
+                                    f"{key_text(keys[0])}: not the same rows per key")
+                    continue
+                per_key_rows[ephi] = int(counts[0])
+            if len(per_key_rows) == 2:
+                if per_key_rows[0] != per_key_rows[1]:
+                    problems.append(f"the {job.label} job: {per_key_rows[0]} rows per key in Ephi=0 against "
+                                    f"{per_key_rows[1]} in Ephi=1")
+                else:
+                    summary.append(f"{job.label} {len(keys)} keys x {per_key_rows[0]} rows")
+        return _row("tables.keys", "every table's rows at exactly its sidecar's declared keys, every declared key with "
+                    "rows, the same rows per key in both polarizations", problems,
+                    ", ".join(summary) + ", both polarizations")
+
+    def _table_identity(self) -> Check:
+        problems: list[str] = []
+        for job in (self.new, self.reference):
+            label = job.sidecar.get("frequency_label")
+            for ephi in (0, 1):
+                at = f"the {job.label} Ephi={ephi} table"
+                if ephi not in job.tables:
+                    problems.append(f"{at} is not usable (tables)")
+                    continue
+                table = job.tables[ephi]
+                wrong = np.flatnonzero(table["freq"] != label)
+                if wrong.size:
+                    i = int(wrong[0])
+                    problems.append(f"{at}: Freq {table['freq'][i]!r} on {wrong.size} rows (the first at row {i}), not "
+                                    f"the sidecar's frequency_label {label!r}")
+                wrong = np.flatnonzero(~(table["ephi"] == ephi))
+                if wrong.size:
+                    i = int(wrong[0])
+                    problems.append(f"{at}: Ephi {float(table['ephi'][i])!r} on {wrong.size} rows (the first at row "
+                                    f"{i}), not the directory's {ephi}")
+        return _row("tables.identity", "every row's Freq its sidecar's frequency_label and its Ephi the directory's "
+                    "polarization (the producer's record; BBRsim reads the directory)", problems,
+                    f"Freq {self.new.sidecar.get('frequency_label')} and Ephi 0 / 1 on every row of the four tables")
+
+    # -- 8. IngoingPower ------------------------------------------------------------------------------------------
     def _ingoing(self) -> Check:
         problems = []
         constants: dict[tuple[str, int], float] = {}
@@ -360,7 +444,7 @@ class _Acceptance:
                     f"the jobs, to {INGOING_REL:g} relative (the key's constant A I)", problems,
                     f"A I = {next(iter(constants.values()))!r} W in all four tables" if constants else "")
 
-    # -- 7. the comparison ---------------------------------------------------------------------------------------
+    # -- 9. the comparison ---------------------------------------------------------------------------------------
     def _new_records(self) -> tuple[dict[int, Mapping], dict[int, str], list[str]]:
         """The new sidecar's transmittance.per_key records at the shared keys, by shared key index; the shared keys
         whose record is unusable, with why; and what is wrong with the list itself."""
