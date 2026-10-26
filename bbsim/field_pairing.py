@@ -706,6 +706,24 @@ def compare_jobs(new_job: Path, ref_job: Path, inputs: InputCapture,
     return compare_sides(new, ref, keys)
 
 
+def _policy_problem(mode: object, tol: object) -> str | None:
+    """Why ``mode`` and ``tol`` are not a policy, or None: measure records no tolerance, enforce needs a finite positive
+    one, and there is no other mode."""
+    if mode == "measure":
+        return None if tol is None else f"policy {POLICY}: measure mode records no tolerance, got {tol!r}"
+    if mode != "enforce":
+        return f"policy {POLICY}: unknown mode {mode!r}, expected 'measure' or 'enforce'"
+    if isinstance(tol, bool) or not isinstance(tol, (int, float)) or not np.isfinite(tol) or tol <= 0.0:
+        return f"policy {POLICY}: enforce mode needs a finite positive tolerance, got {tol!r}"
+    return None
+
+
+def metric_severity() -> str:
+    """The ``.pointwise`` row's severity under the current MODE and TOL: info only while a valid policy measures. An
+    enforced policy fails the row, and so does an invalid one, which is refused rather than recorded as a measurement."""
+    return "info" if MODE == "measure" and _policy_problem(MODE, TOL) is None else "fail"
+
+
 def verdict(result: PairingResult, mode: str | None = None, tol: float | None = None) -> tuple[str, list[str]]:
     """("not judged" | "pass" | "fail", failures) under the policy: ``mode`` and ``tol`` default to the module's
     MODE and TOL at call time. Measure mode judges nothing. Enforce mode (TOL finite and positive) fails a dark/lit
@@ -714,14 +732,11 @@ def verdict(result: PairingResult, mode: str | None = None, tol: float | None = 
     refused."""
     mode = MODE if mode is None else mode
     tol = TOL if tol is None and mode == MODE else tol
+    problem = _policy_problem(mode, tol)
+    if problem:
+        raise PairingRefused(problem)
     if mode == "measure":
-        if tol is not None:
-            raise PairingRefused(f"policy {POLICY}: measure mode records no tolerance, got {tol!r}")
         return "not judged", []
-    if mode != "enforce":
-        raise PairingRefused(f"policy {POLICY}: unknown mode {mode!r}, expected 'measure' or 'enforce'")
-    if isinstance(tol, bool) or not isinstance(tol, (int, float)) or not np.isfinite(tol) or tol <= 0.0:
-        raise PairingRefused(f"policy {POLICY}: enforce mode needs a finite positive tolerance, got {tol!r}")
     failures = []
     seen = set()
     for km in result.keys:
@@ -746,7 +761,8 @@ def _band() -> str:
 
 def checks(prefix: str, result: PairingResult) -> list[Check]:
     """``<prefix>.pointwise.inputs`` (severity fail: every refusal, an empty key intersection included) and
-    ``<prefix>.pointwise`` (severity info while MODE is measure, else fail) for ``result`` under the current policy.
+    ``<prefix>.pointwise`` (``metric_severity()``: info only while a valid policy measures) for ``result`` under the
+    current policy.
     A metric row whose verdict is "not judged" carries that verdict in its values; it claims no numerical agreement."""
     from bbsim.acceptance_rows import MAX_LISTED, row
 
@@ -778,5 +794,5 @@ def checks(prefix: str, result: PairingResult) -> list[Check]:
               f"({cov.get('all_dark_keys', 0)} all-dark keys, {cov.get('transitions', 0)} dark/lit transitions)"
               + (f"; largest {largest}" if largest else ""))
     values = {"verdict": status, "mode": mode, "tol": tol, "policy": POLICY, **result.to_dict(), "failures": failures}
-    metric = Check(f"{prefix}.pointwise", status != "fail", "info" if mode == "measure" else "fail", detail, values)
+    metric = Check(f"{prefix}.pointwise", status != "fail", metric_severity(), detail, values)
     return [inputs, metric]

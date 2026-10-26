@@ -119,7 +119,7 @@ def tolerances(t_rel_tol: float = T_REL_TOL) -> dict[str, object]:
 def required_rows() -> dict[str, str]:
     """The pointwise rows a grid report must hold, by name, at their severity under the current policy (assembly's
     ``acceptance_gate.expected_rows``)."""
-    return {"fields.pointwise.inputs": "fail", "fields.pointwise": "info" if field_pairing.MODE == "measure" else "fail"}
+    return {"fields.pointwise.inputs": "fail", "fields.pointwise": field_pairing.metric_severity()}
 
 
 # --- small helpers ---------------------------------------------------------------------------------------------------
