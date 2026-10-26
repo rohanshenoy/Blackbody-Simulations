@@ -48,10 +48,11 @@ def get(mapping: object, *path: str, where: str, default: object = _MISSING) -> 
         return default
 
 
-def read_json(path: Path, what: str) -> dict:
-    """A JSON object from ``path``; an unreadable file or anything but an object is refused."""
+def read_json(path: Path, what: str, *, read_text: Callable[[Path], str] | None = None) -> dict:
+    """A JSON object from ``path``, read with ``read_text`` (a checker passes its ``InputCapture.read_text``, so the
+    bytes parsed are the bytes its report binds; CDX-038); an unreadable file or anything but an object is refused."""
     try:
-        data = json.loads(Path(path).read_text())
+        data = json.loads(read_text(path) if read_text is not None else Path(path).read_text())
     except (OSError, ValueError) as exc:
         raise Refused(f"{what} {path} is unreadable: {exc}") from exc
     if not isinstance(data, dict):
