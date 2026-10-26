@@ -51,10 +51,10 @@ Rows, in order (the first stops the rest when it fails, as nothing else can be r
 11. fields.pointwise (CDX-026, S42): the common-normalized densities g0, g1 and h of the two solves compared point by
     point at the shared keys, for the exit field and the far field, each deviation scaled to its reference maximum
     (``field_pairing``). A relative sign or phase between the polarizations, invisible to every integrated quantity
-    where the overlap integrates to zero, moves h. Severity info with the verdict "not judged" while the policy's mode
-    is measure (the first run on the October jobs measures; Rohan sets the tolerance from those values), fail once it
-    is enforce. The policy (``field_pairing.policy()``) is part of ``tolerances()``, so a report made under another
-    policy is refused at assembly.
+    where the overlap integrates to zero, moves h. Enforced (HF-055, HF-056): severity fail, each deviation judged
+    against its field's tolerance, exit 0.1 and far field 0.02, set from the October jobs' measuring run. Under a
+    measuring policy the row is severity info with the verdict "not judged". The policy (``field_pairing.policy()``)
+    is part of ``tolerances()``, so a report made under another policy is refused at assembly.
 12. binding.inputs (CDX-038): every file the rows read was read through one ``acceptance_gate.InputCapture``, so each
     was hashed as it was parsed; at the end every core file of both jobs (``acceptance_gate.job_files``) is hashed
     again, the manifests only for their hash, and any file whose bytes changed fails the row. The report's
@@ -202,7 +202,8 @@ class GridResult(RowVerdicts):
         lines = [f"new:       {self.new_job}", f"reference: {self.reference_job}",
                  f"tolerances: t_rel_tol={self.t_rel_tol:g} noise_rel={NOISE_REL:g} ingoing_rel={INGOING_REL:g}",
                  f"pointwise: fields_pointwise_policy={policy['fields_pointwise_policy']} "
-                 f"mode={policy['fields_pointwise_mode']} tol={policy['fields_pointwise_tol']}", ""]
+                 f"mode={policy['fields_pointwise_mode']} "
+                 f"tol={field_pairing.tol_text(policy['fields_pointwise_tol'])}", ""]
         for c in self.checks:
             status = ("PASS" if c.passed else "FAIL") if c.severity == "fail" else ("INFO" if c.passed else "SKIP")
             if c.values.get("verdict") == "not judged":          # the pointwise row: skipped, not agreed (S42)

@@ -51,8 +51,11 @@ if TYPE_CHECKING:
     from bbsim.extract import ExitGrid
 
 POLICY = "bbsim-pointwise-pair/1"
-MODE = "measure"                    # "measure": report only; "enforce": judge against TOL
-TOL: float | None = None            # set from the measured October values when enforcement starts
+MODE = "enforce"                    # "measure": report only; "enforce": judge each field against its TOL
+# One tolerance per field, between that field's noise and what a relative sign flip produces (HF-055, HF-056): on the
+# October pairs the largest d was 0.0229 (exit) and 0.0015 (far), the smallest flip d_h 0.464 (exit) and 0.0851 (far).
+TOL: dict[str, float] | None = {"exit": 0.1, "far": 0.02}
+TOL_FIELDS = ("exit", "far")
 SUPPORT_MIN = dataset_v2.OUTWARD_GUARD    # far-field support: sin(Theta) cos(Phi) >= this
 COORD_M = 1e-12                     # exit-point identity, m
 ANGLE_DEG = 1e-9                    # far-field angle identity, deg
@@ -69,7 +72,8 @@ _FAR_COORDS = ["Theta", "Phi"]
 
 def policy() -> dict[str, object]:
     """The comparison policy a grid acceptance report records and assembly expects, read at call time."""
-    return {"fields_pointwise_policy": POLICY, "fields_pointwise_mode": MODE, "fields_pointwise_tol": TOL,
+    return {"fields_pointwise_policy": POLICY, "fields_pointwise_mode": MODE,
+            "fields_pointwise_tol": dict(TOL) if isinstance(TOL, Mapping) else TOL,
             "fields_pointwise_support_min": SUPPORT_MIN, "fields_pointwise_coord_m": COORD_M,
             "fields_pointwise_angle_deg": ANGLE_DEG, "fields_pointwise_dark_floor": DARK_FLOOR,
             "fields_pointwise_dark_ratio": DARK_RATIO, "fields_pointwise_lit_ratio": LIT_RATIO,
@@ -707,15 +711,26 @@ def compare_jobs(new_job: Path, ref_job: Path, inputs: InputCapture,
 
 
 def _policy_problem(mode: object, tol: object) -> str | None:
-    """Why ``mode`` and ``tol`` are not a policy, or None: measure records no tolerance, enforce needs a finite positive
-    one, and there is no other mode."""
+    """Why ``mode`` and ``tol`` are not a policy, or None: measure records no tolerance, enforce needs one finite
+    positive tolerance for each field in ``TOL_FIELDS`` and no other, and there is no other mode."""
     if mode == "measure":
         return None if tol is None else f"policy {POLICY}: measure mode records no tolerance, got {tol!r}"
     if mode != "enforce":
         return f"policy {POLICY}: unknown mode {mode!r}, expected 'measure' or 'enforce'"
-    if isinstance(tol, bool) or not isinstance(tol, (int, float)) or not np.isfinite(tol) or tol <= 0.0:
-        return f"policy {POLICY}: enforce mode needs a finite positive tolerance, got {tol!r}"
+    if not isinstance(tol, Mapping) or set(tol) != set(TOL_FIELDS) or not all(
+            isinstance(v, (int, float)) and not isinstance(v, bool) and np.isfinite(v) and v > 0.0
+            for v in tol.values()):
+        return (f"policy {POLICY}: enforce mode needs a finite positive tolerance for each of {list(TOL_FIELDS)} and "
+                f"no other, got {tol!r}")
     return None
+
+
+def tol_text(tol: object) -> str:
+    """``tol`` as printed beside the policy: "exit 0.1, far 0.02", or its repr when it is not a per-field mapping."""
+    if isinstance(tol, Mapping):
+        return ", ".join(f"{field} {value:g}" if isinstance(value, (int, float)) else f"{field} {value!r}"
+                         for field, value in tol.items())
+    return repr(tol)
 
 
 def metric_severity() -> str:
@@ -724,10 +739,12 @@ def metric_severity() -> str:
     return "info" if MODE == "measure" and _policy_problem(MODE, TOL) is None else "fail"
 
 
-def verdict(result: PairingResult, mode: str | None = None, tol: float | None = None) -> tuple[str, list[str]]:
+def verdict(result: PairingResult, mode: str | None = None,
+            tol: Mapping[str, float] | None = None) -> tuple[str, list[str]]:
     """("not judged" | "pass" | "fail", failures) under the policy: ``mode`` and ``tol`` default to the module's
-    MODE and TOL at call time. Measure mode judges nothing. Enforce mode (TOL finite and positive) fails a dark/lit
-    transition and any judged deviation above TOL, passes when at least one metric was judged, and is "not judged"
+    MODE and TOL at call time. Measure mode judges nothing. Enforce mode (one finite positive tolerance per field) fails
+    a dark/lit transition and any judged deviation above its field's tolerance, passes when at least one metric was
+    judged, and is "not judged"
     when every metric was legitimately skipped. Refusals are the inputs row's, in either mode. Any other policy is
     refused."""
     mode = MODE if mode is None else mode
@@ -745,8 +762,8 @@ def verdict(result: PairingResult, mode: str | None = None, tol: float | None = 
             failures.append(f"{key_text(km.key)}: dark/lit transition (new {km.states['new']}, reference "
                             f"{km.states['ref']})")
         for name, value in km.d.items():
-            if value > tol:
-                failures.append(f"{km.field} {name} at {key_text(km.key)}: d = {value:.4g} above {tol:g}")
+            if value > tol[km.field]:
+                failures.append(f"{km.field} {name} at {key_text(km.key)}: d = {value:.4g} above {tol[km.field]:g}")
     if failures:
         return "fail", failures
     return ("pass", []) if any(km.d for km in result.keys) else ("not judged", [])
@@ -783,7 +800,7 @@ def checks(prefix: str, result: PairingResult) -> list[Check]:
     if status == "not judged":
         said = f"not judged ({mode} mode)" if mode == "measure" else "not judged (every metric legitimately skipped)"
     elif status == "pass":
-        said = f"pass, every judged d <= {tol:g}"
+        said = f"pass, every judged d within its field's tolerance ({tol_text(tol)})"
     else:
         more = f"; and {len(failures) - MAX_LISTED} more" if len(failures) > MAX_LISTED else ""
         said = f"{len(failures)} failure(s): " + "; ".join(failures[:MAX_LISTED]) + more
@@ -793,6 +810,7 @@ def checks(prefix: str, result: PairingResult) -> list[Check]:
               f"metrics at {cov.get('keys_with_judged_metrics', 0)} keys, {cov.get('metrics_skipped', 0)} skipped "
               f"({cov.get('all_dark_keys', 0)} all-dark keys, {cov.get('transitions', 0)} dark/lit transitions)"
               + (f"; largest {largest}" if largest else ""))
-    values = {"verdict": status, "mode": mode, "tol": tol, "policy": POLICY, **result.to_dict(), "failures": failures}
+    values = {"verdict": status, "mode": mode, "tol": dict(tol) if isinstance(tol, Mapping) else tol, "policy": POLICY,
+              **result.to_dict(), "failures": failures}
     metric = Check(f"{prefix}.pointwise", status != "fail", metric_severity(), detail, values)
     return [inputs, metric]
