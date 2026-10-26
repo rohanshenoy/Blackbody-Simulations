@@ -1,8 +1,8 @@
-# The 35-key incidence grid of OR-036 (Rohan, 2026-10-19) for the round gap at 2000 GHz, HPC step 10: theta 90 to
-# 180 deg in 15 deg steps and phi 0 to 90 deg in 22.5 deg steps, both in the crack-local frame, so every key is
-# reachable. Derived from round_gap_r50um_2000GHz_reference.toml (MaxDeltaE 0.005, up to 20 passes, 5 deg wall
-# facets): only those six [excitation] lines and schema = 2 in [output] differ (tests/test_config.py pins that).
-# Run it with --column-order-reference, the file crack1's 35-key job keeps as
+# The 35-key incidence grid of OR-036 (Rohan, 2026-10-19) for the round gap at 2000 GHz, HPC step 10: theta 90 to 180
+# deg in 15 deg steps and phi 0 to 90 deg in 22.5 deg steps, both in the crack-local frame, so every key is reachable.
+# Derived from round_gap_r50um_2000GHz_reference.toml (MaxDeltaE 0.005, up to 20 passes, 5 deg wall facets): only
+# those six [excitation] lines, schema = 2 in [output] and the [acceptance] table differ (tests/test_config.py pins
+# that). Run it with --column-order-reference, the file crack1's 35-key job keeps as
 # scratch/column_order_reference.json (HF-041).
 
 [project]
@@ -60,3 +60,7 @@ root = "/home/rshenoy/BBRSim/outputs"
 polarizations = [0, 1]
 export_timeout_s = 300.0
 schema = 2
+
+[acceptance]
+kind = "grid_acceptance"
+reference_job = "/home/rshenoy/BBRSim/outputs/RoundGap_r50um_2000GHz/job_reference1"

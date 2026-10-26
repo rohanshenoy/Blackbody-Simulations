@@ -63,3 +63,6 @@ root = "/home/rshenoy/BBRSim/outputs"
 polarizations = [0]
 export_timeout_s = 300.0
 schema = 1  # schema 2 needs a theta = 90 deg key for its cell_90 divisor; this grid is theta = 180 only
+
+[acceptance]
+kind = "none"

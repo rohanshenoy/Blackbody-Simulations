@@ -56,3 +56,6 @@ resolution_mm = [0.0, 0.1, 0.001]
 root = "/home/rshenoy/BBRSim/outputs"
 polarizations = [0, 1]
 export_timeout_s = 300.0
+
+[acceptance]
+kind = "none"

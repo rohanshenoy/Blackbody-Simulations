@@ -176,7 +176,13 @@ def check_before_aedt(cfg: RunConfig, reference: Mapping | None) -> None:
     """Refuse, from the configuration alone and before any job copy or AEDT session, a run whose output cannot be
     written: under schema 1 a column-order reference (schema 1 neither needs nor applies it); under schema 2
     anything but both polarizations, a declared theta grid without a 90 deg key and one above it (``cell_90`` is
-    defined by that band, HF-049 and OR-036), and a missing reference on any job but the reference job (HF-041)."""
+    defined by that band, HF-049 and OR-036), and a missing reference on any job but the reference job (HF-041).
+    Under both schemas, an acceptance reference_job that is not an existing directory: the job that is to judge this
+    one must exist before a licensed solve (CDX-039)."""
+    reference_job = cfg.acceptance.reference_job
+    if reference_job is not None and not Path(reference_job).is_dir():
+        raise ValueError(f"[acceptance] reference_job {reference_job} is not an existing job directory: the "
+                         f"{cfg.acceptance.kind} that is to judge this job needs it (CDX-039)")
     if cfg.output.schema == 1:
         if reference is not None:
             raise ValueError("a column-order reference applies to schema 2 only; this run writes schema 1 "
@@ -769,6 +775,9 @@ def load_source_job(job_dir: Path) -> SourceJob:
     raw = copy.deepcopy(dict(raw))
     output = raw.get("output")
     raw["output"] = {**(output if isinstance(output, Mapping) else {}), "schema": 2}
+    # A re-export is judged against its source, whatever the source recorded (a source made before CDX-039 records
+    # nothing); the fresh manifest records it, equal to the sidecar's provenance.reexport.source_job.
+    raw["acceptance"] = {"kind": "reexport_check", "reference_job": str(job_dir)}
     cfg = build_config(raw)
     folder = f"{cfg.project.dataset_id}_{frequency_label(cfg.solver.frequency_ghz)}"
     if job_dir.parent.name != folder:
