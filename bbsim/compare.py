@@ -107,6 +107,8 @@ class ComparisonResult:
         lines += [f"tolerances: {tol}", ""]
         for c in self.checks:
             status = "PASS" if c.passed else ("FAIL" if c.severity == "fail" else "WARN")
+            if c.values.get("verdict") == "not judged":         # the pointwise row (CDX-026): skipped, not agreed
+                status = "SKIP"
             lines.append(f"{status:4} {c.name:26} {c.detail}")
         lines += ["", "RESULT: " + ("PASS" if self.passed else "FAIL")]
         return "\n".join(lines)
@@ -481,6 +483,18 @@ def _keys(df: pd.DataFrame) -> set[tuple[float, float]]:
     return {(float(a), float(b)) for a, b in df[KEY_COLUMNS].drop_duplicates().itertuples(index=False, name=None)}
 
 
+def _select(df: pd.DataFrame, keys: list[tuple[float, float]] | None) -> pd.DataFrame:
+    """The rows at ``keys`` (within KEY_TOL_DEG), or every row when ``keys`` is None."""
+    if keys is None:
+        return df
+    index = dataset_v2.key_index(df[KEY_COLUMNS[0]].to_numpy(float), df[KEY_COLUMNS[1]].to_numpy(float), keys)
+    return df[index >= 0].reset_index(drop=True)
+
+
+def _no_shared_key(name: str) -> Check:
+    return Check(name, False, "fail", "no incidence key both datasets declare: nothing to compare")
+
+
 def _check_columns(table: str, cand: pd.DataFrame, ref: pd.DataFrame, expected: list[str]) -> Check:
     ok = list(cand.columns) == expected and list(ref.columns) == expected
     detail = "column order matches Geant4 contract" if ok else \
@@ -643,9 +657,10 @@ def _waveguide_values(cand: pd.DataFrame, ref: pd.DataFrame, tol: Tolerances, na
 
 
 def _compare_waveguide(tables: dict[str, pd.DataFrame], resolved: dict[str, tuple], dirs: dict[str, Path],
-                       tol: Tolerances) -> list[Check]:
+                       tol: Tolerances, keys: list[tuple[float, float]] | None = None) -> list[Check]:
     """Columns, the finite gate, for 2.0 sides the sidecar records and the dark rule, then the value checks: native
-    when both sides are 2.0, through the 2.0 side's legacy view when one is (mixed)."""
+    when both sides are 2.0, through the 2.0 side's legacy view when one is (mixed). Every gate reads the whole table;
+    ``keys`` limits only the value checks, after any legacy view."""
     versions = {label: resolved[label][0] for label in tables}
     expected = {label: _COLUMNS_BY_SCHEMA[v] for label, v in versions.items()}
     cand, ref = tables["candidate"], tables["reference"]
@@ -664,8 +679,10 @@ def _compare_waveguide(tables: dict[str, pd.DataFrame], resolved: dict[str, tupl
     if not finite.passed:
         return checks
     v2_sides = [label for label in tables if versions[label] == SCHEMA_2]
+    if keys is not None and not keys:
+        return checks + [_no_shared_key("waveguide.keys")]
     if not v2_sides:
-        return checks + _waveguide_values(cand, ref, tol, native_v2=False)
+        return checks + _waveguide_values(_select(cand, keys), _select(ref, keys), tol, native_v2=False)
     v2: dict[str, _V2Table] = {}
     problems = []
     for label in v2_sides:
@@ -688,15 +705,21 @@ def _compare_waveguide(tables: dict[str, pd.DataFrame], resolved: dict[str, tupl
     if dark:
         return checks
     if len(v2_sides) == 2:
-        return checks + _waveguide_values(cand, ref, tol, native_v2=True)
+        return checks + _waveguide_values(_select(cand, keys), _select(ref, keys), tol, native_v2=True)
     label = v2_sides[0]
     view = dict(tables)
     view[label] = legacy_view(tables[label], v2[label].sidecar, v2[label].ephi)
-    return checks + _waveguide_values(view["candidate"], view["reference"], tol, native_v2=False)
+    return checks + _waveguide_values(_select(view["candidate"], keys), _select(view["reference"], keys), tol,
+                                      native_v2=False)
 
 
-def compare_datasets(candidate_dir: Path, reference_dir: Path, tol: Tolerances = Tolerances()) -> ComparisonResult:
-    """Compare one dataset directory with another; either may be schema 1.0 or 2.0 (see the module docstring)."""
+def compare_datasets(candidate_dir: Path, reference_dir: Path, tol: Tolerances = Tolerances(),
+                     keys: list[tuple[float, float]] | None = None) -> ComparisonResult:
+    """Compare one dataset directory with another; either may be schema 1.0 or 2.0 (see the module docstring).
+
+    Without ``keys`` both must hold the same incidence keys. ``keys``, the shared selection of a paired comparison
+    (``pair_keys``), limits the value checks to those keys after every gate has read the whole tables; an empty
+    selection fails."""
     candidate_dir, reference_dir = Path(candidate_dir), Path(reference_dir)
     dirs = {"candidate": candidate_dir, "reference": reference_dir}
 
@@ -717,7 +740,7 @@ def compare_datasets(candidate_dir: Path, reference_dir: Path, tol: Tolerances =
             expected = _COLUMNS_BY_SCHEMA[next(iter(versions.values()), SCHEMA_1)]
             checks.append(_check_columns("waveguide", waveguides["candidate"], waveguides["reference"], expected))
     else:
-        checks += _compare_waveguide(waveguides, resolved, dirs, tol)
+        checks += _compare_waveguide(waveguides, resolved, dirs, tol, keys)
 
     far, unreadable = {}, []
     for label, d in dirs.items():
@@ -735,7 +758,10 @@ def compare_datasets(candidate_dir: Path, reference_dir: Path, tol: Tolerances =
     if cols.passed:
         finite = _check_finite("far_field.finite", [("candidate far_field.csv", cf), ("reference far_field.csv", rf)])
         checks.append(finite)
-        if finite.passed:
+        if finite.passed and keys is not None and not keys:
+            checks.append(_no_shared_key("far_field.keys"))
+        elif finite.passed:
+            cf, rf = _select(cf, keys), _select(rf, keys)
             checks += [_check_constant("far_field", "Freq", cf, rf), _check_constant("far_field", "Ephi", cf, rf),
                        _check_keys("far_field", cf, rf)]
             checks += _check_points_and_fields("far_field", cf, rf, ["Theta", "Phi"], FAR_FIELD_PAIRS, tol.angle_deg,
@@ -902,6 +928,41 @@ def _check_mixed(cs: dict, rs: dict, tol: Tolerances) -> Check:
     return Check("pair.mixed_transmission", not failures, "fail", detail, {"rows": rows})
 
 
+def pair_keys(candidate: tuple[Path, Path], reference: tuple[Path, Path]) -> list[tuple[float, float]] | None:
+    """The shared-key selection of a paired comparison (CDX-026, S42): the keys both sides' sidecars declare
+    (``excitation`` phi x theta), in the candidate's order, when every directory of both sides has its sidecar; None
+    when a side declares no grid, and then the two sides must hold the same keys. A declared key outside the
+    intersection is not compared, but still validated by each comparison's gates."""
+    from bbsim import field_pairing                     # here, not at the top: field_pairing imports this module
+
+    declared = []
+    for dirs in (candidate, reference):
+        paths = {sidecar_path(Path(d)) for d in dirs}
+        if None in paths or len(paths) != 1:
+            return None
+        path = paths.pop()
+        try:
+            declared.append(field_pairing.declared_keys(_read_sidecar(path), f"the sidecar {path}"))
+        except (ComparisonInputError, field_pairing.PairingRefused):
+            return None                                  # the comparisons' own gates refuse the sidecar
+    return [k for k in declared[0] if dataset_v2.key_position(declared[1], *k) is not None]
+
+
+def _pointwise(sides: Mapping[str, tuple[Path, Path]], keys: list[tuple[float, float]] | None) -> list[Check]:
+    """The pointwise rows ``pair.pointwise.inputs`` and ``pair.pointwise`` (``bbsim.field_pairing``)."""
+    from bbsim import acceptance_gate, field_pairing    # here, not at the top: field_pairing imports this module
+
+    inputs = acceptance_gate.InputCapture()
+    try:
+        cand = field_pairing.read_side("candidate", sides["candidate"], inputs, keys)
+        ref = field_pairing.read_side("reference", sides["reference"], inputs, keys)
+        shared = keys if keys is not None else field_pairing.shared_keys(cand, ref)
+        result = field_pairing.compare_sides(cand, ref, shared)
+    except field_pairing.PairingRefused as exc:
+        result = field_pairing.PairingResult({}, {}, [], [str(exc)], field_pairing._coverage(keys or [], []), {})
+    return field_pairing.checks("pair", result)
+
+
 def compare_polarization_pair(candidate: tuple[Path, Path], reference: tuple[Path, Path],
                               tol: Tolerances = Tolerances()) -> ComparisonResult:
     """Compare what coherent transport uses and the per-directory comparison cannot see (CDX-005).
@@ -921,6 +982,15 @@ def compare_polarization_pair(candidate: tuple[Path, Path], reference: tuple[Pat
     rho. A 2.0 side against a 1.0 side is compared through the 2.0 side's legacy views, and the result is marked
     ``mixed_schema``. Before anything is compared every numeric value must be finite (CDX-030), and every dark record
     of a 2.0 side must carry t_flux and OutgoingPower exactly 0 (OR-038).
+
+    Integrated quantities cannot see a relative sign at a key whose overlap integrates to zero, where it still swaps
+    BBRsim's equal-plus and equal-minus draws (CDX-026). So two more rows compare the common-normalized densities g0, g1
+    and h point by point (``bbsim.field_pairing``, S42): ``pair.pointwise.inputs`` refuses misaligned or invalid
+    inputs, and ``pair.pointwise`` reports the deviations, judged only when the module's policy is enforce.
+
+    Keys: when every directory has a sidecar, the keys compared are those both sides declare (``pair_keys``), each
+    side's tables validated over all of its own; a 35-key solve then pairs with a 15-key one on the nine they share,
+    and an empty intersection fails. Without sidecars the two sides must hold the same keys.
     """
     sides = {"candidate": tuple(Path(d) for d in candidate), "reference": tuple(Path(d) for d in reference)}
     names = (f"{candidate[0]} + {candidate[1]}", f"{reference[0]} + {reference[1]}")
@@ -997,13 +1067,30 @@ def compare_polarization_pair(candidate: tuple[Path, Path], reference: tuple[Pat
     else:
         (cs, cp), (rs, rp) = _pair_stats(cand, tol), _pair_stats(ref, tol)
     problems = [f"candidate {p}" for p in cp] + [f"reference {p}" for p in rp]
-    for (cw, _), (rw, _), e in zip(cand, ref, (0, 1)):
-        if _keys(cw) != _keys(rw):
-            problems.append(f"Ephi={e} incidence keys differ from the reference: missing {sorted(_keys(rw) - _keys(cw))} "
-                            f"extra {sorted(_keys(cw) - _keys(rw))}")
-    checks.append(Check("pair.points", not problems, "fail",
-                        "both pairs pair by row at every key" if not problems else "; ".join(problems[:5])))
+    selection = pair_keys(sides["candidate"], sides["reference"])
+    ok_detail = "both pairs pair by row at every key"
+    if selection is None:
+        for (cw, _), (rw, _), e in zip(cand, ref, (0, 1)):
+            if _keys(cw) != _keys(rw):
+                problems.append(f"Ephi={e} incidence keys differ from the reference: missing "
+                                f"{sorted(_keys(rw) - _keys(cw))} extra {sorted(_keys(cw) - _keys(rw))}")
+    else:
+        if not selection:
+            problems.append("no incidence key both datasets declare: nothing to compare")
+        for label, stats in (("candidate", cs), ("reference", rs)):
+            missing = [k for k in selection if dataset_v2.key_position(list(stats), *k) is None]
+            if missing:
+                problems.append(f"the {label} lacks the shared key {key_text(missing[0])} ({len(missing)} missing)")
+        ok_detail += (f"; {len(selection)} shared keys compared (candidate declares {len(_keys(cand[0][0]))}, "
+                      f"reference {len(_keys(ref[0][0]))})")
+
+        def chosen(stats: dict) -> dict:
+            return {k: v for k, v in stats.items() if dataset_v2.key_position(selection, *k) is not None}
+
+        cs, rs = chosen(cs), chosen(rs)
+    checks.append(Check("pair.points", not problems, "fail", ok_detail if not problems else "; ".join(problems[:5])))
     checks += [_check_rho("pair.exit_overlap", "rho_exit", cs, rs, tol),
                _check_rho("pair.far_field_overlap", "rho_far", cs, rs, tol),
                _check_mixed(cs, rs, tol)]
+    checks += _pointwise(sides, selection)
     return result()

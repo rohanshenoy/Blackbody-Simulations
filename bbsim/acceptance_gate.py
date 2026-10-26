@@ -21,9 +21,13 @@ block (``binding_block``, version ``BINDING_VERSION``). ``report_problems`` refu
 (``evidence_files``) uncovered or lists a file whose bytes have changed since; ``sidecar_file_problems`` checks the
 job's CSVs and manifests against its own sidecar. Assembly checks both before copying anything.
 
+A grid report must also hold the pointwise pair rows at the severities of the current policy (``expected_rows``,
+CDX-026, S42), and its tolerances include that policy, so a report made under another policy is refused.
+
 Stdlib only: the bridge's ``assemble_tree.sbatch`` imports this module from the checkout, and
 ``bbsim.config`` validates its ``[acceptance]`` table with ``validate_requirement_fields``, so this module must not
-import the config, and imports the checkers only inside ``expected_tolerances``, since they import it.
+import the config, and imports the checkers only inside ``expected_tolerances`` and ``expected_rows``, since they
+import it.
 """
 from __future__ import annotations
 
@@ -250,14 +254,23 @@ def binding_block(kind: str, subject: Path, reference: Path, files: Mapping[str,
             "files": dict(sorted(files.items()))}
 
 
-def expected_tolerances(kind: str, t_rel_tol: float | None) -> dict[str, float]:
+def expected_tolerances(kind: str, t_rel_tol: float | None) -> dict[str, object]:
     """The tolerances a ``kind`` report must have used: the checker's defaults, with the job's recorded t_rel_tol for
-    grid acceptance."""
+    grid acceptance (whose tolerances include the pointwise comparison's policy)."""
     if kind == "reexport_check":
         from bbsim import reexport_check
         return reexport_check.tolerances()
     from bbsim import grid_acceptance
     return grid_acceptance.tolerances(grid_acceptance.T_REL_TOL if t_rel_tol is None else t_rel_tol)
+
+
+def expected_rows(kind: str) -> dict[str, str]:
+    """The rows a ``kind`` report must hold, by name, at their severity: the pointwise pair rows for grid acceptance
+    (CDX-026, S42), none for a re-export check."""
+    if kind == "reexport_check":
+        return {}
+    from bbsim import grid_acceptance
+    return grid_acceptance.required_rows()
 
 
 def _read_object(inputs: InputCapture, path: Path) -> dict:
@@ -293,6 +306,15 @@ def report_problems(report: object, kind: str, job: Path, requirement: Requireme
         failed = [str(c.get("name")) for c in checks if c.get("severity") == "fail" and c.get("passed") is not True]
         if failed:
             problems.append(f"{name}'s own rows {failed} failed, which contradicts a passed verdict")
+        try:
+            required = expected_rows(kind)
+        except Exception as exc:  # noqa: BLE001 - a checker the checkout cannot import is a refusal, not a traceback
+            required = {}
+            problems.append(f"the rows {kind} must hold cannot be read from the checkout ({exc})")
+        for row, severity in required.items():
+            if not any(c.get("name") == row and c.get("severity") == severity for c in checks):
+                problems.append(f"{name} lacks the row {row} at severity {severity} (CDX-026: made under another "
+                                "pointwise policy, or before it; copy it aside and rerun its checker, no AEDT)")
     binding = report.get("binding")
     if binding is None:
         return problems + [f"{name} carries no file binding (made before CDX-038); copy it aside, then rerun python -m "

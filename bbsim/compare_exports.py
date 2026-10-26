@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from bbsim.compare import Tolerances, compare_datasets, compare_polarization_pair
+from bbsim.compare import Tolerances, compare_datasets, compare_polarization_pair, pair_keys
 from bbsim.manifest import write_json
 
 
@@ -25,11 +25,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     tol = Tolerances(t_atol=args.t_atol, t_rtol=args.t_rtol, corr_warn=args.corr_warn)
-    result = compare_datasets(args.candidate, args.reference, tol)
+    # With --pair, both per-directory comparisons judge the pair's shared-key selection (CDX-026, S42): a 35-key solve
+    # against a 15-key one compares the nine keys both declare, after each side's whole tables are validated.
+    keys = pair_keys((args.candidate, args.pair[0]), (args.reference, args.pair[1])) if args.pair else None
+    result = compare_datasets(args.candidate, args.reference, tol, keys)
     print(result.format_table())
     record, passed = result.to_dict(), result.passed
     if args.pair:
-        ephi1 = compare_datasets(args.pair[0], args.pair[1], tol)
+        ephi1 = compare_datasets(args.pair[0], args.pair[1], tol, keys)
         pair = compare_polarization_pair((args.candidate, args.pair[0]), (args.reference, args.pair[1]), tol)
         for part in (ephi1, pair):
             print()

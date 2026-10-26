@@ -44,10 +44,21 @@ Rows, in order (the first stops the rest when it fails, as nothing else can be r
    T_ref over the shared keys, |T_new - T_ref| <= t_rel_tol x T_ref; keys below that band are reported as noise and
    do not fail (crack1's E-along-slot polarization at normal incidence carries T about 1e-10); a noise row whose
    T_new lies inside the band carries a note saying so.
-10. binding.inputs (CDX-038): every file the rows read was read through one ``acceptance_gate.InputCapture``, so each
+10. fields.pointwise.inputs (CDX-026, S42; severity fail): both jobs' datasets read for ``bbsim.field_pairing``,
+    validated in their own schema over every declared key (the new job's W undone), and aligned at the nine shared
+    keys: exit points equal to 1e-12 m and far-field angles to 1e-9 deg in row order, the schema-1 grid's derived
+    step equal to the schema-2 declaration, no transmitting basis with a zero norm (BBR027).
+11. fields.pointwise (CDX-026, S42): the common-normalized densities g0, g1 and h of the two solves compared point by
+    point at the shared keys, for the exit field and the far field, each deviation scaled to its reference maximum
+    (``field_pairing``). A relative sign or phase between the polarizations, invisible to every integrated quantity
+    where the overlap integrates to zero, moves h. Severity info with the verdict "not judged" while the policy's mode
+    is measure (the first run on the October jobs measures; Rohan sets the tolerance from those values), fail once it
+    is enforce. The policy (``field_pairing.policy()``) is part of ``tolerances()``, so a report made under another
+    policy is refused at assembly.
+12. binding.inputs (CDX-038): every file the rows read was read through one ``acceptance_gate.InputCapture``, so each
     was hashed as it was parsed; at the end every core file of both jobs (``acceptance_gate.job_files``) is hashed
-    again, ``far_field.csv`` and the manifests only for their hash, and any file whose bytes changed fails the row.
-    The report's ``binding`` holds those digests, which assembly checks against the files before copying them.
+    again, the manifests only for their hash, and any file whose bytes changed fails the row. The report's
+    ``binding`` holds those digests, which assembly checks against the files before copying them.
 
 Every number read must be finite: a missing, malformed or non-finite value fails the row that reads it, naming the key
 and polarization where there is one, and never escapes as an exception (CDX-030: nothing is compared with NaN). The
@@ -70,7 +81,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from bbsim import acceptance_gate, dataset_v2
+from bbsim import acceptance_gate, dataset_v2, field_pairing
 from bbsim.acceptance_rows import RowVerdicts, guard
 from bbsim.acceptance_rows import Refused as _Refused
 from bbsim.acceptance_rows import at_key as _where
@@ -98,9 +109,17 @@ LEADING_COLUMNS = ["Freq", "Ephi", "IWavePhi", "IWaveTheta", "OutgoingPower", "I
 FREQ, EPHI, PHI, THETA, OUTGOING, INGOING = 0, 1, 2, 3, 4, 5
 
 
-def tolerances(t_rel_tol: float = T_REL_TOL) -> dict[str, float]:
-    """The tolerances a report records, and assembly expects (``acceptance_gate.expected_tolerances``)."""
-    return {"t_rel_tol": t_rel_tol, "noise_rel": NOISE_REL, "ingoing_rel": INGOING_REL, "key_deg": KEY_DEG}
+def tolerances(t_rel_tol: float = T_REL_TOL) -> dict[str, object]:
+    """The tolerances a report records, and assembly expects (``acceptance_gate.expected_tolerances``): the power
+    tolerances and the pointwise comparison's policy (CDX-026, S42)."""
+    return {"t_rel_tol": t_rel_tol, "noise_rel": NOISE_REL, "ingoing_rel": INGOING_REL, "key_deg": KEY_DEG,
+            **field_pairing.policy()}
+
+
+def required_rows() -> dict[str, str]:
+    """The pointwise rows a grid report must hold, by name, at their severity under the current policy (assembly's
+    ``acceptance_gate.expected_rows``)."""
+    return {"fields.pointwise.inputs": "fail", "fields.pointwise": "info" if field_pairing.MODE == "measure" else "fail"}
 
 
 # --- small helpers ---------------------------------------------------------------------------------------------------
@@ -179,10 +198,15 @@ class GridResult(RowVerdicts):
 
     def format_rows(self) -> str:
         """The header, the check rows and the per-key table: what ``main`` prints before writing the report."""
+        policy = field_pairing.policy()
         lines = [f"new:       {self.new_job}", f"reference: {self.reference_job}",
-                 f"tolerances: t_rel_tol={self.t_rel_tol:g} noise_rel={NOISE_REL:g} ingoing_rel={INGOING_REL:g}", ""]
+                 f"tolerances: t_rel_tol={self.t_rel_tol:g} noise_rel={NOISE_REL:g} ingoing_rel={INGOING_REL:g}",
+                 f"pointwise: fields_pointwise_policy={policy['fields_pointwise_policy']} "
+                 f"mode={policy['fields_pointwise_mode']} tol={policy['fields_pointwise_tol']}", ""]
         for c in self.checks:
             status = ("PASS" if c.passed else "FAIL") if c.severity == "fail" else ("INFO" if c.passed else "SKIP")
+            if c.values.get("verdict") == "not judged":          # the pointwise row: skipped, not agreed (S42)
+                status = "SKIP"
             lines.append(f"{status:4} {c.name:25} {c.detail}")
         if self.rows:
             lines += ["", f"{'phi':>6} {'theta':>6} {'Ephi':>4} {'T_new':>16} {'T_ref':>16} {'rel_diff':>10}  status"]
@@ -235,12 +259,18 @@ class _Acceptance:
         for name, step in (("identity", self._identity), ("grid.new", self._grid_new),
                            ("grid.reference", self._grid_reference), ("tables", self._tables),
                            ("tables.keys", self._table_keys), ("tables.identity", self._table_identity),
-                           ("powers.ingoing", self._ingoing), ("transmittance.shared_keys", self._transmittance),
-                           ("binding.inputs", self._binding_inputs)):
+                           ("powers.ingoing", self._ingoing), ("transmittance.shared_keys", self._transmittance)):
             checks.append(self._guard(name, step))
+        checks += guard(["fields.pointwise.inputs", "fields.pointwise"], self._pointwise)
+        checks.append(self._guard("binding.inputs", self._binding_inputs))
         return checks
 
-    # -- 10. the bytes judged (CDX-038) ---------------------------------------------------------------------------
+    # -- 10, 11. the pointwise pair comparison (CDX-026, S42) -------------------------------------------------------
+    def _pointwise(self) -> list[Check]:
+        result = field_pairing.compare_jobs(self.new.root, self.reference.root, self.inputs, SHARED_KEYS)
+        return field_pairing.checks("fields", result)
+
+    # -- 12. the bytes judged (CDX-038) ---------------------------------------------------------------------------
     def _binding_inputs(self) -> Check:
         problems: list[str] = []
         files = acceptance_gate.evidence_files("grid_acceptance", self.new.root, self.reference.root, self.new.sidecar)

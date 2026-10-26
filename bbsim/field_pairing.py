@@ -42,7 +42,7 @@ import numpy as np
 import pandas as pd
 
 from bbsim import compare, dataset_v2
-from bbsim.compare import ComparisonInputError, Tolerances
+from bbsim.compare import Check, ComparisonInputError, Tolerances
 from bbsim.dataset_v2 import DatasetV2Error, key_text
 from bbsim.schema import EXIT_FIELD_SLOTS, FAR_FIELD_COLUMNS, WAVEGUIDE_COLUMNS, WAVEGUIDE_COLUMNS_V2
 
@@ -86,7 +86,8 @@ class Side:
     labels with a 2.x table's W undone; ``exit`` and ``far`` hold only the kept keys' rows, while ``declared``, ``m``
     and ``dark_flag`` cover every declared key. ``m`` is |Re S| / (A I) per polarization from the key's first row
     (schema 1 OutgoingPower / IngoingPower, schema 2 ``outgoing_power_abs_re_s_w`` / IngoingPower), before c_k or the
-    flux substitution. ``shape`` and ``grid`` are the declared exit lattice, None when the side declares none."""
+    flux substitution. ``shape`` and ``grid`` are the declared exit lattice, None when the side declares none or (schema
+    1, ``lattice_refusal``) declares one that cannot be used; that is refused only by a comparison that needs it."""
 
     label: str
     dirs: tuple[Path, Path]
@@ -99,6 +100,7 @@ class Side:
     dark_flag: dict[tuple[float, float], tuple[bool, bool]]
     shape: str | None = None
     grid: ExitGrid | None = None
+    lattice_refusal: str | None = None     # why a schema-1 side's declared lattice is unusable, refused when needed
 
 
 # --- reading ---------------------------------------------------------------------------------------------------------
@@ -122,7 +124,7 @@ def _refuse(where: str, exc: Exception) -> PairingRefused:
     return PairingRefused(f"{where}: {exc}")
 
 
-def _declared_keys(sidecar: Mapping, where: str) -> list[tuple[float, float]]:
+def declared_keys(sidecar: Mapping, where: str) -> list[tuple[float, float]]:
     """The product grid of ``excitation.incident_phi_deg`` x ``incident_theta_deg``, phi outer."""
     axes = []
     for name in ("incident_phi_deg", "incident_theta_deg"):
@@ -163,24 +165,30 @@ def _schema1_grid(record: object, where: str) -> ExitGrid:
         raise PairingRefused(str(exc)) from exc
 
 
-def _lattice(sidecar: dict | None, schema: str, where: str) -> tuple[str | None, ExitGrid | None]:
+def _lattice(sidecar: dict | None, schema: str, where: str) -> tuple[str | None, ExitGrid | None, str | None]:
+    """(shape, grid, refusal): a 2.x side's declared lattice, refused now; a 1.x side's, whose refusal is kept for a
+    comparison that needs it (two 1.x sides never do)."""
     if sidecar is None:
-        return None, None
+        return None, None, None
     if schema == SCHEMA_2:
         try:
-            return compare._v2_lattice(sidecar, where)
+            return (*compare._v2_lattice(sidecar, where), None)
         except ComparisonInputError as exc:
             raise PairingRefused(str(exc)) from exc
     exit_field = sidecar.get("exit_field")
     if not isinstance(exit_field, Mapping):
-        return None, None
+        return None, None, None
     section = exit_field.get("cross_section")
     shape = section.get("shape") if isinstance(section, Mapping) else None
     if shape is not None and shape not in dataset_v2.QUADRATURE_BY_SHAPE:
-        raise PairingRefused(f"{where} exit_field.cross_section.shape {shape!r} is not one of "
-                             f"{sorted(dataset_v2.QUADRATURE_BY_SHAPE)}")
-    grid = _schema1_grid(exit_field["grid"], f"{where} exit_field.grid") if "grid" in exit_field else None
-    return shape, grid
+        return None, None, (f"{where} exit_field.cross_section.shape {shape!r} is not one of "
+                            f"{sorted(dataset_v2.QUADRATURE_BY_SHAPE)}")
+    if "grid" not in exit_field:
+        return shape, None, None
+    try:
+        return shape, _schema1_grid(exit_field["grid"], f"{where} exit_field.grid"), None
+    except PairingRefused as exc:
+        return shape, None, str(exc)
 
 
 def _key_rows(table: pd.DataFrame, keys: Sequence[tuple[float, float]], where: str) -> np.ndarray:
@@ -243,7 +251,7 @@ def read_side(label: str, dirs: tuple[Path, Path], inputs: InputCapture,
             raise _refuse(where_sidecar, exc) from exc
         if not isinstance(sidecar, dict):
             raise PairingRefused(f"{where_sidecar} is not a JSON object")
-    declared = _declared_keys(sidecar, where_sidecar) if sidecar is not None else None
+    declared = declared_keys(sidecar, where_sidecar) if sidecar is not None else None
     state: dict[str, Any] = {"schema": None, "declared": declared, "positions": None}
 
     def positions(where: str) -> list[int] | None:
@@ -336,9 +344,9 @@ def read_side(label: str, dirs: tuple[Path, Path], inputs: InputCapture,
             at = dataset_v2.key_position(keys, *key)
             if at is not None:
                 dark[keys[at]] = (records.dark[0][k], records.dark[1][k])
-    shape, grid = _lattice(sidecar, schema, where_sidecar)
+    shape, grid, lattice_refusal = _lattice(sidecar, schema, where_sidecar)
     return Side(label, dirs, schema, sidecar, list(keys), exit_tables, far_tables,
-                {key: (m[0][k], m[1][k]) for k, key in enumerate(keys)}, dark, shape, grid)
+                {key: (m[0][k], m[1][k]) for k, key in enumerate(keys)}, dark, shape, grid, lattice_refusal)
 
 
 # --- alignment -------------------------------------------------------------------------------------------------------
@@ -386,7 +394,10 @@ def _lattice_problems(a: Side, b: Side) -> list[str]:
         return []
     problems = []
     for side in (a, b):
-        if side.shape is None or side.grid is None:
+        if side.lattice_refusal is not None:
+            problems.append(f"{side.label} (schema {side.schema}): {side.lattice_refusal}; the {EXIT_RAW} comparison "
+                            "needs both sides' declared lattice")
+        elif side.shape is None or side.grid is None:
             problems.append(f"{side.label} (schema {side.schema}) declares no exit_field.grid and cross-section shape: "
                             f"the {EXIT_RAW} comparison needs both sides' declared lattice and never guesses it")
     if problems:
@@ -724,3 +735,48 @@ def verdict(result: PairingResult, mode: str | None = None, tol: float | None = 
     if failures:
         return "fail", failures
     return ("pass", []) if any(km.d for km in result.keys) else ("not judged", [])
+
+
+# --- the two rows a checker reports ------------------------------------------------------------------------------------
+
+def _band() -> str:
+    return (f"m = |Re S| / (A I) per polarization; dark below {DARK_FLOOR:g} or below {DARK_RATIO:g} of the larger m, "
+            f"lit above {LIT_RATIO:g} of it, between otherwise")
+
+
+def checks(prefix: str, result: PairingResult) -> list[Check]:
+    """``<prefix>.pointwise.inputs`` (severity fail: every refusal, an empty key intersection included) and
+    ``<prefix>.pointwise`` (severity info while MODE is measure, else fail) for ``result`` under the current policy.
+    A metric row whose verdict is "not judged" carries that verdict in its values; it claims no numerical agreement."""
+    from bbsim.acceptance_rows import MAX_LISTED, row
+
+    cov = result.coverage
+    inputs = row(f"{prefix}.pointwise.inputs",
+                 f"both solves validated in their own schema over every declared key; exit points equal to {COORD_M:g} m "
+                 f"and far-field angles to {ANGLE_DEG:g} deg at each compared key, in row order; the declared lattice "
+                 f"for a {EXIT_RAW} comparison; no transmitting basis with a zero norm (BBR027)",
+                 list(result.refusals),
+                 f"{cov.get('shared_keys', 0)} shared keys aligned; exit {result.conventions.get('exit')}, far "
+                 f"{result.conventions.get('far')}; schemas new {result.schemas.get('new')}, reference "
+                 f"{result.schemas.get('ref')}", {"conventions": dict(result.conventions), "schemas": dict(result.schemas)})
+    mode, tol = MODE, TOL
+    try:
+        status, failures = verdict(result)
+    except PairingRefused as exc:
+        status, failures = "fail", [str(exc)]
+    if status == "not judged":
+        said = f"not judged ({mode} mode)" if mode == "measure" else "not judged (every metric legitimately skipped)"
+    elif status == "pass":
+        said = f"pass, every judged d <= {tol:g}"
+    else:
+        more = f"; and {len(failures) - MAX_LISTED} more" if len(failures) > MAX_LISTED else ""
+        said = f"{len(failures)} failure(s): " + "; ".join(failures[:MAX_LISTED]) + more
+    largest = ", ".join(f"{name} {v['d']:.3g} at ({v['phi_deg']:g}, {v['theta_deg']:g})"
+                        for name, v in sorted(result.largest.items()))
+    detail = (f"g0, g1 and h of the two solves point by point ({_band()}): {said}; {cov.get('metrics_judged', 0)} "
+              f"metrics at {cov.get('keys_with_judged_metrics', 0)} keys, {cov.get('metrics_skipped', 0)} skipped "
+              f"({cov.get('all_dark_keys', 0)} all-dark keys, {cov.get('transitions', 0)} dark/lit transitions)"
+              + (f"; largest {largest}" if largest else ""))
+    values = {"verdict": status, "mode": mode, "tol": tol, "policy": POLICY, **result.to_dict(), "failures": failures}
+    metric = Check(f"{prefix}.pointwise", status != "fail", "info" if mode == "measure" else "fail", detail, values)
+    return [inputs, metric]
