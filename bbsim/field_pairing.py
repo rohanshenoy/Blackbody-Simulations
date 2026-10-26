@@ -44,7 +44,7 @@ import pandas as pd
 from bbsim import compare, dataset_v2
 from bbsim.compare import ComparisonInputError, Tolerances
 from bbsim.dataset_v2 import DatasetV2Error, key_text
-from bbsim.schema import FAR_FIELD_COLUMNS, WAVEGUIDE_COLUMNS, WAVEGUIDE_COLUMNS_V2
+from bbsim.schema import EXIT_FIELD_SLOTS, FAR_FIELD_COLUMNS, WAVEGUIDE_COLUMNS, WAVEGUIDE_COLUMNS_V2
 
 if TYPE_CHECKING:
     from bbsim.acceptance_gate import InputCapture
@@ -203,6 +203,13 @@ def _kept(table: pd.DataFrame, index: np.ndarray, positions: Sequence[int] | Non
     return table[np.isin(index, positions)].reset_index(drop=True)
 
 
+def _read_csv(stream, where: str) -> pd.DataFrame:
+    try:
+        return pd.read_csv(stream)
+    except ValueError as exc:                            # pandas' parser errors and undecodable bytes
+        raise _refuse(where, exc) from exc
+
+
 def _schema_of(columns: list[str], where: str) -> str:
     if columns == list(WAVEGUIDE_COLUMNS):
         return SCHEMA_1
@@ -224,9 +231,15 @@ def read_side(label: str, dirs: tuple[Path, Path], inputs: InputCapture,
     sidecar: dict | None = None
     where_sidecar = f"{label} sidecar {sidecar_path}"
     if sidecar_path is not None:
+        def read_sidecar(stream):
+            try:
+                return json.load(stream)
+            except ValueError as exc:                    # malformed JSON or bytes
+                raise _refuse(where_sidecar, exc) from exc
+
         try:
-            sidecar = inputs.parse(sidecar_path, json.load)
-        except (OSError, ValueError) as exc:
+            sidecar = inputs.parse(sidecar_path, read_sidecar)
+        except OSError as exc:
             raise _refuse(where_sidecar, exc) from exc
         if not isinstance(sidecar, dict):
             raise PairingRefused(f"{where_sidecar} is not a JSON object")
@@ -253,7 +266,7 @@ def read_side(label: str, dirs: tuple[Path, Path], inputs: InputCapture,
         where = f"{label} Ephi={e} {path}"
 
         def read_waveguide(stream, e=e, d=d, where=where):
-            df = pd.read_csv(stream)
+            df = _read_csv(stream, where)
             schema = _schema_of([str(c) for c in df.columns], where)
             if state["schema"] is None:
                 state["schema"] = schema
@@ -291,7 +304,7 @@ def read_side(label: str, dirs: tuple[Path, Path], inputs: InputCapture,
         where = f"{label} Ephi={e} {path}"
 
         def read_far(stream, e=e, d=d, where=where):
-            df = pd.read_csv(stream)
+            df = _read_csv(stream, where)
             if [str(c) for c in df.columns] != list(FAR_FIELD_COLUMNS):
                 raise PairingRefused(f"{where} does not carry the far-field columns {FAR_FIELD_COLUMNS}: "
                                      f"{list(df.columns)}")
@@ -432,3 +445,282 @@ def exit_weights(a: Side, b: Side, key: tuple[float, float]) -> tuple[str, np.nd
         return EXIT_RAW, dataset_v2.node_weights(rows["Y"].to_numpy(float), rows["Z"].to_numpy(float), grid)
     except DatasetV2Error as exc:
         raise PairingRefused(f"{a.label} exit points at {key_text(key)}: {exc}") from exc
+
+
+# --- densities and deviations ----------------------------------------------------------------------------------------
+
+def far_weights(theta_deg: np.ndarray, phi_deg: np.ndarray) -> np.ndarray:
+    """sin(Theta) where sin(Theta) cos(Phi) >= SUPPORT_MIN (an outward direction, BBRsim's kMinNormalComponent), else 0;
+    angles in degrees."""
+    sin_t = np.sin(np.radians(np.asarray(theta_deg, dtype=float)))
+    outward = sin_t * np.cos(np.radians(np.asarray(phi_deg, dtype=float)))
+    return np.where(outward >= SUPPORT_MIN, sin_t, 0.0)
+
+
+def _vectors(table: pd.DataFrame, field: str, convention: str) -> np.ndarray:
+    """Complex field vectors per row: the exit slots by position (HF-038), all three components or (Ex, Ey); the far
+    field's (rEphi, rEtheta)."""
+    if field == "far":
+        v = table[["rEphi_real", "rEphi_imag", "rEtheta_real", "rEtheta_imag"]].to_numpy(float)
+    else:
+        v = table.iloc[:, EXIT_FIELD_SLOTS].to_numpy(float)
+    c = v[:, ::2] + 1j * v[:, 1::2]
+    return c[:, :2] if (field == "exit" and convention == EXIT_RAW) else c
+
+
+def _own_convention(side: Side) -> str:
+    return EXIT_1_1 if side.schema == SCHEMA_1 else EXIT_RAW
+
+
+def _field_inputs(side: Side, key: tuple[float, float], field: str, convention: str,
+                  weights: np.ndarray | None) -> tuple[dict[int, np.ndarray], np.ndarray]:
+    tables = side.far if field == "far" else side.exit
+    rows = {e: _rows(tables[e], key) for e in (0, 1)}
+    if weights is None:
+        if field == "far":
+            weights = far_weights(rows[0]["Theta"].to_numpy(float), rows[0]["Phi"].to_numpy(float))
+        else:
+            weights = exit_weights(side, side, key)[1]
+    return {e: _vectors(rows[e], field, convention) for e in (0, 1)}, np.asarray(weights, dtype=float)
+
+
+def _densities(vectors: Mapping[int, np.ndarray], weights: np.ndarray, bases: Sequence[int]
+               ) -> tuple[dict[int, np.ndarray], np.ndarray | None, float]:
+    q = {e: weights * np.sum(np.abs(vectors[e]) ** 2, axis=1) for e in bases}
+    total = float(sum(np.sum(q[e]) for e in bases))
+    g = {e: q[e] / total for e in bases}
+    h = (weights * np.sum(vectors[0] * np.conj(vectors[1]), axis=1) / total) if len(bases) == 2 else None
+    return g, h, total
+
+
+def densities(side: Side, key: tuple[float, float], field: str, convention: str | None = None,
+              weights: np.ndarray | None = None, bases: Sequence[int] = (0, 1)
+              ) -> tuple[dict[int, np.ndarray], np.ndarray | None]:
+    """(g per basis, h) of one side at ``key`` for ``field`` "exit" or "far", normalized by Q over ``bases``; h only
+    when both bases are included. ``convention`` and ``weights`` default to the side's own (far: ``far_weights``)."""
+    vectors, w = _field_inputs(side, key, field, convention or _own_convention(side), weights)
+    g, h, _ = _densities(vectors, w, list(bases))
+    return g, h
+
+
+@dataclass
+class KeyMetrics:
+    """One key and one field ("exit" or "far"): the deviations judged (``d``: "g0", "g1", "h"), those skipped with
+    their reason, the normalizations (Q per side, the max of each g_ref, B_ref), the bases forming Q (the same set on
+    both sides), each side's m and dark/lit state, whether the key went from dark to lit, and the exit points whose
+    zero fill (all six values exactly 0) differs between the two solves."""
+
+    key: tuple[float, float]
+    field: str
+    convention: str
+    m_new: tuple[float, float]
+    m_ref: tuple[float, float]
+    states: dict[str, str]
+    d: dict[str, float]
+    skipped: dict[str, str]
+    denominators: dict[str, float]
+    transition: bool
+    bases: list[int]
+    zero_fill_differs: list[dict]
+
+
+@dataclass
+class PairingResult:
+    """Per shared key and field the metrics, the conventions and both schemas, every input refusal, the coverage
+    counts and the largest deviation of each metric."""
+
+    conventions: dict[str, str]
+    schemas: dict[str, str]
+    keys: list[KeyMetrics]
+    refusals: list[str]
+    coverage: dict[str, int]
+    largest: dict[str, dict]
+
+    def to_dict(self) -> dict:
+        records = []
+        for km in self.keys:
+            records.append({"phi_deg": km.key[0], "theta_deg": km.key[1], "field": km.field,
+                            "convention": km.convention, "m_new": list(km.m_new), "m_ref": list(km.m_ref),
+                            "states": dict(km.states), "d": dict(km.d), "skipped": dict(km.skipped),
+                            "denominators": dict(km.denominators), "transition": km.transition,
+                            "bases": list(km.bases), "zero_fill_differs": list(km.zero_fill_differs)})
+        return {"conventions": dict(self.conventions), "schemas": dict(self.schemas), "keys": records,
+                "refusals": list(self.refusals), "coverage": dict(self.coverage), "largest": dict(self.largest)}
+
+
+def _state(m: tuple[float, float], flags: tuple[bool, bool]) -> str:
+    """compare.py's band on m (dark below the floor or below DARK_RATIO of the larger, lit above LIT_RATIO), dark
+    outright when either basis carries an explicit schema-2 dark flag."""
+    if any(flags) or max(m) < DARK_FLOOR or min(m) < DARK_RATIO * max(m):
+        return "dark"
+    return "lit" if min(m) > LIT_RATIO * max(m) else "between"
+
+
+def _transmitting(m: float, flag: bool) -> bool:
+    return not flag and m >= DARK_FLOOR
+
+
+def _not_transmitting(label: str, m: float, flag: bool) -> str:
+    return f"{label}: dark flag" if flag else f"{label}: m {m:.3g} below {DARK_FLOOR:g}"
+
+
+def _zero_fill(new_rows: Mapping[int, pd.DataFrame], ref_rows: Mapping[int, pd.DataFrame]) -> list[dict]:
+    found = []
+    for e in (0, 1):
+        zn = ~new_rows[e].iloc[:, EXIT_FIELD_SLOTS].to_numpy(float).any(axis=1)
+        zr = ~ref_rows[e].iloc[:, EXIT_FIELD_SLOTS].to_numpy(float).any(axis=1)
+        for i in np.flatnonzero(zn != zr):
+            found.append({"ephi": e, "point": int(i), "y_m": float(new_rows[e]["Y"].iloc[i]),
+                          "z_m": float(new_rows[e]["Z"].iloc[i]), "zero_on": "new" if zn[i] else "ref"})
+    return found
+
+
+def _key_field(new: Side, ref: Side, key: tuple[float, float], field: str, convention: str,
+               weights: np.ndarray | None, refusals: list[str]) -> KeyMetrics:
+    kn, kr = _at_key(new, key), _at_key(ref, key)
+    m_new, m_ref = new.m[kn], ref.m[kr]
+    flags_new, flags_ref = new.dark_flag[kn], ref.dark_flag[kr]
+    states = {"new": _state(m_new, flags_new), "ref": _state(m_ref, flags_ref)}
+    km = KeyMetrics(key, field, convention, m_new, m_ref, states, {}, {}, {}, set(states.values()) == {"dark", "lit"},
+                    [], [])
+    sides = {"new": (new, m_new, flags_new), "ref": (ref, m_ref, flags_ref)}
+    inputs = {label: _field_inputs(side, key, field, convention, weights) for label, (side, _, _) in sides.items()}
+    if field == "exit":
+        km.zero_fill_differs = _zero_fill({e: _rows(new.exit[e], key) for e in (0, 1)},
+                                          {e: _rows(ref.exit[e], key) for e in (0, 1)})
+    # BBR027: a basis a side declares transmitting must have a nonzero norm under this field's weights.
+    bad = False
+    for label, (side, m, flags) in sides.items():
+        vectors, w = inputs[label]
+        for e in (0, 1):
+            if _transmitting(m[e], flags[e]) and not np.sum(w * np.sum(np.abs(vectors[e]) ** 2, axis=1)) > 0.0:
+                what = "outward far-field" if field == "far" else "exit-field"
+                refusals.append(f"BBR027: {side.label} Ephi={e} at {key_text(key)} is transmitting (m {m[e]:.3g}) but "
+                                f"its {what} norm is zero")
+                bad = True
+    if bad:
+        km.skipped = {name: "refused (BBR027)" for name in ("g0", "g1", "h")}
+        return km
+    for e in (0, 1):
+        if _transmitting(m_new[e], flags_new[e]) and _transmitting(m_ref[e], flags_ref[e]):
+            km.bases.append(e)
+        else:
+            reasons = [_not_transmitting(label, m[e], flags[e]) for label, (_, m, flags) in sides.items()
+                       if not _transmitting(m[e], flags[e])]
+            km.skipped[f"g{e}"] = f"Ephi={e} not compared: " + "; ".join(reasons)
+    if not km.bases:
+        km.skipped["h"] = "no basis compared"
+        return km
+    norm = {}
+    for label in sides:
+        vectors, w = inputs[label]
+        norm[label] = _densities(vectors, w, km.bases)
+        km.denominators[f"Q_{label}"] = norm[label][2]
+    (g_new, h_new, _), (g_ref, h_ref, _) = norm["new"], norm["ref"]
+    for e in km.bases:
+        top = float(np.max(g_ref[e]))
+        km.denominators[f"max_g_ref{e}"] = top
+        km.d[f"g{e}"] = float(np.max(np.abs(g_new[e] - g_ref[e]))) / top
+    if len(km.bases) < 2:
+        km.skipped["h"] = "a basis is not compared"
+    elif states != {"new": "lit", "ref": "lit"}:
+        km.skipped["h"] = f"cross term not judged: new {states['new']}, reference {states['ref']}"
+    else:
+        b_ref = float(np.max((g_ref[0] + g_ref[1]) / 2.0))
+        km.denominators["B_ref"] = b_ref
+        km.d["h"] = float(np.max(np.abs(h_new - h_ref))) / b_ref
+    for name, value in list(km.d.items()):
+        if not np.isfinite(value):
+            refusals.append(f"{field} {name} at {key_text(key)} is not finite ({value!r}): an input or "
+                            "classification inconsistency")
+            del km.d[name]
+            km.skipped[name] = "not finite"
+    return km
+
+
+def compare_sides(new: Side, ref: Side, keys: Sequence[tuple[float, float]]) -> PairingResult:
+    """The pointwise comparison of ``new`` with ``ref`` at ``keys``. Alignment problems are refusals, and then no
+    metric is formed."""
+    keys = [tuple(map(float, k)) for k in keys]
+    refusals = [] if keys else [f"{new.label} and {ref.label}: no shared key to compare"]
+    refusals += check_alignment(new, ref, keys)
+    conventions = {"exit": EXIT_1_1 if new.schema == SCHEMA_1 and ref.schema == SCHEMA_1 else EXIT_RAW, "far": FAR}
+    schemas = {"new": new.schema, "ref": ref.schema}
+    metrics: list[KeyMetrics] = []
+    if not refusals:
+        for key in keys:
+            try:
+                weights = exit_weights(new, ref, key)[1]
+            except PairingRefused as exc:
+                refusals.append(str(exc))
+                continue
+            metrics.append(_key_field(new, ref, key, "exit", conventions["exit"], weights, refusals))
+            metrics.append(_key_field(new, ref, key, "far", FAR, None, refusals))
+    return PairingResult(conventions, schemas, metrics, refusals, _coverage(keys, metrics), _largest(metrics))
+
+
+def _coverage(keys: Sequence[tuple[float, float]], metrics: Sequence[KeyMetrics]) -> dict[str, int]:
+    by_key: dict[tuple[float, float], list[KeyMetrics]] = {}
+    for km in metrics:
+        by_key.setdefault(km.key, []).append(km)
+    return {"shared_keys": len(keys),
+            "keys_with_judged_metrics": sum(1 for kms in by_key.values() if any(km.d for km in kms)),
+            "metrics_judged": sum(len(km.d) for km in metrics),
+            "metrics_skipped": sum(len(km.skipped) for km in metrics),
+            "all_dark_keys": sum(1 for kms in by_key.values() if all(not km.bases and "refused (BBR027)"
+                                                                    not in km.skipped.values() for km in kms)),
+            "transitions": sum(1 for kms in by_key.values() if kms[0].transition),
+            "zero_fill_differences": sum(len(km.zero_fill_differs) for km in metrics)}
+
+
+def _largest(metrics: Sequence[KeyMetrics]) -> dict[str, dict]:
+    largest: dict[str, dict] = {}
+    for km in metrics:
+        for name, value in km.d.items():
+            label = f"{km.field}.{name}"
+            if label not in largest or value > largest[label]["d"]:
+                largest[label] = {"phi_deg": km.key[0], "theta_deg": km.key[1], "d": value}
+    return largest
+
+
+def compare_jobs(new_job: Path, ref_job: Path, inputs: InputCapture,
+                 keys: Sequence[tuple[float, float]]) -> PairingResult:
+    """``compare_sides`` on two job roots' datasets, read through ``inputs`` keeping only ``keys``; an input that
+    cannot be read or validated becomes the result's refusal."""
+    try:
+        new = read_side("new", job_dataset_dirs(new_job), inputs, keys)
+        ref = read_side("reference", job_dataset_dirs(ref_job), inputs, keys)
+    except PairingRefused as exc:
+        return PairingResult({}, {}, [], [str(exc)], _coverage(keys, []), {})
+    return compare_sides(new, ref, keys)
+
+
+def verdict(result: PairingResult, mode: str | None = None, tol: float | None = None) -> tuple[str, list[str]]:
+    """("not judged" | "pass" | "fail", failures) under the policy: ``mode`` and ``tol`` default to the module's
+    MODE and TOL at call time. Measure mode judges nothing. Enforce mode (TOL finite and positive) fails a dark/lit
+    transition and any judged deviation above TOL, passes when at least one metric was judged, and is "not judged"
+    when every metric was legitimately skipped. Refusals are the inputs row's, in either mode. Any other policy is
+    refused."""
+    mode = MODE if mode is None else mode
+    tol = TOL if tol is None and mode == MODE else tol
+    if mode == "measure":
+        if tol is not None:
+            raise PairingRefused(f"policy {POLICY}: measure mode records no tolerance, got {tol!r}")
+        return "not judged", []
+    if mode != "enforce":
+        raise PairingRefused(f"policy {POLICY}: unknown mode {mode!r}, expected 'measure' or 'enforce'")
+    if isinstance(tol, bool) or not isinstance(tol, (int, float)) or not np.isfinite(tol) or tol <= 0.0:
+        raise PairingRefused(f"policy {POLICY}: enforce mode needs a finite positive tolerance, got {tol!r}")
+    failures = []
+    seen = set()
+    for km in result.keys:
+        if km.transition and km.key not in seen:
+            seen.add(km.key)
+            failures.append(f"{key_text(km.key)}: dark/lit transition (new {km.states['new']}, reference "
+                            f"{km.states['ref']})")
+        for name, value in km.d.items():
+            if value > tol:
+                failures.append(f"{km.field} {name} at {key_text(km.key)}: d = {value:.4g} above {tol:g}")
+    if failures:
+        return "fail", failures
+    return ("pass", []) if any(km.d for km in result.keys) else ("not judged", [])
