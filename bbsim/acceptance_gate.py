@@ -285,6 +285,14 @@ def report_problems(report: object, kind: str, job: Path, requirement: Requireme
     problems: list[str] = []
     if report.get("passed") is not True:
         problems.append(f"{name} records passed {json.dumps(report.get('passed'))}, not true")
+    checks = report.get("checks")
+    if not (isinstance(checks, list) and checks and all(isinstance(c, Mapping) for c in checks)):
+        problems.append(f"{name}'s checks must be a non-empty list of rows, got {type(checks).__name__} {checks!r:.40}: "
+                        "its verdict stands on nothing")
+    else:
+        failed = [str(c.get("name")) for c in checks if c.get("severity") == "fail" and c.get("passed") is not True]
+        if failed:
+            problems.append(f"{name}'s own rows {failed} failed, which contradicts a passed verdict")
     binding = report.get("binding")
     if binding is None:
         return problems + [f"{name} carries no file binding (made before CDX-038); copy it aside, then rerun python -m "
