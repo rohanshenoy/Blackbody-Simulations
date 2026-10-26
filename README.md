@@ -18,7 +18,8 @@ These gaps behave like semi-open parallel-plate waveguides that can support low-
    `python compare_hfss_exports.py <job>/InfParallelPlate_crack1Rohan_500GHz_Ephi=0 <reference dir>`
 4. Post-process (BBRsim's sampling physics per key, schema 1): `python postprocess.py <Ephi=0 dir> <Ephi=1 dir>`, `python plot.py <dataset dir> --out-dir figs`.
 
-See `hpc/README.md` for the cluster environment.
+The cluster environment is in `ANSYS_HPC_INSTALL_README.md`. The Slurm scripts and the HPC run log live in the
+bbrsim-bridge repository under `scripts/hpc/hfss/`, copied to `/home/rshenoy/BBRSim/hfss/` on the cluster.
 For the original geometry and simulation guide, see [here](https://github.com/ModerJason/Blackbody-Simulations/blob/main/Blackbody%20Simulations%20Usage%20Guide.pdf).
 The original Windows script is preserved in `legacy/`. The usage guide PDF refers to `bbsim.py`;
 the actual legacy script is `legacy/bbsim1freq.py`.

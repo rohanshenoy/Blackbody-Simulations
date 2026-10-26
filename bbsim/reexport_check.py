@@ -10,7 +10,8 @@ of its solved project (HF-050). On the HPC this is the gate before the ``_v2`` t
 checkout that made the re-export: the embedded column-order reference is checked against this checkout's exporter
 files, as the runner checks it.
 
-``--preflight`` runs before the re-export, so that ``hpc/reexport_v2.sbatch`` refuses before any AEDT session starts:
+``--preflight`` runs before the re-export, so that ``reexport.sbatch`` (bbrsim-bridge scripts/hpc/hfss) refuses
+before any AEDT session starts:
 the --poynting record must exist, be made on this source (its ``manifest_sha256``) and hold every key of the source
 manifest's excitation lists for both polarizations, each with a finite ``exit.flux_z_w``. It reads step 8b's record
 with the same parser as the ``powers.poynting`` row below (``read_poynting``). It prints ``PREFLIGHT: PASS`` and
@@ -39,13 +40,20 @@ declaration that a manifest or a CSV header contradicts fails before any value i
    raw flux otherwise (OR-038); t_flux = OutgoingPower / (A I);
    IngoingPower = A I; InterceptFactor constant within each key and equal to c_key, itself recomputed from the
    declared grid, to 1e-12 (OR-034); the fresh |Re S| equal to the source's OutgoingPower to 1e-4; with
-   ``--poynting`` (hpc/diagnose_poynting.py's poynting.json), the raw flux equal to step 8b's ``flux_z_w`` to 1e-4,
+   ``--poynting`` (step 8b's poynting.json, written by ``diagnose_poynting.py``, archived in bbrsim-bridge
+   scripts/hpc/hfss/archive/), the raw flux equal to step 8b's ``flux_z_w`` to 1e-4,
    absolute 1e-12 A I at zero (CDX-009).
 7. Convergence (CDX-025): the source's saved tables re-qualified at its recorded target; both polarizations must
    qualify and agree field by field with the fresh qualification, and with the source manifest's record if it has one.
+8. Binding (CDX-038): every file the rows read was read through one ``acceptance_gate.InputCapture``, which hashed
+   the very bytes each reader parsed (the raw tables' and convergence tables' hashes are those of the bytes judged);
+   at the end every evidence file (``acceptance_gate.evidence_files``: both jobs' core files and convergence tables,
+   the kept raw tables when the method is ``reference``, the --poynting record) is hashed again. A file that changed,
+   or required evidence that is missing, fails the row. The report's ``binding`` holds those digests, which assembly
+   checks against the files before copying them.
 
 Missing, malformed or non-finite input fails the row that needs it; nothing is compared with NaN. Every row, the
-largest deviations and the verdict go to ``<fresh>/reexport_check.json``, written after the table is printed and
+largest deviations, the binding and the verdict go to ``<fresh>/reexport_check.json``, written after the table is printed and
 only into a fresh job whose sidecar declares schema 2.x, so a swapped --source/--fresh never writes into a schema-1
 source; a report that cannot be written is named on its own ``report:`` line and fails the run, without a traceback.
 The printed table ends in ``REEXPORT: PASS`` or ``REEXPORT: FAIL <n>`` (n failing rows, the report counted). Exit
@@ -64,7 +72,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from bbsim import dataset_v2, schema
+from bbsim import acceptance_gate, dataset_v2, schema
 from bbsim.acceptance_rows import RowVerdicts, guard
 from bbsim.acceptance_rows import Refused as _Refused
 from bbsim.acceptance_rows import at_key as _where
@@ -106,6 +114,13 @@ QUALIFICATION_FIELDS = ("achieved", "target", "passes_completed", "max_passes", 
 EXIT_ROWS = ("exit_field.dark", "exit_field.scale", "exit_field.values", "exit_field.normalization")
 
 _MISSING = object()
+
+
+def tolerances(eps: float = EPS) -> dict[str, float]:
+    """The tolerances a report records, and assembly expects (``acceptance_gate.expected_tolerances``)."""
+    return {"eps": eps, "scale_rel": SCALE_REL, "normalization_rel": NORMALIZATION_REL,
+            "intercept_rel": INTERCEPT_REL, "abs_re_s_rel": ABS_RE_S_REL, "poynting_rel": POYNTING_REL,
+            "stored_rel": STORED_REL, "coord_m": COORD_M, "key_deg": KEY_DEG, "dark_rel": DARK_REL}
 
 
 # --- small helpers ---------------------------------------------------------------------------------------------------
@@ -201,6 +216,7 @@ class ReexportResult(RowVerdicts):
     report_target: str | None = None   # <fresh>/reexport_check.json for a declared schema-2 fresh job, else None
     report: str | None = None          # the JSON written (``write_report``)
     report_error: str | None = None    # why it could not be written
+    binding: dict | None = None        # acceptance_gate.binding_block over the bytes the rows read (CDX-038)
 
     @property
     def passed(self) -> bool:
@@ -216,7 +232,7 @@ class ReexportResult(RowVerdicts):
         return {"source": self.source, "fresh": self.fresh, "poynting": self.poynting, "passed": self.passed,
                 "failed": len(self.failures), "verdict": self.verdict, "tolerances": dict(self.tolerances),
                 "checks": [asdict(c) for c in self.checks],
-                "largest_deviations": {k: dict(v) for k, v in self.largest_deviation.items()}}
+                "largest_deviations": {k: dict(v) for k, v in self.largest_deviation.items()}, "binding": self.binding}
 
     def format_table(self) -> str:
         return self.format_rows() + "\n" + self.format_footer()
@@ -285,6 +301,7 @@ class _Acceptance:
         self.rows: dict[int, list[np.ndarray]] = {}
         self.ff_rows: dict[int, list[np.ndarray]] = {}
         self._cache: dict[str, tuple[Any, BaseException | None]] = {}
+        self.inputs = acceptance_gate.InputCapture()     # every job file is read through it (CDX-038)
 
     # -- plumbing ------------------------------------------------------------------------------------------------
     def _note(self, name: str, value: float, where: str, limit: float) -> None:
@@ -339,7 +356,22 @@ class _Acceptance:
                            ("powers.abs_re_s", self._abs_re_s), ("powers.poynting", self._poynting)):
             checks += self._needs([name], lambda step=step: [step()], aligned=True)
         checks += self._guard(["convergence"], lambda: [self._convergence()])
+        checks += self._guard(["binding.inputs"], lambda: [self._binding_inputs()])
         return checks
+
+    def _binding_inputs(self) -> Check:
+        problems: list[str] = []
+        for path in acceptance_gate.evidence_files("reexport_check", self.fresh.root, self.source.root,
+                                                   self.fresh.sidecar, self.poynting):
+            try:
+                self.inputs.digest(path)
+            except OSError as exc:
+                problems.append(f"{path} is required evidence and is missing or unreadable ({exc})")
+            except acceptance_gate.InputChanged:
+                pass                                     # in self.inputs.problems
+        problems = list(dict.fromkeys(self.inputs.problems + problems))
+        return _row("binding.inputs", "every file read once and unchanged until the end of the check, every evidence "
+                    "file present and hashed", problems, f"{len(self.inputs.hashes)} files bound")
 
     # -- 0. declared schemas -------------------------------------------------------------------------------------
     def _declaration(self, job: _Job, problems: list[str]) -> object:
@@ -349,7 +381,7 @@ class _Acceptance:
             problems.append(f"the {job.label} job holds {len(sidecars)} dataset sidecars (*.dataset.json), not 1{names}")
             return None
         try:
-            job.sidecar = _read_json(sidecars[0], f"the {job.label} sidecar")
+            job.sidecar = _read_json(sidecars[0], f"the {job.label} sidecar", read_text=self.inputs.read_text)
         except _Refused as exc:
             problems.append(str(exc))
             return None
@@ -364,7 +396,8 @@ class _Acceptance:
                                      (self.fresh, 2, schema.WAVEGUIDE_COLUMNS_V2)):
             version = job.sidecar["schema_version"]
             try:
-                job.manifest = _read_json(job.root / "manifest.json", f"the {job.label} manifest")
+                job.manifest = _read_json(job.root / "manifest.json", f"the {job.label} manifest",
+                                          read_text=self.inputs.read_text)
             except _Refused as exc:
                 problems.append(str(exc))
                 continue
@@ -384,7 +417,7 @@ class _Acceptance:
                 for name, expected in (("waveguide.csv", columns), ("far_field.csv", schema.FAR_FIELD_COLUMNS)):
                     try:
                         path = job.csv(ephi, name)
-                        header = list(pd.read_csv(path, nrows=0).columns)
+                        header = list(self.inputs.parse(path, lambda f: pd.read_csv(f, nrows=0)).columns)
                     except (_Refused, OSError, ValueError) as exc:
                         problems.append(f"the {job.label} {name} of Ephi={ephi} is unreadable: {exc}")
                         continue
@@ -477,7 +510,7 @@ class _Acceptance:
         if retained[0] != retained[1]:
             problems.append(f"exit_field.points_per_key_retained: source {retained[0]!r}, fresh {retained[1]!r}")
 
-        source_sha = sha256_file(self.source.root / "manifest.json")
+        source_sha = self.inputs.digest(self.source.root / "manifest.json")
         reexport = _get(f, "provenance", "reexport", where="the fresh sidecar", default=None)
         if not isinstance(reexport, Mapping):
             problems.append("the fresh sidecar has no provenance.reexport: it is not a re-export")
@@ -497,7 +530,7 @@ class _Acceptance:
                 for name, store in (("waveguide.csv", job.waveguide), ("far_field.csv", job.far_field)):
                     path = job.csv(ephi, name)
                     where = f"the {job.label} {path.parent.name}/{name}"
-                    frame = pd.read_csv(path)
+                    frame = self.inputs.parse(path, pd.read_csv)
                     try:
                         numeric = frame.iloc[:, 1:].to_numpy(dtype=float)
                     except (TypeError, ValueError) as exc:
@@ -638,10 +671,10 @@ class _Acceptance:
                 if not path.is_file():
                     problems.append(f"the reference job keeps no raw table {path}")
                     continue
-                if sha256_file(path) != expected:
+                frame = self.inputs.parse(path, pd.read_csv)     # the hash below is of the bytes parsed
+                if self.inputs.recorded(path) != expected:
                     problems.append(f"{path.name} does not hash to the reference's raw_table_sha256[{ephi!r}]")
                     continue
-                frame = pd.read_csv(path)
                 if list(frame.columns) != list(schema.WAVEGUIDE_COLUMNS):
                     problems.append(f"{path.name} does not carry the 1.0 columns it was hashed with")
                     continue
@@ -1078,10 +1111,10 @@ class _Acceptance:
                 "at zero), every key and polarization")
         if self.poynting is None:
             return Check("powers.poynting", True, "info", "not requested (--poynting)")
-        data = _read_json(self.poynting, "the --poynting record")
+        data = _read_json(self.poynting, "the --poynting record", read_text=self.inputs.read_text)
         raw, _ = self._raw_powers()
         floor = DARK_REL * self._ai()
-        seen, problems = read_poynting(data, self.keys, sha256_file(self.source.root / "manifest.json"))
+        seen, problems = read_poynting(data, self.keys, self.inputs.digest(self.source.root / "manifest.json"))
         for (ephi, k), f8b in sorted(seen.items()):
             if (ephi, k) not in raw:
                 continue
@@ -1120,12 +1153,12 @@ class _Acceptance:
             e = str(ephi)
             path = self.source.root / "logs" / f"convergence_Ephi{ephi}.txt"
             try:
-                text = path.read_text()
-            except OSError as exc:
+                text = self.inputs.read_text(path)
+            except (OSError, ValueError) as exc:
                 problems.append(f"Ephi={ephi}: the source convergence table {path} is unreadable ({exc}): it is no "
                                 "evidence of convergence")
                 continue
-            tables[e] = {"path": str(path), "sha256": sha256_file(path)}
+            tables[e] = {"path": str(path), "sha256": self.inputs.recorded(path)}     # of the text qualified
             q = qualify(text, target)
             source_q[e] = {name: q[name] for name in QUALIFICATION_FIELDS}
             if not q["qualified"]:
@@ -1144,8 +1177,8 @@ class _Acceptance:
                                 f"manifest's: {', '.join(diff)}")
             fresh_path = self.fresh.root / "logs" / f"convergence_Ephi{ephi}.txt"
             try:
-                fq = qualify(fresh_path.read_text(), target)
-            except OSError as exc:
+                fq = qualify(self.inputs.read_text(fresh_path), target)
+            except (OSError, ValueError) as exc:
                 problems.append(f"Ephi={ephi}: the fresh convergence table {fresh_path} is unreadable ({exc})")
                 continue
             fresh_q[e] = {name: fq[name] for name in QUALIFICATION_FIELDS}
@@ -1165,7 +1198,7 @@ class _Acceptance:
 
 def read_poynting(data: object, keys: Sequence[tuple[float, float]], manifest_sha256: str
                   ) -> tuple[dict[tuple[int, int], float], list[str]]:
-    """The exit ``flux_z_w`` of every (Ephi, key index) in step 8b's record (``hpc/diagnose_poynting.py``'s
+    """The exit ``flux_z_w`` of every (Ephi, key index) in step 8b's record (the archived ``diagnose_poynting.py``'s
     ``poynting.json``), and what is wrong with the record, each problem named: made on another job than the one whose
     manifest hashes to ``manifest_sha256``; a record unreadable, off ``keys`` or repeated; a polarization absent; the
     declared keys a polarization lacks. ``keys`` are the declared (phi, theta) keys in degrees."""
@@ -1263,13 +1296,13 @@ def check(source_job: Path, fresh_job: Path, poynting: Path | None = None, eps: 
         raise ValueError(f"eps must be a finite positive number, got {eps!r}")
     acceptance = _Acceptance(source_job, fresh_job, None if poynting is None else Path(poynting), float(eps))
     checks = acceptance.run()
-    tolerances = {"eps": float(eps), "scale_rel": SCALE_REL, "normalization_rel": NORMALIZATION_REL,
-                  "intercept_rel": INTERCEPT_REL, "abs_re_s_rel": ABS_RE_S_REL, "poynting_rel": POYNTING_REL,
-                  "stored_rel": STORED_REL, "coord_m": COORD_M, "key_deg": KEY_DEG, "dark_rel": DARK_REL}
     version = acceptance.fresh.sidecar.get("schema_version")
     target = fresh_job / REPORT_NAME if isinstance(version, str) and version.split(".")[0] == FRESH_MAJOR else None
     result = ReexportResult(str(source_job), str(fresh_job), None if poynting is None else str(poynting), checks,
-                            acceptance.largest, tolerances, report_target=None if target is None else str(target))
+                            acceptance.largest, tolerances(float(eps)),
+                            report_target=None if target is None else str(target),
+                            binding=acceptance_gate.binding_block("reexport_check", fresh_job, source_job,
+                                                                  acceptance.inputs.hashes))
     if write:
         write_report(result)
     return result

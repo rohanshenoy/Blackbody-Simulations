@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import math
+import os
 import tomllib
 from collections.abc import Mapping
 from dataclasses import MISSING, asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
+
+from bbsim import acceptance_gate
 
 
 class ConfigError(ValueError):
@@ -237,6 +240,23 @@ class OutputConfig:
 
 
 @dataclass(frozen=True)
+class AcceptanceConfig:
+    """The acceptance the job's dataset needs before assembly (CDX-039, OR-042): ``kind`` is "none",
+    "grid_acceptance" (a 35-key solve judged against the 15-key ``reference_job`` of the same geometry, at
+    ``t_rel_tol``, default the checker's 0.005) or "reexport_check" (set by --from-solved from its source job, never
+    in a config file). The manifest records it, and assembly requires exactly it."""
+    kind: str
+    reference_job: Path | None = None
+    t_rel_tol: float | None = None
+
+    def __post_init__(self) -> None:
+        try:
+            acceptance_gate.validate_requirement_fields(self.kind, self.reference_job, self.t_rel_tol)
+        except acceptance_gate.GateError as exc:
+            raise ConfigError(str(exc)) from None
+
+
+@dataclass(frozen=True)
 class RunConfig:
     project: ProjectConfig
     geometry: GeometryConfig
@@ -245,6 +265,7 @@ class RunConfig:
     far_field: FarFieldConfig
     exit_field: ExitFieldConfig
     output: OutputConfig
+    acceptance: AcceptanceConfig
 
 
 _SECTIONS: dict[str, type] = {
@@ -255,12 +276,21 @@ _SECTIONS: dict[str, type] = {
     "far_field": FarFieldConfig,
     "exit_field": ExitFieldConfig,
     "output": OutputConfig,
+    "acceptance": AcceptanceConfig,
 }
 _PATH_FIELDS = {"path", "root"}
 _FACE_FIELDS = {"entrance_face", "exit_face"}
 
 
 def _coerce(name: str, value: Any, where: str) -> Any:
+    if name == "reference_job":
+        # Optional: None stays None. A path is made absolute from the loading directory (the checkout, for the
+        # bridge scripts), not the TOML's, and kept as written otherwise; comparisons resolve both sides (CDX-039).
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(f"[{where}] reference_job must be a nonblank string path, got {value!r}")
+        return Path(os.path.abspath(os.path.expanduser(value)))
     if name in _PATH_FIELDS:
         if not isinstance(value, str):
             raise ConfigError(f"[{where}] {name} must be a string path")
@@ -307,13 +337,20 @@ def build_config(raw: Mapping[str, Any], overrides: Mapping[str, Any] | None = N
         if name not in {f.name for f in fields(_SECTIONS[section])}:
             raise ConfigError(f"unknown override {key!r}")
         data.setdefault(section, {})[name] = value
+    if "acceptance" not in data:
+        raise ConfigError('[acceptance] is required: kind = "none", or kind = "grid_acceptance" with reference_job '
+                          "(CDX-039, OR-042)")
     return RunConfig(**{s: _build(cls, data.get(s, {}), s) for s, cls in _SECTIONS.items()})
 
 
 def load_config(path: Path | str, overrides: Mapping[str, Any] | None = None) -> RunConfig:
     with open(path, "rb") as fh:
         raw = tomllib.load(fh)
-    return build_config(raw, overrides)
+    cfg = build_config(raw, overrides)
+    if cfg.acceptance.kind == "reexport_check":
+        raise ConfigError("[acceptance] kind reexport_check: a re-export's requirement is set by --from-solved from its "
+                          "source job; a config file declares none or grid_acceptance")
+    return cfg
 
 
 def config_to_dict(cfg: RunConfig) -> dict[str, Any]:
