@@ -821,7 +821,7 @@ def check_before_copy(source: SourceJob, reference: Mapping | None) -> None:
 
 def stage_solved_job(source: SourceJob, dirs: JobDirs) -> StagedProject:
     """Copy the source's solved project and its ``.aedtresults`` into the fresh job, before any AEDT session, as
-    step 8b's ``diagnose_poynting.py`` (archived in bbrsim-bridge) copied a solved job; AEDT opens only the copy, so the
+    step 8b's ``diagnose_poynting.py`` (archived in bbridge) copied a solved job; AEDT opens only the copy, so the
     source is never written."""
     job_project = dirs.project / source.project.name
     shutil.copy2(source.project, job_project)

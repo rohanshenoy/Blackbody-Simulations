@@ -258,11 +258,11 @@ and the Python import/path checks above passed.
 
 Update 2026-09-28: non-graphical AEDT 2025.2 startup on a compute node was
 verified with PyAEDT 1.7.0 (`aedt_smoke_test.py`, now archived in
-bbrsim-bridge `scripts/hpc/hfss/archive/`; Slurm job 3614903, debug QOS):
+bbridge `scripts/hpc/hfss/archive/`; Slurm job 3614903, debug QOS):
 the desktop started over gRPC in 43 s, created and saved a project, and
 released cleanly, so the base AEDT license checkout works from compute
 nodes. An HFSS solver license checkout and an actual simulation had **not
-yet been verified** then; see the HPC run log, `RESULTS.md` in bbrsim-bridge
+yet been verified** then; see the HPC run log, `RESULTS.md` in bbridge
 `scripts/hpc/hfss/`.
 
 Before batch execution, Blackbody-Simulations still needs its graphical
@@ -276,7 +276,7 @@ BBRsim, the Geant4 package (Mac checkout `/Users/rohanshenoy/BBRsim/BBRSimulatio
 was built against the cluster's own Geant4 module until 2026-10-22. Since then
 it is built against Geant4 11.4.0, the Mac's version, installed by us under
 `/resnick/groups/golwala/rshenoy/software/` by `g4_build_11.4.sbatch` (kept in
-the bbrsim-bridge repository, not yet published; on the HPC at
+the bbridge repository, not yet published; on the HPC at
 `/home/rshenoy/BBRSim/g4_build_11.4.sbatch`; multithreaded, GDML, C++17;
 ledger G4-026). No administrator rights are needed. The rest of this section records
 the 2026-09-30 setup on 11.1.2.

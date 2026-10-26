@@ -159,7 +159,7 @@ def add_exit_flux_expression(hfss: Any) -> None:
     The exit face's outward normal is +z in the canonical pose, so ScalarZ is the flux (HF-039(1), CDX-009), where
     ``outgoing_power`` integrates the magnitude |Re S|. It does not clear the named expressions, unlike
     ``add_outgoing_power_expression``, so it can be added beside it, or to a solved design that holds it already
-    (step 8b's ``diagnose_poynting.py``, archived in bbrsim-bridge scripts/hpc/hfss/archive/, built the same
+    (step 8b's ``diagnose_poynting.py``, archived in bbridge scripts/hpc/hfss/archive/, built the same
     expression as ``dg_exit_flux_z``).
     """
     fields = hfss.odesign.GetModule("FieldsReporter")
