@@ -2,11 +2,15 @@
 
 A grid file lists one array task per line, ``<frequency GHz> [<step along l, mm>]``:
 
-- the frequency is a positive integer written with digits only (no sign, leading zero or decimal point, so ``500.0``
-  is refused), strictly ascending and never repeated;
+- the frequency is a positive integer of at most 6 digits, written with digits only (no sign, leading zero or decimal
+  point, so ``500.0`` is refused), strictly ascending and never repeated;
 - the optional step is the requested exit-field resolution along l, a finite positive decimal in mm; without it the
   config's own ``exit_field.resolution_mm[1]`` applies;
-- ``#`` starts a comment, on a line of its own or after the values; blank lines are skipped.
+- ``#`` starts a comment, on a line of its own or after the values; blank lines are skipped;
+- lines end at LF, with one CR before it allowed (CRLF), and fields are separated by spaces and tabs only. Any other
+  character outside printable ASCII is refused, in comments too: a bare CR, form feed, vertical tab, U+2028 or a
+  no-break space would otherwise split a line differently here than in an editor, and turn a frequency into the
+  previous entry's step.
 
 Every refusal is a ``GridError`` that names its line; ``read_grid`` adds the file. ``max_entries`` defaults to 1001,
 Slurm's default MaxArraySize (indices 0 to 1000); a caller may pass a smaller cap.
@@ -37,7 +41,9 @@ RULE_ABOVE_GHZ = 750.0                  # the c/(4f) rule applies strictly above
 SPEED_OF_LIGHT_M_PER_S = 299792458.0    # equal to bbsim.sampling.SPEED_OF_LIGHT_M_PER_S
 MAX_ENTRIES = 1001                      # Slurm's default MaxArraySize
 
-_FREQUENCY = re.compile(r"[1-9][0-9]*")
+_FREQUENCY = re.compile(r"[1-9][0-9]{0,5}")   # at most 6 digits, so every frequency converts to a finite float
+_NOT_ALLOWED = re.compile(r"[^\t\x20-\x7e]")  # anything but tab and printable ASCII
+_FIELD_SEPARATOR = re.compile(r"[ \t]+")
 _STEP = re.compile(r"(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
 _FORM = "an entry is '<frequency GHz> [<step along l, mm>]'"
 
@@ -61,10 +67,16 @@ def parse_grid(text: str, max_entries: int = MAX_ENTRIES) -> list[GridEntry]:
     entries: list[GridEntry] = []
     first_line: dict[int, int] = {}
     for number, raw in enumerate(text.split("\n"), start=1):
-        fields = raw.split("#", 1)[0].split()
+        where = f"line {number}: "
+        line = raw[:-1] if raw.endswith("\r") else raw
+        bad = _NOT_ALLOWED.search(line)
+        if bad:
+            char = bad.group()
+            raise GridError(f"{where}character {char!r} (U+{ord(char):04X}) is not allowed: a grid line holds "
+                            "printable ASCII and tabs and ends at LF or CRLF")
+        fields = [field for field in _FIELD_SEPARATOR.split(line.split("#", 1)[0]) if field]
         if not fields:
             continue
-        where = f"line {number}: "
         if len(entries) == max_entries:
             raise GridError(f"{where}more than {max_entries} entries")
         if len(fields) > 2:
@@ -100,10 +112,10 @@ def read_grid(path: Path, max_entries: int = MAX_ENTRIES) -> tuple[list[GridEntr
 
 def max_l_step_mm(frequency_ghz: float) -> float:
     """c/(4f) in mm: the largest exit step along l allowed above ``RULE_ABOVE_GHZ`` (OR-037, HF-051)."""
-    if isinstance(frequency_ghz, bool) or not isinstance(frequency_ghz, numbers.Real) \
-            or not math.isfinite(frequency_ghz) or frequency_ghz <= 0:
+    frequency = _finite_positive(frequency_ghz)
+    if frequency is None:
         raise GridError(f"frequency {frequency_ghz!r} GHz must be a finite positive number")
-    return SPEED_OF_LIGHT_M_PER_S / (4.0 * float(frequency_ghz) * 1e9) * 1e3
+    return SPEED_OF_LIGHT_M_PER_S / (4.0 * frequency * 1e9) * 1e3
 
 
 def effective_l_resolution_mm(entry: GridEntry, config_l_resolution_mm: float) -> float:
@@ -128,23 +140,41 @@ def effective_l_resolution_mm(entry: GridEntry, config_l_resolution_mm: float) -
 
 def _frequency(token: str, where: str) -> int:
     if not _FREQUENCY.fullmatch(token):
-        raise GridError(f"{where}frequency {token!r} is not a positive integer GHz (digits only, no sign, leading zero "
-                        "or decimal point)")
+        raise GridError(f"{where}frequency {_shown(token)} is not a positive integer GHz of at most 6 digits (digits "
+                        "only, no sign, leading zero or decimal point)")
     return int(token)
 
 
 def _step(token: str, where: str) -> float:
     if not _STEP.fullmatch(token):
-        raise GridError(f"{where}step along l {token!r} is not a positive decimal number of mm")
+        raise GridError(f"{where}step along l {_shown(token)} is not a positive decimal number of mm")
     value = float(token)
     if not math.isfinite(value):
-        raise GridError(f"{where}step along l {token!r} is not finite")
+        raise GridError(f"{where}step along l {_shown(token)} is not finite")
     if value <= 0:
-        raise GridError(f"{where}step along l {token!r} must be positive")
+        raise GridError(f"{where}step along l {_shown(token)} must be positive")
     return value
 
 
 def _positive_mm(value: object, what: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, numbers.Real) or not math.isfinite(value) or value <= 0:
+    number = _finite_positive(value)
+    if number is None:
         raise GridError(f"{what} {value!r} must be a finite positive number of mm")
-    return float(value)
+    return number
+
+
+def _finite_positive(value: object) -> float | None:
+    """``value`` as a float when it is a finite positive real (not a bool), else None; an int too large for a float
+    is None, not an OverflowError."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def _shown(token: str) -> str:
+    """A token for a message: its repr, cut after 20 characters when longer than 24."""
+    return repr(token) if len(token) <= 24 else f"{token[:20]!r}... ({len(token)} characters)"
