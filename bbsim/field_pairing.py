@@ -146,9 +146,10 @@ def declared_keys(sidecar: Mapping, where: str) -> list[tuple[float, float]]:
     return [(p, t) for p in axes[0] for t in axes[1]]
 
 
-def _schema1_grid(record: object, where: str) -> ExitGrid:
+def schema1_grid(record: object, where: str) -> ExitGrid:
     """A schema-1 ``exit_field.grid`` (min, max, count per axis; a step only if declared) as a ``declared_grid``,
-    the step derived as (max - min) / (count - 1)."""
+    the step derived as (max - min) / (count - 1); ``PairingRefused`` otherwise. The array_run probe policy
+    (``bbsim.run_acceptance``) reads a schema-1 lattice with it too, so one schema-1 lattice rule serves both."""
     full: dict[str, dict] = {}
     for axis in ("y_e", "z_e"):
         at = f"{where}.{axis}"
@@ -190,7 +191,7 @@ def _lattice(sidecar: dict | None, schema: str, where: str) -> tuple[str | None,
     if "grid" not in exit_field:
         return shape, None, None
     try:
-        return shape, _schema1_grid(exit_field["grid"], f"{where} exit_field.grid"), None
+        return shape, schema1_grid(exit_field["grid"], f"{where} exit_field.grid"), None
     except PairingRefused as exc:
         return shape, None, str(exc)
 
