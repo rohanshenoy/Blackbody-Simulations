@@ -127,9 +127,11 @@ class ExcitationConfig:
                 raise ConfigError(f"{name}_step_deg must be positive")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class SolverConfig:
-    frequency_ghz: float
+    # None: not given here. A job-array plan supplies each task's frequency (HF-057, OR-047); a single run without
+    # one, from the config or --frequency-ghz, is refused before its job starts (run_frequency.check_before_aedt).
+    frequency_ghz: float | None = None
     max_delta_e: float
     max_passes: int
     cores: int
@@ -139,13 +141,14 @@ class SolverConfig:
     wall_normal_deviation_deg: float | None = None
 
     def __post_init__(self) -> None:
-        _finite("frequency_ghz", self.frequency_ghz)
+        if self.frequency_ghz is not None:
+            _finite("frequency_ghz", self.frequency_ghz)
         _finite("max_delta_e", self.max_delta_e)
         _integer("max_passes", self.max_passes)
         _integer("cores", self.cores)
         if self.wall_normal_deviation_deg is not None:
             _finite("wall_normal_deviation_deg", self.wall_normal_deviation_deg)
-        if self.frequency_ghz <= 0:
+        if self.frequency_ghz is not None and self.frequency_ghz <= 0:
             raise ConfigError("frequency_ghz must be positive")
         if self.max_delta_e <= 0:
             raise ConfigError("max_delta_e must be positive")

@@ -177,8 +177,11 @@ def check_before_aedt(cfg: RunConfig, reference: Mapping | None) -> None:
     written: under schema 1 a column-order reference (schema 1 neither needs nor applies it); under schema 2
     anything but both polarizations, a declared theta grid without a 90 deg key and one above it (``cell_90`` is
     defined by that band, HF-049 and OR-036), and a missing reference on any job but the reference job (HF-041).
-    Under both schemas, an acceptance reference_job that is not an existing directory: the job that is to judge this
-    one must exist before a licensed solve (CDX-039)."""
+    Under both schemas, first a run with no frequency (solver.frequency_ghz may be absent from a config, for a
+    job-array plan to supply; HF-057, OR-047), then an acceptance reference_job that is not an existing directory: the
+    job that is to judge this one must exist before a licensed solve (CDX-039)."""
+    if cfg.solver.frequency_ghz is None:
+        raise ValueError("no frequency: give solver.frequency_ghz in the config, --frequency-ghz, or a plan")
     reference_job = cfg.acceptance.reference_job
     if reference_job is not None and not Path(reference_job).is_dir():
         raise ValueError(f"[acceptance] reference_job {reference_job} is not an existing job directory: the "
@@ -779,6 +782,9 @@ def load_source_job(job_dir: Path) -> SourceJob:
     # nothing); the fresh manifest records it, equal to the sidecar's provenance.reexport.source_job.
     raw["acceptance"] = {"kind": "reexport_check", "reference_job": str(job_dir)}
     cfg = build_config(raw)
+    if cfg.solver.frequency_ghz is None:
+        # A config may leave it to a plan (HF-057, OR-047), but a finished job always ran at one and records it.
+        raise ValueError(f"{manifest_path}'s config records no solver.frequency_ghz: a finished job records its own")
     folder = f"{cfg.project.dataset_id}_{frequency_label(cfg.solver.frequency_ghz)}"
     if job_dir.parent.name != folder:
         raise ValueError(f"the source job {job_dir} is not in its dataset folder {folder}/, where the fresh job goes")
