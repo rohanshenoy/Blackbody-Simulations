@@ -77,9 +77,13 @@ from bbsim.acceptance_rows import RowVerdicts, guard
 from bbsim.acceptance_rows import Refused as _Refused
 from bbsim.acceptance_rows import at_key as _where
 from bbsim.acceptance_rows import get as _get
+from bbsim.acceptance_rows import match_records as _match_records
 from bbsim.acceptance_rows import number as _number
+from bbsim.acceptance_rows import phi_theta as _phi_theta
 from bbsim.acceptance_rows import read_json as _read_json
+from bbsim.acceptance_rows import relative as _relative
 from bbsim.acceptance_rows import row as _row
+from bbsim.acceptance_rows import strict_records as _strict
 from bbsim.compare import Check
 from bbsim.convergence import qualify
 from bbsim.dataset_v2 import key_text
@@ -131,13 +135,6 @@ def _integer(value: object, where: str) -> int:
     return int(value)
 
 
-def _relative(a: float, b: float) -> float:
-    """|a - b| / |b|, 0 when both are 0, infinity when only b is."""
-    if a == b:
-        return 0.0
-    return abs(a - b) / abs(b) if b != 0.0 else math.inf
-
-
 def _same_value(a: object, b: object, rel: float = 1e-12) -> bool:
     numeric = (int, float, np.integer, np.floating)
     if isinstance(a, numeric) and isinstance(b, numeric) and not isinstance(a, bool) and not isinstance(b, bool):
@@ -149,54 +146,11 @@ def _same_value(a: object, b: object, rel: float = 1e-12) -> bool:
     return a == b
 
 
-def _phi_theta(record: object, where: str) -> tuple[float, float]:
-    if not isinstance(record, Mapping):
-        raise _Refused(f"{where} is not an object")
-    return _number(record.get("phi_deg"), f"{where}.phi_deg"), _number(record.get("theta_deg"), f"{where}.theta_deg")
-
-
 def _rim_key(record: object, where: str) -> tuple[float, float]:
     key = record.get("key") if isinstance(record, Mapping) else None
     if not isinstance(key, (list, tuple)) or len(key) != 2:
         raise _Refused(f"{where}.key must be [phi, theta], got {key!r}")
     return _number(key[0], f"{where}.key[0]"), _number(key[1], f"{where}.key[1]")
-
-
-def _match_records(records: object, keys: Sequence[tuple[float, float]], where: str,
-                   key_of: Callable[[object, str], tuple[float, float]] = _phi_theta,
-                   polarized: bool = False) -> tuple[dict[int, Any], list[str]]:
-    """The records of a per-key list by declared key index, and what is wrong with the list: not a list, a record
-    off the declared grid or unreadable, two records at one key, declared keys without a record. ``polarized``: each
-    record holds both polarizations, so a repeated key repeats Ephi=0 and Ephi=1 alike."""
-    if not isinstance(records, list):
-        return {}, [f"{where} must be a list of per-key records, got {type(records).__name__}"]
-    found: dict[int, Any] = {}
-    problems: list[str] = []
-    for i, record in enumerate(records):
-        try:
-            phi, theta = key_of(record, f"{where}[{i}]")
-        except _Refused as exc:
-            problems.append(str(exc))
-            continue
-        k = dataset_v2.key_position(keys, phi, theta)
-        if k is None:
-            problems.append(f"{where} has a record at {key_text((phi, theta))}, outside the declared grid")
-        elif k in found:
-            repeated = ": Ephi=0 and Ephi=1 each appear twice" if polarized else ""
-            problems.append(f"{where} has two records at {key_text(keys[k])}{repeated}")
-        else:
-            found[k] = record
-    missing = [keys[k] for k in range(len(keys)) if k not in found]
-    if missing:
-        problems.append(f"{where} lacks {len(missing)} declared keys, the first at {key_text(missing[0])}")
-    return found, problems
-
-
-def _strict(records: object, keys: Sequence[tuple[float, float]], where: str, **kwargs: Any) -> dict[int, Any]:
-    found, problems = _match_records(records, keys, where, **kwargs)
-    if problems:
-        raise _Refused("; ".join(problems))
-    return found
 
 
 # --- the result ------------------------------------------------------------------------------------------------------

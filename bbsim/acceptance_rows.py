@@ -1,14 +1,17 @@
-"""The check-row pieces the acceptance CLIs share (``bbsim.reexport_check``, ``bbsim.grid_acceptance``).
+"""The check-row pieces the acceptance CLIs share (``bbsim.reexport_check``, ``bbsim.grid_acceptance``,
+``bbsim.run_acceptance``).
 
 A refusal type for input a row cannot accept; readers of a finite number, a nested key and a JSON object that refuse
-as such; a fail-severity row whose detail states its rule, then its summary or its first ``MAX_LISTED`` failures; a
-guard that turns any exception in a step into failing rows, never a traceback (CDX-030); and the failures / passed
-pattern of a result that holds its rows in ``checks``.
+as such; the relative difference of two numbers; the matcher of a per-key record list to the declared keys; a
+fail-severity row whose detail states its rule, then its summary or its first ``MAX_LISTED`` failures; a guard that
+turns any exception in a step into failing rows, never a traceback (CDX-030); and the failures / passed pattern of a
+result that holds its rows in ``checks``.
 """
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Sequence
+import math
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +61,58 @@ def read_json(path: Path, what: str, *, read_text: Callable[[Path], str] | None 
     if not isinstance(data, dict):
         raise Refused(f"{what} {path} is not a JSON object")
     return data
+
+
+def relative(a: float, b: float) -> float:
+    """|a - b| / |b|, 0 when both are 0, infinity when only b is."""
+    if a == b:
+        return 0.0
+    return abs(a - b) / abs(b) if b != 0.0 else math.inf
+
+
+def phi_theta(record: object, where: str) -> tuple[float, float]:
+    if not isinstance(record, Mapping):
+        raise Refused(f"{where} is not an object")
+    return number(record.get("phi_deg"), f"{where}.phi_deg"), number(record.get("theta_deg"), f"{where}.theta_deg")
+
+
+def match_records(records: object, keys: Sequence[tuple[float, float]], where: str,
+                  key_of: Callable[[object, str], tuple[float, float]] = phi_theta,
+                  polarized: bool = False) -> tuple[dict[int, Any], list[str]]:
+    """The records of a per-key list by declared key index, and what is wrong with the list: not a list, a record
+    off the declared grid or unreadable, two records at one key, declared keys without a record. ``polarized``: each
+    record holds both polarizations, so a repeated key repeats Ephi=0 and Ephi=1 alike."""
+    if not isinstance(records, list):
+        return {}, [f"{where} must be a list of per-key records, got {type(records).__name__}"]
+    found: dict[int, Any] = {}
+    problems: list[str] = []
+    for i, record in enumerate(records):
+        try:
+            phi, theta = key_of(record, f"{where}[{i}]")
+        except Refused as exc:
+            problems.append(str(exc))
+            continue
+        k = dataset_v2.key_position(keys, phi, theta)
+        if k is None:
+            problems.append(f"{where} has a record at {key_text((phi, theta))}, outside the declared grid")
+        elif k in found:
+            repeated = ": Ephi=0 and Ephi=1 each appear twice" if polarized else ""
+            problems.append(f"{where} has two records at {key_text(keys[k])}{repeated}")
+        else:
+            found[k] = record
+    missing = [keys[k] for k in range(len(keys)) if k not in found]
+    if missing:
+        problems.append(f"{where} lacks {len(missing)} declared keys, the first at {key_text(missing[0])}")
+    return found, problems
+
+
+def strict_records(records: object, keys: Sequence[tuple[float, float]], where: str,
+                   **kwargs: Any) -> dict[int, Any]:
+    """``match_records``' records, refused with every problem it found when there is any."""
+    found, problems = match_records(records, keys, where, **kwargs)
+    if problems:
+        raise Refused("; ".join(problems))
+    return found
 
 
 def row(name: str, rule: str, failures: list[str], summary: str, values: dict | None = None) -> Check:

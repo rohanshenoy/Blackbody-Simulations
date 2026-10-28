@@ -113,7 +113,9 @@ from bbsim.acceptance_rows import at_key as _where
 from bbsim.acceptance_rows import get as _get
 from bbsim.acceptance_rows import number as _number
 from bbsim.acceptance_rows import read_json as _read_json
+from bbsim.acceptance_rows import relative as _relative
 from bbsim.acceptance_rows import row as _row
+from bbsim.acceptance_rows import strict_records as _by_key
 from bbsim.compare import Check
 from bbsim.config import RunConfig, build_config, config_to_dict
 from bbsim.convergence import CRITERION, qualify
@@ -195,13 +197,6 @@ def _positive(value: object) -> bool:
     return _real(value) and math.isfinite(value) and value > 0
 
 
-def _relative(a: float, b: float) -> float:
-    """|a - b| / |b|, 0 when both are 0, infinity when only b is."""
-    if a == b:
-        return 0.0
-    return abs(a - b) / abs(b) if b != 0.0 else math.inf
-
-
 def _within(a: float, b: float, rel: float) -> bool:
     return _relative(float(a), float(b)) <= rel
 
@@ -230,35 +225,6 @@ def _differences(a: object, b: object, path: str) -> list[str]:
                 out += _differences(a[key], b[key], f"{path}.{key}")
         return out
     return [] if _same(a, b) else [f"{path} = {a!r}, the task config gives {b!r}"]
-
-
-def _phi_theta(record: object, where: str) -> tuple[float, float]:
-    if not isinstance(record, Mapping):
-        raise _Refused(f"{where} is not an object")
-    return _number(record.get("phi_deg"), f"{where}.phi_deg"), _number(record.get("theta_deg"), f"{where}.theta_deg")
-
-
-def _by_key(records: object, keys: Sequence[tuple[float, float]], where: str) -> dict[int, Mapping]:
-    """A per-key list's records by declared key index; a list that is not one record per declared key is refused."""
-    if not isinstance(records, list):
-        raise _Refused(f"{where} must be a list of per-key records, got {type(records).__name__}")
-    found: dict[int, Mapping] = {}
-    problems: list[str] = []
-    for i, record in enumerate(records):
-        key = _phi_theta(record, f"{where}[{i}]")
-        k = dataset_v2.key_position(keys, *key)
-        if k is None:
-            problems.append(f"{where} has a record at {key_text(key)}, outside the declared grid")
-        elif k in found:
-            problems.append(f"{where} has two records at {key_text(keys[k])}")
-        else:
-            found[k] = record
-    missing = [keys[k] for k in range(len(keys)) if k not in found]
-    if missing:
-        problems.append(f"{where} lacks {len(missing)} declared keys, the first at {key_text(missing[0])}")
-    if problems:
-        raise _Refused("; ".join(problems))
-    return found
 
 
 def _polarizations(record: Mapping, where: str, pols: Sequence[int]) -> Mapping:
