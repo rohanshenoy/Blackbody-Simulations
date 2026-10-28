@@ -1,0 +1,10 @@
+# crack1 pilot grid (I2; HF-057, HF-058, OR-047): five single-angle tasks, the milestone's four frequencies plus
+# 500 GHz, the matched denominator of the October 35-key crack1 solve at 500 GHz (job_grid35_1).
+# One entry per line: <frequency GHz> [<requested exit step along l, mm>].
+# Above 750 GHz the step along l is at most c/(4f) (OR-037, HF-051): 0.07420605 mm at 1010 GHz, written rounded down
+# to 0.0742. The lower frequencies keep the config's 0.1 mm (c/(4f) is 0.150 mm at 500 GHz).
+180
+320
+500
+569
+1010 0.0742
