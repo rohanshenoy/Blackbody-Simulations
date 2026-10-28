@@ -246,8 +246,9 @@ class OutputConfig:
 class AcceptanceConfig:
     """The acceptance the job's dataset needs before assembly (CDX-039, OR-042): ``kind`` is "none",
     "grid_acceptance" (a 35-key solve judged against the 15-key ``reference_job`` of the same geometry, at
-    ``t_rel_tol``, default the checker's 0.005) or "reexport_check" (set by --from-solved from its source job, never
-    in a config file). The manifest records it, and assembly requires exactly it."""
+    ``t_rel_tol``, default the checker's 0.005), "array_run" (a job-array task judged by its own check against its
+    frozen plan, with neither ``reference_job`` nor ``t_rel_tol``; HF-057) or "reexport_check" (set by --from-solved
+    from its source job, never in a config file). The manifest records it, and assembly requires exactly it."""
     kind: str
     reference_job: Path | None = None
     t_rel_tol: float | None = None
@@ -341,8 +342,8 @@ def build_config(raw: Mapping[str, Any], overrides: Mapping[str, Any] | None = N
             raise ConfigError(f"unknown override {key!r}")
         data.setdefault(section, {})[name] = value
     if "acceptance" not in data:
-        raise ConfigError('[acceptance] is required: kind = "none", or kind = "grid_acceptance" with reference_job '
-                          "(CDX-039, OR-042)")
+        raise ConfigError('[acceptance] is required: kind = "none", kind = "grid_acceptance" with reference_job, or '
+                          'kind = "array_run" (CDX-039, OR-042, HF-057)')
     return RunConfig(**{s: _build(cls, data.get(s, {}), s) for s, cls in _SECTIONS.items()})
 
 
@@ -352,7 +353,7 @@ def load_config(path: Path | str, overrides: Mapping[str, Any] | None = None) ->
     cfg = build_config(raw, overrides)
     if cfg.acceptance.kind == "reexport_check":
         raise ConfigError("[acceptance] kind reexport_check: a re-export's requirement is set by --from-solved from its "
-                          "source job; a config file declares none or grid_acceptance")
+                          "source job; a config file declares none, grid_acceptance or array_run")
     return cfg
 
 

@@ -1,0 +1,62 @@
+# The job array's single-angle pilot config for crack1 (HF-057, OR-047): one incidence key, theta 180 deg and phi 0 deg
+# in the crack-local frame, run only by a probe plan, as a diagnostic that never enters a tree. It is crack1_grid.toml
+# with that one key, output.polarizations = [0] and schema 1; as there, the plan supplies the frequency, the
+# acceptance is array_run, and the target is MaxDeltaE 0.005 with up to 20 passes (HF-027).
+# Both polarizations are still solved: the setup's sweep is always Ephi 0 and 1 (bbsim/hfss_setup.py,
+# parametric_arguments) and polarizations = [0] restricts only the export (HF-058), so the pilot's sizing compares
+# like with like against the 35-key solves, which solve both at the same target.
+
+[project]
+path = "/home/rshenoy/BBRSim/projects/ParallelPlateGaps.aedt"
+design = "parallel_plate_gap_50um"
+dataset_id = "InfParallelPlate_crack1Rohan"
+aedt_version = "2025.2"
+
+[geometry]
+object = "gap"
+entrance_face = { axis = "z", side = "min" }   # legacy face ID 8, plane wave origin (0.025, 0, 0) mm
+exit_face = { axis = "z", side = "max" }       # legacy face ID 7
+exit_cs_x = [0.0, 0.0, 1.0]
+exit_cs_y = [0.0, 1.0, 0.0]
+expected_box_size_mm = [0.05, 10.0, 1.0]
+expected_face_area_mm2 = 0.5
+symmetry = ["mirror_l", "mirror_g", "end_to_end"]
+
+[excitation]
+ei_v_per_m = 1.0
+theta_lower_deg = 180.0
+theta_upper_deg = 180.0
+theta_step_deg = 45.0
+phi_lower_deg = 0.0
+phi_upper_deg = 0.0
+phi_step_deg = 45.0
+
+[solver]
+max_delta_e = 0.005
+max_passes = 20
+cores = 4
+sweep = "discrete"
+
+[far_field]
+theta_lower_deg = 0.0
+theta_upper_deg = 180.0
+phi_lower_deg = -90.0
+phi_upper_deg = 90.0
+a_mm = 10.0
+b_mm = 0.05
+fineness = 10.0
+min_coarseness_deg = 0.1
+max_coarseness_deg = 5.0
+
+[exit_field]
+manual = true
+resolution_mm = [0.0, 0.1, 0.001]
+
+[output]
+root = "/home/rshenoy/BBRSim/outputs"
+polarizations = [0]  # the export only: both polarizations are solved (see the header)
+export_timeout_s = 300.0
+schema = 1  # schema 2 needs a theta = 90 deg key for its cell_90 divisor; this grid is theta = 180 only
+
+[acceptance]
+kind = "array_run"
