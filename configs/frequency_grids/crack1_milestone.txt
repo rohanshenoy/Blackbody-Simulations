@@ -1,8 +1,8 @@
 # crack1 milestone grid (I3; HF-057, OR-047): one 35-key schema-2 solve per frequency, on the screen-free model as a
 # pipeline test. One entry per line: <frequency GHz> [<requested exit step along l, mm>].
-# Above 750 GHz the step along l is at most c/(4f) (OR-037, HF-051): 0.07420605 mm at 1010 GHz, written rounded down
-# to 0.0742 (HF-045 fits it to 10 mm over 135 steps, 136 x 51 points). The lower frequencies keep the config's 0.1 mm
-# (c/(4f) is 0.416, 0.234 and 0.132 mm at 180, 320 and 569 GHz).
+# At every frequency the step along l is at most c/(4f) (OR-048, OR-037, HF-051): 0.07420605 mm at 1010 GHz, written
+# rounded down to 0.0742 (HF-045 fits it to 10 mm over 135 steps, 136 x 51 points). The lower frequencies keep the
+# config's 0.1 mm (c/(4f) is 0.416, 0.234 and 0.132 mm at 180, 320 and 569 GHz).
 180
 320
 569

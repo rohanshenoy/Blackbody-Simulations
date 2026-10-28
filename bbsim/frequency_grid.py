@@ -1,4 +1,4 @@
-"""Frequency grids of the job array and the exit step along l (OR-037, HF-051, HF-057).
+"""Frequency grids of the job array and the exit step along l (OR-048, OR-037, HF-051, HF-057).
 
 A grid file lists one array task per line, ``<frequency GHz> [<step along l, mm>]``:
 
@@ -17,10 +17,11 @@ Slurm's default MaxArraySize (indices 0 to 1000); a caller may pass a smaller ca
 
 The step is the requested resolution, not the exported lattice step: the runner fits the step to the exit face's
 extent (HF-045), so crack1's request of 0.0742 mm at 1010 GHz exports 10 mm over 135 steps, 0.07407 mm, 136 x 51
-points. Above ``RULE_ABOVE_GHZ`` the step along l may not exceed c/(4f) (OR-037, HF-051), 0.07420605 mm at 1010 GHz;
-``effective_l_resolution_mm`` applies that rule to the entry's step or, without one, to the config's. The grids write
-c/(4f) rounded down to 3 significant figures. Below the threshold the config's 0.1 mm holds: c/(4f) is 0.416, 0.234
-and 0.132 mm at 180, 320 and 569 GHz.
+points. At every frequency the step along l may not exceed c/(4f) (OR-048, refining OR-037 and HF-051), 0.07420605 mm
+at 1010 GHz; ``effective_l_resolution_mm`` applies that rule to the entry's step or, without one, to the config's.
+The config's 0.1 mm meets it up to c/(4 x 0.1 mm) = 749.48 GHz, which is where OR-037's "above about 0.75 THz" came
+from; c/(4f) is 0.416, 0.234 and 0.132 mm at 180, 320 and 569 GHz. Above 749.48 GHz a grid entry gives the step, which
+the grids write as c/(4f) rounded down to 3 significant figures.
 
 No grid generator: the earlier log grid (180 to 18000 GHz, 24 per decade) is superseded by HF-039(10), and its
 generator waits for S62. The first licensed batch (OR-047) uses the hand-written files in ``configs/frequency_grids/``.
@@ -37,7 +38,6 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-RULE_ABOVE_GHZ = 750.0                  # the c/(4f) rule applies strictly above this frequency (OR-037, HF-051)
 SPEED_OF_LIGHT_M_PER_S = 299792458.0    # equal to bbsim.sampling.SPEED_OF_LIGHT_M_PER_S
 MAX_ENTRIES = 1001                      # Slurm's default MaxArraySize
 
@@ -111,7 +111,7 @@ def read_grid(path: Path, max_entries: int = MAX_ENTRIES) -> tuple[list[GridEntr
 
 
 def max_l_step_mm(frequency_ghz: float) -> float:
-    """c/(4f) in mm: the largest exit step along l allowed above ``RULE_ABOVE_GHZ`` (OR-037, HF-051)."""
+    """c/(4f) in mm: the largest exit step along l allowed at frequency f (OR-048, OR-037, HF-051)."""
     frequency = _finite_positive(frequency_ghz)
     if frequency is None:
         raise GridError(f"frequency {frequency_ghz!r} GHz must be a finite positive number")
@@ -121,8 +121,8 @@ def max_l_step_mm(frequency_ghz: float) -> float:
 def effective_l_resolution_mm(entry: GridEntry, config_l_resolution_mm: float) -> float:
     """The exit step along l a task requests: the entry's own, else the config's ``exit_field.resolution_mm[1]``.
 
-    Above ``RULE_ABOVE_GHZ`` it may not exceed c/(4f) (OR-037, HF-051); a step that does, whichever supplied it, is a
-    ``GridError`` naming the frequency, the step and the limit.
+    At every frequency it may not exceed c/(4f) (OR-048, OR-037, HF-051); a step that does, whichever supplied it, is
+    a ``GridError`` naming the frequency, the step and the limit.
     """
     if entry.l_resolution_mm is None:
         value = _positive_mm(config_l_resolution_mm, "the config's step along l")
@@ -131,10 +131,10 @@ def effective_l_resolution_mm(entry: GridEntry, config_l_resolution_mm: float) -
         value = _positive_mm(entry.l_resolution_mm, "the grid entry's step along l")
         source = "the grid entry's step along l"
     limit = max_l_step_mm(entry.frequency_ghz)
-    if entry.frequency_ghz > RULE_ABOVE_GHZ and value > limit:
+    if value > limit:
         raise GridError(f"{entry.frequency_ghz} GHz: {source} {value!r} mm exceeds c/(4f) = {limit:.7g} mm, the "
-                        f"largest allowed above {RULE_ABOVE_GHZ:g} GHz (OR-037, HF-051); give the grid entry a step "
-                        f"of at most {limit:.7g} mm")
+                        f"largest step along l allowed (OR-048, OR-037, HF-051); give the grid entry a step of at most "
+                        f"{limit:.7g} mm")
     return value
 
 
