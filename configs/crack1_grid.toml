@@ -1,9 +1,9 @@
-# The job array's crack1 config, for the crack1 milestone and production (HF-057, OR-047): the 35-key incidence grid
-# of OR-036, theta 90 to 180 deg in 15 deg steps and phi 0 to 90 deg in 22.5 deg steps, both in the crack-local frame.
-# It is crack1_500GHz_grid35.toml with two changes only: no solver.frequency_ghz, because the plan supplies each
-# task's frequency (and any exit resolution along l, OR-037), and [acceptance] kind = "array_run", each task's own
-# check against its frozen plan, which takes no reference job. Schema 2: a plan running it names the HF-041
-# column-order reference explicitly.
+# The job array's crack1 config, for the crack1 milestone (a pipeline test on the screen-free model) and
+# production-policy plans (HF-057, OR-047): the 35-key incidence grid of OR-036, theta 90 to 180 deg in 15 deg steps and
+# phi 0 to 90 deg in 22.5 deg steps, both in the crack-local frame. It is crack1_500GHz_grid35.toml with two changes
+# only: no solver.frequency_ghz, because the plan supplies each task's frequency (and any exit resolution along l,
+# OR-037), and [acceptance] kind = "array_run", each task's own check against its frozen plan, which takes no reference
+# job. Schema 2: a plan running it names the HF-041 column-order reference explicitly.
 
 [project]
 path = "/home/rshenoy/BBRSim/projects/ParallelPlateGaps.aedt"
