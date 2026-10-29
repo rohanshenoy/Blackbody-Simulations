@@ -55,12 +55,14 @@ A job's lease consumes its reservation's slots (at most ``slots`` held per reser
 first takes a direct one-slot reservation; at most ``CEILING`` leases are held in total. A lease records {id,
 reservation_id, direct, state (acquired, launching, retained, released), cleanup (unknown, live, stopped), outcome,
 cleanup_waited_s, identity, scope, processes, cleanup_checks, cleanup_evidence, events}. Before ``Hfss()`` its launch
-scope is recorded (host, boot, the launcher and its ancestors, the numeric ``SLURM_JOB_ID``, the step incarnation and
-the launcher's cgroup, ``ProcScopeObserver``), after it the desktop's process and its descendants. After
+scope is recorded (host, boot, the launcher and its ancestors, the numeric ``SLURM_JOB_ID``, the step incarnation, the
+launcher's cgroup and the scope root: inside a Slurm job the whole job's cgroup ``job_<SLURM_JOB_ID>``, outside one the
+launcher's own; ``ProcScopeObserver``), after it the desktop's process and its descendants. After
 ``release_desktop`` the session polls ``cleanup_status`` every ``CLEANUP_POLL_S`` for up to ``CLEANUP_WAIT_S`` and
-releases the lease only on ``stopped``: the launch cgroup read in full on its host with no process started since the
-launch left in it, so a solver that outlives its desktop keeps it held. A vanished pid, an empty process list, another
-host, an unreadable cgroup, terminal accounting in ``sacct`` and Slurm's cgroup setting are never proof. Otherwise the
+releases the lease only on ``stopped``: the scope root's subtree read in full on its host with no process started since
+the launch left in it, so a solver that outlives its desktop, or runs in another step of the job, keeps it held. A
+vanished pid, an empty process list, another host, an unreadable cgroup, terminal accounting in ``sacct`` and Slurm's
+cgroup setting are never proof. Otherwise the
 lease stays held until the operator, after ``scope-check LEASE`` on its host, runs the logged ``release LEASE
 --confirm-cleanup REASON``. ``status --job ID`` lists a job's leases with their state, ``cleanup_waited_s`` and
 outcome. A job checks, before AEDT, that it runs under the shared guard and its own reservation (``check_job_guard``,
@@ -757,12 +759,19 @@ class ProcScopeObserver:
     ``launch_scope`` (before ``Hfss()``) records the launcher's identity and its ancestors', the boot-relative clock
     tick at which the launch began, and the launcher's cgroup: the hierarchy of ``/proc/self/cgroup`` whose
     ``cgroup.procs`` (with its descendant cgroups') lists the launcher, cgroup v1's ``freezer`` first, where Slurm's
-    proctrack/cgroup tracks a job. ``scope`` then counts every process listed there that started at or after that
+    proctrack/cgroup tracks a job. It also records the scope root, the cgroup subtree the cleanup check lists: inside
+    a Slurm job (``SLURM_JOB_ID``) the whole job's cgroup, the ancestor whose path component is ``job_<SLURM_JOB_ID>``
+    as a whole component, in the same hierarchy, so a solver started in another step of the job (through ``srun``,
+    say) is seen; outside Slurm, the launcher's own cgroup. Inside a job whose cgroup path has no such component the
+    root is an error, never the step's subtree. ``scope`` then counts every process listed in the root's subtree
+    (every descendant's ``cgroup.procs``: under cgroup v2 only leaves hold processes) that started at or after that
     tick, other than the launcher and its recorded ancestors: AEDT's processes inherit the launcher's cgroup, and a
     solver reparented away from its exiting desktop stays in it, which a walk of the desktop's process tree would miss.
-    An exited process not yet reaped (state Z) holds nothing. A cgroup that cannot be read, or that no longer lists
-    the living launcher, is incomplete evidence, never proof of cleanup. The roots, host, uid and tick rate are
-    injectable for tests.
+    Processes of the job that started before the launch (its extern step, slurmstepd) are outside the scope; one
+    adopted into the job after it (an ssh session) is inside and holds the lease until it ends (HF-058(2)). An exited
+    process not yet reaped (state Z) holds nothing. A cgroup that cannot be read anywhere in the subtree, or that no
+    longer lists the living launcher, is incomplete evidence, never proof of cleanup. The roots, host, uid and tick
+    rate are injectable for tests.
     """
 
     def __init__(self, proc_root: str | os.PathLike = "/proc", cgroup_root: str | os.PathLike = "/sys/fs/cgroup", *,
@@ -885,10 +894,18 @@ class ProcScopeObserver:
             raise OSError(f"{directory} holds no cgroup.procs")
         return pids
 
-    def launch_scope(self) -> dict:
-        """The launch scope of this process, before AEDT starts; ``cgroup.readable`` is False when it cannot be read."""
+    def launch_scope(self, slurm_job_id: str | None = None) -> dict:
+        """The launch scope of this process, before AEDT starts; ``cgroup.readable`` is False when it cannot be read.
+
+        ``slurm_job_id`` is this process's ``SLURM_JOB_ID`` (None outside Slurm); ``cgroup.scope_root`` records the
+        subtree the cleanup check will list, {kind ``job`` or ``launcher``, dir, error}.
+        """
+        job = slurm_job_id or None
+        root: dict[str, Any] = {"kind": "job" if job is not None else "launcher", "dir": None, "error": None}
         cgroup: dict[str, Any] = {"readable": False, "kind": None, "path": None, "dir": None, "error": None,
-                                  "lines": None}
+                                  "lines": None, "scope_root": root}
+        if job is not None and not _JOB_ID.fullmatch(str(job)):
+            root["error"] = f"SLURM_JOB_ID={job!r} is not a numeric job id, so the job's cgroup cannot be found"
         scope: dict[str, Any] = {"observer": "proc", "host": self.host(), "boot_id": self.boot_id(),
                                  "launcher": {"pid": os.getpid(), "start": None}, "ancestors": [], "cgroup": cgroup,
                                  "begin_ticks": None, "clock_ticks_per_s": self._ticks_per_s()}
@@ -928,8 +945,12 @@ class ProcScopeObserver:
             cgroup["error"] = f"{self.proc_root / 'self' / 'cgroup'} cannot be read: {exc}"
             return scope
         cgroup["lines"] = [":".join(line) for line in lines]
+        candidates = self._candidates(lines)
+        if job is not None:                     # a hierarchy whose path names the job first, in the usual order
+            token = f"job_{job}"
+            candidates = sorted(candidates, key=lambda c: token not in c[1].split("/"))
         tried = []
-        for kind, path, directory in self._candidates(lines):
+        for kind, path, directory in candidates:
             try:
                 listed = self._listing(directory)
             except OSError as exc:
@@ -937,6 +958,16 @@ class ProcScopeObserver:
                 continue
             if me["pid"] in listed:
                 cgroup.update(readable=True, kind=kind, path=path, dir=str(directory))
+                if root["error"] is None:
+                    if job is None:
+                        root["dir"] = str(directory)
+                    else:
+                        job_dir = _job_cgroup_dir(path, directory, job)
+                        if job_dir is None:
+                            root["error"] = (f"SLURM_JOB_ID={job}, but the launcher's cgroup {path} has no path "
+                                             f"component job_{job}, so the job's cgroup cannot be found")
+                        else:
+                            root["dir"] = str(job_dir)
                 return scope
             tried.append(f"{directory} does not list the launcher {me['pid']}")
         cgroup["error"] = "no cgroup of the launcher lists it: " + ("; ".join(tried) or "no cgroup line was understood")
@@ -945,18 +976,24 @@ class ProcScopeObserver:
     def scope(self, scope: Mapping[str, Any]) -> dict:
         """The processes of a recorded launch scope now: ``complete`` only when its cgroup was read in full."""
         cg = scope.get("cgroup") if isinstance(scope.get("cgroup"), Mapping) else {}
-        result: dict[str, Any] = {"complete": False, "dir": cg.get("dir"), "live": [], "exited": [], "reason": None}
+        root = cg.get("scope_root") if isinstance(cg.get("scope_root"), Mapping) else {}
+        result: dict[str, Any] = {"complete": False, "dir": root.get("dir"), "root": root.get("kind"), "live": [],
+                                  "exited": [], "reason": None}
         if not cg.get("readable") or not cg.get("dir"):
             result["reason"] = f"the launch recorded no readable cgroup ({cg.get('error') or 'none recorded'})"
+            return result
+        if root.get("error") or not root.get("dir"):
+            result["reason"] = f"the launch recorded no scope root ({root.get('error') or 'none recorded'})"
             return result
         begin = scope.get("begin_ticks")
         if isinstance(begin, bool) or not isinstance(begin, int):
             result["reason"] = "the launch recorded no start tick, so its processes cannot be told from earlier ones"
             return result
         try:
-            listed = self._listing(Path(cg["dir"]))
+            listed = self._listing(Path(root["dir"]))
         except OSError as exc:
-            result["reason"] = f"the cgroup {cg['dir']} cannot be read now: {exc}"
+            what = "the job's cgroup" if root.get("kind") == "job" else "the launcher's cgroup"
+            result["reason"] = f"{what} {root['dir']} cannot be read in full now: {exc}"
             return result
         launcher = scope.get("launcher") if isinstance(scope.get("launcher"), Mapping) else {}
         own = {(launcher.get("pid"), launcher.get("start"))}
@@ -968,8 +1005,8 @@ class ProcScopeObserver:
             me = None
         if me is not None and me["start"] == launcher.get("start") and me["state"] not in EXITED_STATES \
                 and pid not in listed:
-            result["reason"] = (f"the launcher {pid} is alive but its recorded cgroup {cg['dir']} does not list it, "
-                                "so that listing is not its scope")
+            result["reason"] = (f"the launcher {pid} is alive but the scope root {root['dir']} does not list it, so "
+                                "that listing is not its scope")
             return result
         for p in sorted(listed):
             try:
@@ -1040,6 +1077,19 @@ class ProcScopeObserver:
                         if part.startswith("job_") and part[4:].isdigit()), None)
             found.append({"pid": pid, "comm": st["comm"], "job": job, "command": command[:200]})
         return found
+
+
+def _job_cgroup_dir(path: str, directory: Path, job_id: str) -> Path | None:
+    """The ancestor of ``directory`` (the launcher's cgroup at cgroup ``path``) whose path component is
+    ``job_<job_id>`` as a whole component (``job_771`` is not ``job_77``), in the same hierarchy; None if none."""
+    token = f"job_{job_id}"
+    parts = [part for part in str(path).split("/") if part]
+    if token not in parts:
+        return None
+    job_dir = Path(directory)
+    for _ in range(len(parts) - parts.index(token) - 1):
+        job_dir = job_dir.parent
+    return job_dir if job_dir.name == token else None
 
 
 def default_scope_observer() -> ProcScopeObserver:
@@ -1863,7 +1913,7 @@ class Guard:
         identity = _check_context(identity)
         self._lease_file(lease_id)
         try:
-            observed = dict(self.observer.launch_scope())
+            observed = dict(self.observer.launch_scope(slurm_job_id=os.environ.get("SLURM_JOB_ID") or None))
         except Exception as exc:                # no evidence: recorded as such, and cleanup stays unknown
             observed = {"observer": "failed", "host": socket.gethostname(), "boot_id": _boot_id(),
                         "cgroup": {"readable": False, "error": f"the observer failed: {type(exc).__name__}: {exc}"}}
@@ -1877,7 +1927,8 @@ class Guard:
             cg = scope.get("cgroup") if isinstance(scope.get("cgroup"), dict) else {}
             self._lease_event(rec, "lease_launch_scope", host=scope.get("host"), slurm_job_id=scope.get("slurm_job_id"),
                               step_incarnation=scope.get("step_incarnation"), cgroup=cg.get("path"),
-                              cgroup_readable=bool(cg.get("readable")), cgroup_error=cg.get("error"))
+                              cgroup_readable=bool(cg.get("readable")), cgroup_error=cg.get("error"),
+                              scope_root=cg.get("scope_root"))
 
     def set_lease_processes(self, lease_id: str, processes: Sequence[dict]) -> None:
         """Append observed desktop and solver processes (pid and start identity) to the lease's scope; earlier
@@ -1919,9 +1970,10 @@ class Guard:
         """``stopped``, ``live`` or ``unknown`` for a lease's owned launch scope, with the evidence used.
 
         ``stopped`` needs independent complete evidence: no launch scope was ever recorded (``Hfss()`` was never
-        called), the host has rebooted since, or the launch cgroup was read in full on its host and holds none of the
-        launch's processes. A recorded desktop or solver alive with its start identity, or any process of the cgroup
-        started since the launch, is ``live``. Anything else, an empty process list, a vanished or reused pid, another
+        called), the host has rebooted since, or the scope root's subtree (the whole job's cgroup inside a Slurm job,
+        the launcher's own outside one) was read in full on its host and holds none of the launch's processes. A
+        recorded desktop or solver alive with its start identity, or any process of that subtree started since the
+        launch, is ``live``. Anything else, an empty process list, a vanished or reused pid, another
         host, an unreadable cgroup included, is ``unknown``. Accounting and Slurm's settings are never read here.
         """
         try:
@@ -1984,14 +2036,17 @@ class Guard:
             cg = dict(self.observer.scope(scope))
         except Exception as exc:                # noqa: BLE001
             cg = {"complete": False, "reason": f"the observer failed: {type(exc).__name__}: {exc}"}
-        evidence["cgroup"] = {k: cg.get(k) for k in ("complete", "dir", "reason", "exited")}
+        evidence["cgroup"] = {k: cg.get(k) for k in ("complete", "root", "dir", "reason", "exited")}
+        recorded_root = (scope.get("cgroup") or {}).get("scope_root") if isinstance(scope.get("cgroup"), dict) else None
+        evidence["scope_root"] = dict(recorded_root) if isinstance(recorded_root, dict) else None
+        where = f"the {'job' if cg.get('root') == 'job' else 'launcher'}'s cgroup {cg.get('dir')}"
         if cg.get("complete"):
             if cg.get("live"):
                 evidence.update(basis="cgroup", live=cg["live"],
-                                detail=f"{len(cg['live'])} process(es) of the launch cgroup started since the launch")
+                                detail=f"{len(cg['live'])} process(es) in {where} started since the launch")
                 return "live", evidence
-            evidence.update(basis="cgroup_empty", detail=f"the launch cgroup {cg.get('dir')} holds no process started "
-                                                         "since the launch, other than the launcher and its ancestors")
+            evidence.update(basis="cgroup_empty", detail=f"{where} holds no process started since the launch, other "
+                                                         "than the launcher and its ancestors")
             return "stopped", evidence
         seen = ", ".join(f"{r['pid']} {r['now']}" for r in recorded) or "none"
         evidence.update(basis="incomplete", detail=f"{cg.get('reason')}; recorded processes: {seen}; a vanished pid "
@@ -2240,6 +2295,9 @@ def describe_evidence(evidence: Mapping[str, Any] | None) -> str:
         if isinstance(p, Mapping):
             live.append(f"pid {p.get('pid')} ({p.get('comm') or p.get('role') or '?'}, start {p.get('start')})")
     text = f"basis {evidence.get('basis')}"
+    root = evidence.get("scope_root")
+    if isinstance(root, Mapping):
+        text += f"; scope root {root.get('kind')} {root.get('dir') or root.get('error')}"
     if live:
         text += f"; live: {', '.join(live)}"
     if evidence.get("detail"):
@@ -2346,12 +2404,17 @@ def format_job_leases(root: Path, job_id: str, leases: Sequence[dict]) -> str:
         wait = rec.get("cleanup_waited_s")
         if isinstance(wait, (int, float)) and not isinstance(wait, bool):
             waits.append(wait)
+        cg = scope.get("cgroup") if isinstance(scope.get("cgroup"), dict) else {}
+        root = cg.get("scope_root") if isinstance(cg.get("scope_root"), dict) else {}
+        root_text = (f"{root.get('kind')}" + (f" (error: {root['error']})" if root.get("error") else "")
+                     if root else "none")
         if rec.get("state") != LEASE_RELEASED:
             held += 1
         lines.append(f"  lease {rec['id']} job {scope.get('slurm_job_id') or 'none'}{array} host "
                      f"{scope.get('host') or 'none'} reservation {rec.get('reservation_id')}: state "
                      f"{rec.get('state')}, cleanup {rec.get('cleanup')}, cleanup_waited_s "
-                     f"{wait if wait is not None else 'none'}, outcome {rec.get('outcome') or 'none'}")
+                     f"{wait if wait is not None else 'none'}, outcome {rec.get('outcome') or 'none'}, scope_root "
+                     f"{root_text}")
     largest = max(waits) if waits else "none"
     lines.append(f"job {job_id}: {len(leases)} lease(s), {held} held, largest cleanup_waited_s {largest}")
     if held:
