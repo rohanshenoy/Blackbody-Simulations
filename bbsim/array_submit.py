@@ -14,9 +14,10 @@ line (exit 2):
 - an array: its class and indices are the plan's (a rerun's indices lie in one class, and a class already submitted is
   submitted again only as a rerun), its resources are well formed, the installed PyAEDT is the plan's, every pending or
   running ``bbsim:`` array runs at the plan's cores (the planner's rule, repeated before every array submission,
-  HF-057), a production plan's frozen HF-041 column-order reference still has its recorded sha256 and still fits the
-  worktree's exporter files and the installed PyAEDT (``dataset_v2.check_reference_before_aedt``), and a probe plan
-  records none;
+  HF-057; it runs outside the guard lock, so two submissions started at the same instant from separate shells can
+  both pass it, and plans at different cores are submitted one after another), a production plan's frozen HF-041
+  column-order reference still has its recorded sha256 and still fits the worktree's exporter files and the installed
+  PyAEDT (``dataset_v2.check_reference_before_aedt``), and a probe plan records none;
   a monitor: the plan runs one, and an array of the plan is in ``submissions.log`` for it to watch;
 - the plan's own sbatch arguments pass ``licence_guard.check_user_sbatch_args`` and set none of the resources the plan
   sets itself (``PLAN_RESOURCE_OPTIONS``); a dependency is ``after[any|ok|notok]:JOBID[:JOBID...]``;
@@ -48,10 +49,13 @@ carriage return or NUL; a list prints one element per line, null an empty line.
 CLI (``--root`` names the shared guard, by default ``licence_guard.DEFAULT_ROOT``): ``submit PLAN SHA256
 {array,monitor,assembly} [--class NAME] [--dependency DEP]``; ``rerun PLAN SHA256 --indices I,J [--mem M] [--time T]
 [--qos Q]``, nothing else; ``throttle PLAN SHA256 ARRAY_ID THROTTLE``, a live throttle change of an array of this plan
-through ``Guard.change_throttle``; ``job-field NAME``. ``submit`` and ``rerun`` print the job id alone on stdout. Exit
-codes: 2 refused before anything was reserved or submitted, 1 failed, 0 success. I1's probe and lock test are submitted
-by path through the guard and use none of this. Standard library at import; ``dataset_v2`` (numpy, pandas) only for a
-production array's reference check.
+through ``Guard.change_throttle``, the only throttle change ``submissions.log`` records (``python -m
+bbsim.licence_guard throttle`` changes it without a line there); ``remaining PLAN SHA256``, what remains of the plan's
+printed block after some of its jobs are in ``submissions.log`` (``remaining_block``), its ids already admitted written
+out, ready to paste, which every STOP of the block prints; ``job-field NAME``. ``submit`` and ``rerun`` print the job
+id alone on stdout. Exit codes: 2 refused before anything was reserved or submitted, 1 failed, 0 success. I1's probe
+and lock test are submitted by path through the guard and use none of this. Standard library at import;
+``dataset_v2`` (numpy, pandas) only for a production array's reference check.
 """
 from __future__ import annotations
 
@@ -62,6 +66,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -136,7 +141,7 @@ def _git_error(run: subprocess.CompletedProcess) -> str:
 
 def capture_script(bridge_repo: Path, commit: str, relpath: str, sha256: str) -> bytes:
     """The bytes of ``relpath`` at ``commit`` in the bridge clone, read as a git blob, never from the working tree, and
-    required to have the sha256 the plan recorded (R2, OR-044). A commit or blob the clone no longer holds (a
+    required to have the sha256 the plan recorded (OR-044). A commit or blob the clone no longer holds (a
     force-push, a gc, a re-clone) or other bytes raise ``SubmitError`` naming the commit: the plan's scripts are
     submitted from that commit only."""
     if not isinstance(commit, str) or not _COMMIT.fullmatch(commit):
@@ -501,7 +506,9 @@ def submit(plan_path: Path, plan_sha256: str, what: str, *, class_name: str | No
                        if line.get("class") == cls["name"] and line.get("rerun") is not True]
             if earlier:
                 raise SubmitError(f"class {cls['name']} was submitted already as job {', '.join(map(str, earlier))} "
-                                  f"({run_dir / SUBMISSIONS_LOG}); submit its failed indices with rerun --indices")
+                                  f"({run_dir / SUBMISSIONS_LOG}); submit its failed indices with rerun --indices, and "
+                                  f"print what remains of the plan's block with python -m bbsim.array_submit "
+                                  f"remaining {shlex.quote(str(path))} {plan_sha256}")
         throttle = cls.get("throttle")
         if isinstance(throttle, bool) or not isinstance(throttle, int) or throttle < 1:
             raise SubmitError(f"class {cls['name']}'s throttle {throttle!r} is not a positive integer")
@@ -579,11 +586,24 @@ def submit(plan_path: Path, plan_sha256: str, what: str, *, class_name: str | No
     return job
 
 
+def _after_stop(exc: BaseException, plan_path: Path, plan_sha256: str) -> str:
+    """What a stopped ``--submit`` prints next: after a refusal (nothing reserved or submitted) what remains of the
+    block, ready to paste; after any other failure the command that prints it, to run once that failure is dealt
+    with."""
+    if isinstance(exc, (SubmitError, licence_guard.GuardRefused)):
+        try:
+            return "Once the guard admits it, paste what remains:\n" + remaining_block(plan_path, plan_sha256)
+        except (SubmitError, OSError) as err:
+            return f"what remains cannot be printed ({_one_line(err)})"
+    return (f"its result is uncertain or unrecorded: do what the message above says first, then print what remains "
+            f"with python -m bbsim.array_submit remaining {shlex.quote(str(plan_path))} {plan_sha256}")
+
+
 def submit_plan(plan_path: Path, plan_sha256: str, *, guard: Any, env: EnvironmentState | None = None) -> int:
     """The planner's ``--submit``: every class's array, the monitor when the plan runs one, then the assembly after
     every array (``afterany``), each through ``submit``. A refused or failed array stops there (exit 1): the arrays
-    before it keep running, and the printed block submits the rest. A monitor or an assembly that is not submitted is
-    reported (exit 1) and the arrays keep running."""
+    before it keep running, and what remains is printed as the block's STOP prints it. A monitor or an assembly that
+    is not submitted is reported the same way (exit 1), and the arrays keep running."""
     failures = (SubmitError, SubmissionNotLogged, licence_guard.GuardError, OSError)
     try:
         _, plan = read_plan(plan_path, plan_sha256)
@@ -599,11 +619,12 @@ def submit_plan(plan_path: Path, plan_sha256: str, *, guard: Any, env: Environme
         except failures as exc:
             print(f"plan_hfss_array: --submit: class {name} was not submitted: {_one_line(exc)}. The arrays "
                   f"submitted before it ({', '.join(arrays) or 'none'}) keep running; no monitor or assembly was "
-                  "submitted: run the rest of the printed block when the guard admits it", file=sys.stderr)
+                  "submitted", file=sys.stderr)
+            print(_after_stop(exc, plan_path, plan_sha256))
             return 1
         arrays.append(job)
         print(f"array {name}: job {job}")
-    status = 0
+    stopped: BaseException | None = None
     jobs = [("monitor", {})] if monitor else []
     jobs.append(("assembly", {"dependency": "afterany:" + ":".join(arrays)}))
     for what, kw in jobs:
@@ -611,9 +632,12 @@ def submit_plan(plan_path: Path, plan_sha256: str, *, guard: Any, env: Environme
             print(f"{what}: job {submit(plan_path, plan_sha256, what, guard=guard, env=env, **kw)}")
         except failures as exc:
             print(f"plan_hfss_array: --submit: the {what} was not submitted: {_one_line(exc)}; the arrays keep "
-                  "running: submit it with its line of the printed block", file=sys.stderr)
-            status = 1
-    return status
+                  "running", file=sys.stderr)
+            stopped = stopped or exc
+    if stopped is None:
+        return 0
+    print(_after_stop(stopped, plan_path, plan_sha256))
+    return 1
 
 
 def change_throttle(plan_path: Path, plan_sha256: str, array_id: str, throttle: int, *, guard: Any) -> None:
@@ -628,8 +652,45 @@ def change_throttle(plan_path: Path, plan_sha256: str, array_id: str, throttle: 
     if not found:
         raise SubmitError(f"job {array_id} is not an array of the plan {path} in {run_dir / SUBMISSIONS_LOG}")
     guard.change_throttle(array_id, throttle, cap=_get(plan, "licence_cap"))
-    _append_log(run_dir, {"kind": "throttle", "class": found[-1].get("class"), "id": array_id, "throttle": throttle,
-                          "utc": _now(), "plan_sha256": plan_sha256, "admitted": True})
+    try:
+        _append_log(run_dir, {"kind": "throttle", "class": found[-1].get("class"), "id": array_id,
+                              "throttle": throttle, "utc": _now(), "plan_sha256": plan_sha256, "admitted": True})
+    except OSError as exc:
+        raise SubmissionNotLogged(f"array {array_id}'s throttle was changed to {throttle} through the guard (its "
+                                  f"events.log in {guard.root} records it), but {run_dir / SUBMISSIONS_LOG} could not "
+                                  f"record the change ({exc})") from exc
+
+
+def remaining_block(plan_path: Path, plan_sha256: str) -> str:
+    """What remains of the plan's printed block (``array_plan.submission_block``) after the jobs in
+    ``submissions.log``: the classes not yet submitted, the monitor when the plan runs one and it is not in the log,
+    and the assembly unless one follows the last class's array in the log; the classes already submitted appear as
+    their literal ids, so the lines hold no variable they do not set. Nothing is submitted here."""
+    path, plan = read_plan(plan_path, plan_sha256)
+    lines = _read_log(Path(plan["run_dir"]))
+    names = [c.get("name") for c in _get(plan, "classes") if isinstance(c, Mapping)]
+    admitted: dict[str, str] = {}
+    last_array = -1
+    for number, line in enumerate(lines):
+        if line["kind"] == "array" and line.get("plan_sha256") == plan_sha256 and line.get("rerun") is not True \
+                and line.get("class") in names:
+            if not _JOB_ID.fullmatch(line["id"]):
+                raise SubmitError(f"{SUBMISSIONS_LOG} names class {line['class']}'s job {line['id']!r}, not a job id")
+            admitted[line["class"]] = line["id"]
+            last_array = number
+    ours = [(number, line["kind"]) for number, line in enumerate(lines) if line.get("plan_sha256") == plan_sha256]
+    monitor_submitted = any(kind == "monitor" for _, kind in ours)
+    assembly_submitted = len(admitted) == len(names) and any(kind == "assembly" and number > last_array
+                                                             for number, kind in ours)
+    monitor_needed = _get(plan, "slurm", "monitor", "enabled") is True and not monitor_submitted
+    if len(admitted) == len(names) and assembly_submitted and not monitor_needed:
+        return (f"nothing remains: every class, the assembly and any monitor of the plan {path} are in "
+                f"{Path(plan['run_dir']) / SUBMISSIONS_LOG}")
+    try:
+        return array_plan.submission_block(path, plan_sha256, plan, admitted=admitted,
+                                           monitor_submitted=monitor_submitted, assembly_submitted=assembly_submitted)
+    except (KeyError, TypeError) as exc:
+        raise SubmitError(f"the plan {path} cannot give its block: {exc!r} is missing or malformed") from None
 
 
 def log_submission(run_dir: Path | str, kind: str, job_id: str) -> dict:
@@ -801,6 +862,10 @@ def _parser() -> argparse.ArgumentParser:
     t.add_argument("sha256")
     t.add_argument("array_id", metavar="ARRAY_ID")
     t.add_argument("throttle", type=int)
+    rest = sub.add_parser("remaining", allow_abbrev=False, help="print what remains of the plan's block, after the "
+                                                                "jobs in submissions.log")
+    rest.add_argument("plan", type=Path)
+    rest.add_argument("sha256")
     j = sub.add_parser("job-field", allow_abbrev=False, help="one value of this job's context, verified")
     j.add_argument("name", choices=JOB_KEYS)
     return p
@@ -817,6 +882,9 @@ def main(argv: list[str] | None = None, *, scheduler: Any = None, env: Environme
     try:
         if args.command == "job-field":
             print(job_field(args.name, environ=environ, root=args.root, module_root=module_root))
+            return 0
+        if args.command == "remaining":
+            print(remaining_block(args.plan, args.sha256))
             return 0
         root = args.root if args.root is not None else licence_guard.DEFAULT_ROOT
         guard = licence_guard.Guard(root, scheduler if scheduler is not None else licence_guard.SlurmScheduler())

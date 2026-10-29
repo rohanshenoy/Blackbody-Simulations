@@ -68,12 +68,13 @@ captured from that copy, with ``config.build_config`` and exactly five overrides
   task's ``effective_l_resolution_mm``. That field is never null: it is the grid entry's requested step when the
   entry gives one (``l_resolution_mm``), else the config's own, after the c/(4f) rule (``frequency_grid``).
 
-After writing the plan the CLI prints its submission block (``submission_block``; spec section 4.3 replaced, OR-044,
-OR-045): from the frozen code ``<RUN>/code``, one ``python -m bbsim.array_submit submit`` line per class, the licence
-monitor when the plan runs one, and the assembly after every array; then the rerun and throttle lines. Every job goes
-through the guard from the recorded bridge blob, and nothing in the block calls sbatch or scontrol. ``--submit`` does
-the same at once (``array_submit.submit_plan``); ``plan_hfss_array.py --log-submission RUN KIND ID`` records a job
-submitted by hand, with no admission (``array_submit.log_submission``).
+After writing the plan the CLI prints its submission block (``submission_block``; OR-044, OR-045, HF-057): from the
+frozen code ``<RUN>/code``, one ``python -m bbsim.array_submit submit`` line per class, the licence monitor when the
+plan runs one, and the assembly after every array; then the rerun and throttle lines. Every job goes through the guard
+from the recorded bridge blob, and nothing in the block calls sbatch or scontrol. A line refused part way through
+prints what remains of the block, with the ids already admitted (``python -m bbsim.array_submit remaining``).
+``--submit`` does the same at once (``array_submit.submit_plan``); ``plan_hfss_array.py --log-submission RUN KIND
+ID`` records a job submitted by hand, with no admission (``array_submit.log_submission``).
 
 The planner, the runner, the array_run self-check (``bbsim.run_acceptance``) and the assembler all build a task's
 config here, and the planner and the self-check predict its lattice with ``predict_exit_lattice``, so none can
@@ -1234,36 +1235,54 @@ def build_plan(options: PlanOptions, *, env: EnvironmentState, guard: Any, now: 
 
 # --- the submission block --------------------------------------------------------------------------------------------
 
-def submission_block(plan_path: Path, plan_sha256: str, plan: Mapping[str, Any]) -> str:
-    """The block the planner prints (spec section 4.3 replaced; OR-044, OR-045): from the frozen code, every job
-    through ``python -m bbsim.array_submit``, which captures the recorded bridge blob and repeats admission and the
-    cores rule at the moment each line runs; the reruns and live throttle changes through the guard. One subshell, so a
-    STOP leaves the operator's shell open."""
+def submission_block(plan_path: Path, plan_sha256: str, plan: Mapping[str, Any], *,
+                     admitted: Mapping[str, str] | None = None, monitor_submitted: bool = False,
+                     assembly_submitted: bool = False) -> str:
+    """The block the planner prints (OR-044, OR-045, HF-057), or what remains of it once some of its jobs are in
+    ``submissions.log`` (``python -m bbsim.array_submit remaining``): ``admitted`` maps a class already submitted to
+    its job id, written as a literal id, and the monitor and the assembly already submitted are left out.
+
+    From the frozen code every job goes through ``python -m bbsim.array_submit``, which captures the recorded bridge
+    blob and repeats admission and the cores rule when its line runs. The lines run in one subshell, so a STOP leaves
+    the operator's shell open. A STOP after a refusal (exit 2: nothing was reserved or submitted) prints what remains,
+    ready to paste, with the ids admitted so far; a STOP after any other failure (an uncertain or unrecorded result)
+    names the command that prints it, to run once the failure's own message is dealt with."""
+    admitted = dict(admitted or {})
     q = shlex.quote
     code, plan_arg = q(str(plan["code"]["repo"])), q(str(plan_path))
     submit = f"python -m bbsim.array_submit submit {plan_arg} {plan_sha256}"
+    remaining = f"python -m bbsim.array_submit remaining {plan_arg} {plan_sha256}"
     names = [entry["name"] for entry in plan["classes"]]
-    monitor = plan["slurm"]["monitor"]["enabled"] is True
+    ids = {name: admitted.get(name, f"${name}") for name in names}
+    monitor = plan["slurm"]["monitor"]["enabled"] is True and not monitor_submitted
     lines = ["# Submit through the licence guard (OR-045) from the frozen code, in a shell that has sourced bb_env.sh;",
              "# each line repeats admission when it runs, so a delayed paste is checked again.",
-             f"cd {code} && ("]
+             f"cd {code} && (",
+             'bbsim_stop() { echo "STOP: $1 was not submitted (exit $2); the arrays submitted before it keep '
+             'running."; if [ "$2" = 2 ]; then echo "Nothing was reserved or submitted for it. Once the guard '
+             f'admits it, paste what remains:"; {remaining}; else echo "Its result is uncertain or unrecorded: do '
+             f'what the message above says first, then print what remains: cd {code} && {remaining}"; fi; exit 1; }}']
     for name in names:
-        lines.append(f'{name}=$({submit} array --class {name}) || {{ echo "STOP: class {name} was not submitted; '
-                     'the arrays submitted before it keep running"; exit 1; }')
+        if name not in admitted:
+            lines.append(f'{name}=$({submit} array --class {name}) || bbsim_stop "class {name}" $?')
     if monitor:
-        lines.append(f'M=$({submit} monitor) || echo "the licence monitor was not submitted; the arrays keep running"')
-    dependency = "afterany:" + ":".join(f"${name}" for name in names)
-    lines.append(f'R=$({submit} assembly --dependency "{dependency}") || {{ echo "STOP: the assembly was not '
-                 'submitted; the arrays keep running: run its line again"; exit 1; }')
-    jobs = " ".join(f"{name}=${name}" for name in names) + (" monitor=$M" if monitor else "") + " assembly=$R"
+        lines.append(f'M=$({submit} monitor) || echo "the licence monitor was not submitted (exit $?); the arrays '
+                     f'keep running; {remaining} prints its line"')
+    if not assembly_submitted:
+        dependency = "afterany:" + ":".join(ids[name] for name in names)
+        lines.append(f'R=$({submit} assembly --dependency "{dependency}") || bbsim_stop "the assembly" $?')
+    jobs = " ".join(f"{name}={ids[name]}" for name in names) + (" monitor=$M" if monitor else "") + \
+        ("" if assembly_submitted else " assembly=$R")
     lines += [f'echo "submitted: {jobs}"', ")",
               "# Rerun failed indices of one class (the assembly report prints these lines): scancel the pending",
               "# assembly that submissions.log names, then submit the rerun and a new assembly after it:",
               f"#   cd {code} && python -m bbsim.array_submit rerun {plan_arg} {plan_sha256} --indices I,J "
               "[--mem MEM] [--time TIME] [--qos QOS]",
               f"#   cd {code} && {submit} assembly --dependency afterany:RERUN_ID",
-              "# Live throttle changes go through the guard, never through scontrol:",
-              f"#   python -m bbsim.licence_guard throttle ARRAY_ID THROTTLE --cap {plan['licence_cap']}"]
+              "# Live throttle changes go through the guard from the frozen code, never through scontrol;",
+              f"# submissions.log records one only through python -m bbsim.array_submit throttle {plan_arg} "
+              f"{plan_sha256} ARRAY_ID THROTTLE:",
+              f"#   cd {code} && python -m bbsim.licence_guard throttle ARRAY_ID THROTTLE --cap {plan['licence_cap']}"]
     return "\n".join(lines)
 
 
