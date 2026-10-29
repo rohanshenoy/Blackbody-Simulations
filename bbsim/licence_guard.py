@@ -47,9 +47,23 @@ or any interruption (``KeyboardInterrupt`` included) leaves the reservation ``un
 ``reconcile --resolve RESERVATION=released|job:<id> --reason TEXT`` after checking ``squeue``; a bind that cannot be
 written after sbatch accepted the job names the job and that command. ``sbatch --wait`` is never run under the lock.
 
-Leases (``<root>/leases/<id>.json``) belong to the launch-lease layer; this module reads only their
-``reservation_id`` and ``state``. Any state but ``released`` holds, unknown cleanup included (HF-058(2)); a held lease
-naming no live reservation counts one slot of its own.
+Launch leases (``<root>/leases/<id>.json``): every owned AEDT start takes one (``bbsim.session.aedt_session`` through
+``launch_lease_from_env``). Admission reads only their ``reservation_id`` and ``state``: any state but ``released``
+holds, unknown cleanup included (HF-058(2)), and a held lease naming no live reservation counts one slot of its own.
+A job's lease consumes its reservation's slots (at most ``slots`` held per reservation); a session with no reservation
+first takes a direct one-slot reservation; at most ``CEILING`` leases are held in total. A lease records {id,
+reservation_id, direct, state (acquired, launching, retained, released), cleanup (unknown, live, stopped), outcome,
+cleanup_waited_s, identity, scope, processes, cleanup_checks, cleanup_evidence, events}. Before ``Hfss()`` its launch
+scope is recorded (host, boot, the launcher and its ancestors, the numeric ``SLURM_JOB_ID``, the step incarnation and
+the launcher's cgroup, ``ProcScopeObserver``), after it the desktop's process and its descendants. After
+``release_desktop`` the session polls ``cleanup_status`` every ``CLEANUP_POLL_S`` for up to ``CLEANUP_WAIT_S`` and
+releases the lease only on ``stopped``: the launch cgroup read in full on its host with no process started since the
+launch left in it, so a solver that outlives its desktop keeps it held. A vanished pid, an empty process list, another
+host, an unreadable cgroup, terminal accounting in ``sacct`` and Slurm's cgroup setting are never proof. Otherwise the
+lease stays held until the operator, after ``scope-check LEASE`` on its host, runs the logged ``release LEASE
+--confirm-cleanup REASON``. ``status --job ID`` lists a job's leases with their state, ``cleanup_waited_s`` and
+outcome. A job checks, before AEDT, that it runs under the shared guard and its own reservation (``check_job_guard``,
+CLI ``check-job``); a second guard named in ``GUARD_ENV`` refuses.
 
 The guard owns the script, the job's context and identity, its array indices and throttle, its working directory and
 the submission protocol. User sbatch arguments (``check_user_sbatch_args``) are complete canonical long names from
@@ -175,6 +189,18 @@ _JOB_ID = re.compile(r"[0-9]+")
 _INDEX_RANGE = re.compile(r"([0-9]+)(?:-([0-9]+)(?::([0-9]+))?)?")
 _ARRAY_TASK = re.compile(r"([0-9]+)_(?:([0-9]+)|\[([^\]]*)\])")
 _COMMIT = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+_RESERVATION_ID = re.compile(r"r[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}")
+_LEASE_ID = re.compile(r"l[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}")
+
+# Launch leases (HF-058(2)): the in-job wait for an owned AEDT scope to stop after release_desktop, and its poll.
+CLEANUP_WAIT_S = 120.0
+CLEANUP_POLL_S = 2.0
+LEASE_ACQUIRED, LEASE_LAUNCHING, LEASE_RETAINED = "acquired", "launching", "retained"
+LEASE_STATES = (LEASE_ACQUIRED, LEASE_LAUNCHING, LEASE_RETAINED, LEASE_RELEASED)
+EXITED_STATES = frozenset({"Z", "X"})          # exited, not yet reaped: holds no licence
+# cgroup v1 hierarchies in the order tried; Slurm's proctrack/cgroup tracks a job's processes in freezer.
+CGROUP_V1_PREFERENCE = ("freezer", "pids", "memory", "cpuset", "cpuacct", "cpu")
+AEDT_PROCESS = re.compile(r"ansysedt|AnsysEM|hf3d|hfss", re.IGNORECASE)
 
 
 class GuardError(RuntimeError):
@@ -722,6 +748,304 @@ def check_path_mode_script(script: str | os.PathLike) -> PathScript:
                       bridge_commit=head.stdout.decode().strip(), data=data)
 
 
+# --- the launch scope on this host: /proc and the cgroup filesystem -------------------------------------------
+
+class ProcScopeObserver:
+    """Process and cgroup evidence on this host, read from ``/proc`` and the cgroup filesystem (standard library).
+
+    ``launch_scope`` (before ``Hfss()``) records the launcher's identity and its ancestors', the boot-relative clock
+    tick at which the launch began, and the launcher's cgroup: the hierarchy of ``/proc/self/cgroup`` whose
+    ``cgroup.procs`` (with its descendant cgroups') lists the launcher, cgroup v1's ``freezer`` first, where Slurm's
+    proctrack/cgroup tracks a job. ``scope`` then counts every process listed there that started at or after that
+    tick, other than the launcher and its recorded ancestors: AEDT's processes inherit the launcher's cgroup, and a
+    solver reparented away from its exiting desktop stays in it, which a walk of the desktop's process tree would miss.
+    An exited process not yet reaped (state Z) holds nothing. A cgroup that cannot be read, or that no longer lists
+    the living launcher, is incomplete evidence, never proof of cleanup. The roots, host, uid and tick rate are
+    injectable for tests.
+    """
+
+    def __init__(self, proc_root: str | os.PathLike = "/proc", cgroup_root: str | os.PathLike = "/sys/fs/cgroup", *,
+                 host: str | None = None, clock_ticks: int | None = None, uid: int | None = None):
+        self.proc_root = Path(proc_root)
+        self.cgroup_root = Path(cgroup_root)
+        self._host = host
+        self._hz = clock_ticks
+        self.uid = os.getuid() if uid is None else uid
+
+    def host(self) -> str:
+        return self._host or socket.gethostname()
+
+    def _ticks_per_s(self) -> int:
+        if self._hz is None:
+            try:
+                self._hz = int(os.sysconf("SC_CLK_TCK"))
+            except (AttributeError, ValueError, OSError):
+                self._hz = 100
+        return self._hz
+
+    def boot_id(self) -> str | None:
+        try:
+            return (self.proc_root / "sys" / "kernel" / "random" / "boot_id").read_text().strip() or None
+        except OSError:
+            return None
+
+    def stat(self, pid: int | str) -> dict | None:
+        """pid, comm, state, ppid and start identity from ``<proc>/<pid>/stat``; None if the process is gone."""
+        path = self.proc_root / str(pid) / "stat"
+        try:
+            text = path.read_text()
+        except (FileNotFoundError, ProcessLookupError, NotADirectoryError):
+            return None
+        head, sep, tail = text.rpartition(")")
+        try:
+            own, comm = head.split(" (", 1)
+            fields = tail.split()
+            start = int(fields[19])
+            return {"pid": int(own), "comm": comm, "state": fields[0], "ppid": int(fields[1]), "starttime": start,
+                    "start": f"linux-starttime:{start}"}
+        except (IndexError, ValueError) as exc:
+            raise OSError(f"{path} is not understood ({exc})") from exc
+
+    def process(self, pid: int) -> dict | None:
+        return self.stat(pid)
+
+    def _pids(self) -> list[int]:
+        return sorted(int(name) for name in os.listdir(self.proc_root) if name.isdigit())
+
+    def descendants(self, pid: int) -> list[dict]:
+        """The processes below ``pid`` in the process tree now (a reparented orphan is not among them)."""
+        try:
+            pids = self._pids()
+        except OSError:
+            return []
+        stats, children = {}, {}
+        for p in pids:
+            try:
+                st = self.stat(p)
+            except OSError:
+                continue
+            if st is not None:
+                stats[p] = st
+                children.setdefault(st["ppid"], []).append(p)
+        found, todo, seen = [], list(children.get(pid, [])), set()
+        while todo:
+            p = todo.pop(0)
+            if p in seen:
+                continue
+            seen.add(p)
+            found.append({k: stats[p][k] for k in ("pid", "start", "ppid", "comm")})
+            todo.extend(children.get(p, []))
+        return found
+
+    def _cgroup_lines(self, pid: int | str = "self") -> list[tuple[str, str, str]]:
+        lines = []
+        for line in (self.proc_root / str(pid) / "cgroup").read_text().splitlines():
+            hierarchy, sep, rest = line.partition(":")
+            controllers, sep2, path = rest.partition(":")
+            if sep and sep2:
+                lines.append((hierarchy, controllers, path))
+        return lines
+
+    def _candidates(self, lines: list[tuple[str, str, str]]) -> list[tuple[str, str, Path]]:
+        v1 = [(c, p) for h, c, p in lines if h != "0" and c and not c.startswith("name=")]
+        found: list[tuple[str, str, Path]] = []
+        for want in CGROUP_V1_PREFERENCE:
+            for controllers, path in v1:
+                if want in controllers.split(","):
+                    found.append((f"v1 {controllers}", path, self.cgroup_root / controllers / path.lstrip("/")))
+        for h, c, path in lines:
+            if h == "0" and c == "":
+                found.append(("v2", path, self.cgroup_root / path.lstrip("/")))
+                found.append(("v2 unified", path, self.cgroup_root / "unified" / path.lstrip("/")))
+        unique, seen = [], set()
+        for kind, path, directory in found:
+            if directory not in seen:
+                seen.add(directory)
+                unique.append((kind, path, directory))
+        return unique
+
+    @staticmethod
+    def _listing(directory: Path) -> set[int]:
+        """Every pid in the ``cgroup.procs`` of ``directory`` and of its descendant cgroups; OSError if one is
+        unreadable."""
+        def refuse(exc: OSError) -> None:
+            raise exc
+
+        pids: set[int] = set()
+        read = 0
+        for folder, _, _ in os.walk(directory, onerror=refuse):
+            text = (Path(folder) / "cgroup.procs").read_text()
+            read += 1
+            try:
+                pids.update(int(x) for x in text.split())
+            except ValueError as exc:
+                raise OSError(f"{folder}/cgroup.procs is not understood ({exc})") from exc
+        if not read:
+            raise OSError(f"{directory} holds no cgroup.procs")
+        return pids
+
+    def launch_scope(self) -> dict:
+        """The launch scope of this process, before AEDT starts; ``cgroup.readable`` is False when it cannot be read."""
+        cgroup: dict[str, Any] = {"readable": False, "kind": None, "path": None, "dir": None, "error": None,
+                                  "lines": None}
+        scope: dict[str, Any] = {"observer": "proc", "host": self.host(), "boot_id": self.boot_id(),
+                                 "launcher": {"pid": os.getpid(), "start": None}, "ancestors": [], "cgroup": cgroup,
+                                 "begin_ticks": None, "clock_ticks_per_s": self._ticks_per_s()}
+        try:
+            me = self.stat("self")
+        except OSError as exc:
+            me, why = None, str(exc)
+        else:
+            why = f"{self.proc_root / 'self' / 'stat'} does not exist"
+        if me is None:
+            cgroup["error"] = f"this host's processes cannot be observed: {why}"
+            return scope
+        scope["launcher"] = {"pid": me["pid"], "start": me["start"]}
+        chain, seen, ppid = [], {me["pid"]}, me["ppid"]
+        while ppid > 0 and ppid not in seen and len(chain) < 64:
+            seen.add(ppid)
+            try:
+                st = self.stat(ppid)
+            except OSError:
+                st = None
+            if st is None:
+                break
+            chain.append({"pid": st["pid"], "start": st["start"]})
+            ppid = st["ppid"]
+        scope["ancestors"] = chain
+        try:
+            uptime_s = float((self.proc_root / "uptime").read_text().split()[0])
+        except (OSError, ValueError, IndexError) as exc:
+            cgroup["error"] = (f"{self.proc_root / 'uptime'} cannot be read ({exc}), so processes started after the "
+                               "launch cannot be told from earlier ones")
+            return scope
+        # One tick of margin toward inclusion: a process started in the tick the launch began is in scope.
+        scope["begin_ticks"] = int(uptime_s * self._ticks_per_s()) - 1
+        try:
+            lines = self._cgroup_lines("self")
+        except OSError as exc:
+            cgroup["error"] = f"{self.proc_root / 'self' / 'cgroup'} cannot be read: {exc}"
+            return scope
+        cgroup["lines"] = [":".join(line) for line in lines]
+        tried = []
+        for kind, path, directory in self._candidates(lines):
+            try:
+                listed = self._listing(directory)
+            except OSError as exc:
+                tried.append(f"{directory}: {exc}")
+                continue
+            if me["pid"] in listed:
+                cgroup.update(readable=True, kind=kind, path=path, dir=str(directory))
+                return scope
+            tried.append(f"{directory} does not list the launcher {me['pid']}")
+        cgroup["error"] = "no cgroup of the launcher lists it: " + ("; ".join(tried) or "no cgroup line was understood")
+        return scope
+
+    def scope(self, scope: Mapping[str, Any]) -> dict:
+        """The processes of a recorded launch scope now: ``complete`` only when its cgroup was read in full."""
+        cg = scope.get("cgroup") if isinstance(scope.get("cgroup"), Mapping) else {}
+        result: dict[str, Any] = {"complete": False, "dir": cg.get("dir"), "live": [], "exited": [], "reason": None}
+        if not cg.get("readable") or not cg.get("dir"):
+            result["reason"] = f"the launch recorded no readable cgroup ({cg.get('error') or 'none recorded'})"
+            return result
+        begin = scope.get("begin_ticks")
+        if isinstance(begin, bool) or not isinstance(begin, int):
+            result["reason"] = "the launch recorded no start tick, so its processes cannot be told from earlier ones"
+            return result
+        try:
+            listed = self._listing(Path(cg["dir"]))
+        except OSError as exc:
+            result["reason"] = f"the cgroup {cg['dir']} cannot be read now: {exc}"
+            return result
+        launcher = scope.get("launcher") if isinstance(scope.get("launcher"), Mapping) else {}
+        own = {(launcher.get("pid"), launcher.get("start"))}
+        own |= {(a.get("pid"), a.get("start")) for a in scope.get("ancestors") or [] if isinstance(a, Mapping)}
+        pid = launcher.get("pid")
+        try:
+            me = self.stat(pid) if isinstance(pid, int) and not isinstance(pid, bool) else None
+        except OSError:
+            me = None
+        if me is not None and me["start"] == launcher.get("start") and me["state"] not in EXITED_STATES \
+                and pid not in listed:
+            result["reason"] = (f"the launcher {pid} is alive but its recorded cgroup {cg['dir']} does not list it, "
+                                "so that listing is not its scope")
+            return result
+        for p in sorted(listed):
+            try:
+                st = self.stat(p)
+            except OSError as exc:
+                result["reason"] = f"process {p} of the cgroup cannot be read: {exc}"
+                return result
+            if st is None or (p, st["start"]) in own or st["starttime"] < begin:
+                continue
+            entry = {k: st[k] for k in ("pid", "start", "ppid", "comm", "state")}
+            (result["exited"] if st["state"] in EXITED_STATES else result["live"]).append(entry)
+        result["complete"] = True
+        return result
+
+    def job_processes(self, job_id: str) -> dict:
+        """Every process on this host whose ``/proc/<pid>/cgroup`` has the path component ``job_<job_id>``."""
+        token = f"job_{job_id}"
+        result: dict[str, Any] = {"complete": False, "processes": [], "reason": None}
+        try:
+            pids = self._pids()
+        except OSError as exc:
+            result["reason"] = f"{self.proc_root} cannot be listed: {exc}"
+            return result
+        for pid in pids:
+            try:
+                lines = self._cgroup_lines(pid)
+            except (FileNotFoundError, ProcessLookupError, NotADirectoryError):
+                continue
+            except OSError as exc:
+                result["reason"] = f"{self.proc_root / str(pid) / 'cgroup'} cannot be read: {exc}"
+                return result
+            paths = [path for _, _, path in lines if token in path.split("/")]
+            if not paths:
+                continue
+            try:
+                st = self.stat(pid)
+            except OSError:
+                st = None
+            result["processes"].append({"pid": pid, "comm": st["comm"] if st else None,
+                                        "start": st["start"] if st else None, "state": st["state"] if st else None,
+                                        "cgroup": paths[0]})
+        result["complete"] = True
+        return result
+
+    def aedt_processes(self) -> list[dict]:
+        """This user's AEDT processes on this host, each with the Slurm job its cgroup names (None outside one)."""
+        found = []
+        try:
+            pids = self._pids()
+        except OSError:
+            return found
+        for pid in pids:
+            folder = self.proc_root / str(pid)
+            try:
+                if folder.stat().st_uid != self.uid:
+                    continue
+                command = (folder / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+                st = self.stat(pid)
+            except OSError:
+                continue
+            if st is None or not (AEDT_PROCESS.search(command) or AEDT_PROCESS.search(st["comm"])):
+                continue
+            try:
+                lines = self._cgroup_lines(pid)
+            except OSError:
+                lines = []
+            job = next((part[4:] for _, _, path in lines for part in path.split("/")
+                        if part.startswith("job_") and part[4:].isdigit()), None)
+            found.append({"pid": pid, "comm": st["comm"], "job": job, "command": command[:200]})
+        return found
+
+
+def default_scope_observer() -> ProcScopeObserver:
+    """The production observer: this host's ``/proc`` and ``/sys/fs/cgroup``."""
+    return ProcScopeObserver()
+
+
 # --- the guard ------------------------------------------------------------------------------------------------
 
 def _check_cap(cap: Any) -> int:
@@ -774,6 +1098,18 @@ def _check_env_extras(env: Mapping[str, str] | None) -> dict[str, str]:
     return extras
 
 
+def _reservation_problem(rec: Any, error: str | None, stem: str) -> str | None:
+    """Why a reservation record read from ``<stem>.json`` is unusable, or None."""
+    if error is not None:
+        return error
+    ok = (isinstance(rec, dict) and rec.get("id") == stem and rec.get("state") in STATES
+          and rec.get("kind") in (*KINDS, DIRECT_KIND)
+          and isinstance(rec.get("slots"), int) and not isinstance(rec.get("slots"), bool)
+          and rec["slots"] >= 0 and isinstance(rec.get("events"), list)
+          and (rec["state"] != "bound" or (isinstance(rec.get("job_id"), str) and _JOB_ID.fullmatch(rec["job_id"]))))
+    return None if ok else "fields"
+
+
 def _parse_job_id(stdout: str) -> str | None:
     lines = [line.strip() for line in stdout.splitlines() if line.strip()]
     if len(lines) != 1:
@@ -817,10 +1153,10 @@ class _Reconciled:
 
 
 class Guard:
-    """The shared admission in ``root`` (resolved once), with its scheduler."""
+    """The shared admission in ``root`` (resolved once), with its scheduler and this host's launch-scope observer."""
 
     def __init__(self, root: str | os.PathLike, scheduler: Scheduler, *, lock_timeout_s: float = 60.0,
-                 clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time, observer: Any = None):
         try:
             resolved = Path(root).resolve(strict=True)
         except (OSError, RuntimeError) as exc:
@@ -833,6 +1169,8 @@ class Guard:
             raise GuardRefused(f"lock_timeout_s must be a finite nonnegative number, got {lock_timeout_s!r}")
         self.root = resolved
         self.scheduler = scheduler
+        # The launch-scope observer of this host (ProcScopeObserver); tests pass one reading a fake /proc.
+        self.observer = observer if observer is not None else default_scope_observer()
         self.lock_timeout_s = float(lock_timeout_s)
         self.clock = clock
         self.last_reservation_id: str | None = None
@@ -1040,14 +1378,9 @@ class Guard:
             if path.name.startswith(".") or path.suffix != ".json":
                 continue
             rec, error = _read_json(path)
-            ok = (error is None and isinstance(rec, dict) and rec.get("id") == path.stem
-                  and rec.get("state") in STATES and rec.get("kind") in (*KINDS, DIRECT_KIND)
-                  and isinstance(rec.get("slots"), int) and not isinstance(rec.get("slots"), bool)
-                  and rec["slots"] >= 0 and isinstance(rec.get("events"), list)
-                  and (rec["state"] != "bound" or (isinstance(rec.get("job_id"), str)
-                                                   and _JOB_ID.fullmatch(rec["job_id"]))))
-            if not ok:
-                raise GuardError(f"reservation record {path} is unreadable or malformed ({error or 'fields'}); "
+            problem = _reservation_problem(rec, error, path.stem)
+            if problem is not None:
+                raise GuardError(f"reservation record {path} is unreadable or malformed ({problem}); "
                                  "admission is refused until it is repaired")
             records[rec["id"]] = rec
         return records
@@ -1437,6 +1770,592 @@ class Guard:
             self._change(record, "bound", event="resolved", outcome=outcome, reason=reason.strip(), previous=previous,
                          job_queued=job in state.groups)
 
+    # launch leases
+    def _lease_file(self, lease_id: Any) -> Path:
+        if not isinstance(lease_id, str) or not _LEASE_ID.fullmatch(lease_id):
+            raise GuardRefused(f"{lease_id!r} is not a lease id (l<UTC time>-<8 hex digits>, from status --job)")
+        return self._leases / f"{lease_id}.json"
+
+    def lease(self, lease_id: str) -> dict:
+        """A lease record as stored (read without the lock: records are replaced atomically)."""
+        path = self._lease_file(lease_id)
+        rec, error = _read_json(path)
+        if rec is None and error is None:
+            raise GuardRefused(f"there is no lease {lease_id} in {self._leases}")
+        if error is not None or not isinstance(rec, dict) or rec.get("id") != lease_id \
+                or not isinstance(rec.get("state"), str) or not isinstance(rec.get("processes"), list) \
+                or not isinstance(rec.get("events"), list):
+            raise GuardError(f"lease record {path} is unreadable or malformed ({error or 'fields'})")
+        return rec
+
+    def _new_lease_id(self) -> str:
+        while True:
+            lid = f"l{_compact(self.clock())}-{secrets.token_hex(4)}"
+            if not (self._leases / f"{lid}.json").exists():
+                return lid
+
+    def _save_lease(self, rec: dict) -> None:
+        _write_json_atomic(self._lease_file(rec["id"]), rec)
+
+    def _lease_event(self, rec: dict, event: str, **details: Any) -> None:
+        rec["events"].append({"utc": self._now(), "event": event, **details})
+        self._save_lease(rec)
+        self._append_event({"utc": self._now(), "event": event, "lease": rec["id"],
+                            "reservation": rec.get("reservation_id"), "lease_state": rec["state"], **details,
+                            "by": _identity()})
+
+    def acquire_lease(self, *, reservation_id: str | None, identity: dict) -> str:
+        """A launch lease before an owned AEDT start; its id.
+
+        With ``reservation_id`` (the job's ``RESERVATION_ENV``) the reservation must hold a solve slot, not be
+        released, and, once bound, be bound to this Slurm job; its held leases stay within its slots. Without one, a
+        direct one-slot reservation is admitted first (``reserve_direct``), released only with this lease. At most
+        ``CEILING`` leases are held in total.
+        """
+        identity = _check_context(identity)
+        if reservation_id is not None and (not isinstance(reservation_id, str)
+                                           or not _RESERVATION_ID.fullmatch(reservation_id)):
+            raise GuardRefused(f"{reservation_id!r} is not a reservation id")
+        with self.locked():
+            held = [lease for lease in self._read_leases() if lease["state"] != LEASE_RELEASED]
+            if len(held) >= CEILING:
+                raise GuardRefused(f"{len(held)} launch leases are held, the ceiling of {CEILING} (OR-045): no AEDT "
+                                   "start is admitted until one is released after its cleanup is verified")
+            direct = reservation_id is None
+            if direct:
+                rid = self.reserve_direct(cap=CEILING, context={"source": "direct session", "identity": identity})
+            else:
+                rec = self._read_reservations().get(reservation_id)
+                if rec is None:
+                    raise GuardRefused(f"there is no reservation {reservation_id} in {self.root}")
+                problem = _reservation_use_problem(rec, os.environ)
+                if problem:
+                    raise GuardRefused(problem)
+                on_it = sum(1 for lease in held if lease["reservation_id"] == reservation_id)
+                if on_it + 1 > rec["slots"]:
+                    raise GuardRefused(f"reservation {reservation_id} holds {rec['slots']} slot(s) and {on_it} held "
+                                       "launch lease(s) name it already; a lease is released only after its cleanup "
+                                       "is verified")
+                rid = reservation_id
+            lid = self._new_lease_id()
+            record = {"id": lid, "reservation_id": rid, "direct": direct, "state": LEASE_ACQUIRED,
+                      "cleanup": "unknown", "outcome": None, "cleanup_waited_s": None, "identity": identity,
+                      "acquired_by": _owner_identity(), "created_utc": self._now(), "scope": None, "processes": [],
+                      "cleanup_checks": [], "cleanup_evidence": None, "events": []}
+            try:
+                self._leases.mkdir(exist_ok=True)
+                self._lease_event(record, "lease_acquired", direct=direct, slurm_job=os.environ.get("SLURM_JOB_ID"))
+            except BaseException:
+                if direct:                      # no lease names it and nothing was launched
+                    res = self._read_reservations().get(rid)
+                    if res is not None and res["state"] != "released":
+                        self._change(res, "released", event="released_unused", reason="its lease could not be written")
+                raise
+            return lid
+
+    def begin_launch_scope(self, lease_id: str, identity: dict) -> None:
+        """Record the owned launch scope before ``Hfss()``: host, boot, launcher and ancestors, the numeric
+        ``SLURM_JOB_ID`` (an array task's own), the step incarnation and the readable cgroup; state ``launching``,
+        cleanup ``unknown``. Recorded once."""
+        identity = _check_context(identity)
+        self._lease_file(lease_id)
+        try:
+            observed = dict(self.observer.launch_scope())
+        except Exception as exc:                # no evidence: recorded as such, and cleanup stays unknown
+            observed = {"observer": "failed", "host": socket.gethostname(), "boot_id": _boot_id(),
+                        "cgroup": {"readable": False, "error": f"the observer failed: {type(exc).__name__}: {exc}"}}
+        scope = {**observed, **_slurm_identity(os.environ), "began_utc": self._now(), "identity": identity}
+        with self.locked():
+            rec = self.lease(lease_id)
+            if rec["state"] != LEASE_ACQUIRED or rec.get("scope") is not None:
+                raise GuardRefused(f"lease {lease_id} is {rec['state']}: its launch scope is recorded once, before "
+                                   "Hfss() is called")
+            rec["state"], rec["cleanup"], rec["scope"] = LEASE_LAUNCHING, "unknown", scope
+            cg = scope.get("cgroup") if isinstance(scope.get("cgroup"), dict) else {}
+            self._lease_event(rec, "lease_launch_scope", host=scope.get("host"), slurm_job_id=scope.get("slurm_job_id"),
+                              step_incarnation=scope.get("step_incarnation"), cgroup=cg.get("path"),
+                              cgroup_readable=bool(cg.get("readable")), cgroup_error=cg.get("error"))
+
+    def set_lease_processes(self, lease_id: str, processes: Sequence[dict]) -> None:
+        """Append observed desktop and solver processes (pid and start identity) to the lease's scope; earlier
+        evidence is never replaced, and an empty observation adds nothing."""
+        if not isinstance(processes, (list, tuple)):
+            raise GuardRefused(f"processes must be a list of records, got {type(processes).__name__}")
+        clean = []
+        for p in processes:
+            pid = p.get("pid") if isinstance(p, dict) else None
+            if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+                raise GuardRefused(f"a process record needs a positive integer pid, got {p!r}")
+            start = p.get("start")
+            if start is not None and not isinstance(start, str):
+                raise GuardRefused(f"process {pid}'s start identity must be a string or null, got {start!r}")
+            entry = {"pid": pid, "start": start, "role": str(p.get("role") or "descendant")}
+            entry.update({k: p[k] for k in ("comm", "ppid") if k in p})
+            clean.append(entry)
+        with self.locked():
+            rec = self.lease(lease_id)
+            if rec["state"] == LEASE_RELEASED:
+                raise GuardRefused(f"lease {lease_id} is released; no process is recorded on it")
+            known = {(q.get("pid"), q.get("start")) for q in rec["processes"]}
+            added = []
+            for entry in clean:
+                if (entry["pid"], entry["start"]) not in known:
+                    known.add((entry["pid"], entry["start"]))
+                    added.append({**entry, "observed_utc": self._now()})
+            rec["processes"].extend(added)
+            self._lease_event(rec, "lease_processes", observed=len(clean),
+                              added=[{"pid": e["pid"], "role": e["role"]} for e in added])
+
+    def note_lease(self, lease_id: str, event: str, **details: Any) -> None:
+        """Log one event of a lease's launch (a constructor that raised, a desktop release that failed, ...)."""
+        with self.locked():
+            rec = self.lease(lease_id)
+            self._lease_event(rec, event, **json.loads(json.dumps(details, default=str)))
+
+    def _observe_cleanup(self, rec: dict) -> tuple[str, dict]:
+        """``stopped``, ``live`` or ``unknown`` for a lease's owned launch scope, with the evidence used.
+
+        ``stopped`` needs independent complete evidence: no launch scope was ever recorded (``Hfss()`` was never
+        called), the host has rebooted since, or the launch cgroup was read in full on its host and holds none of the
+        launch's processes. A recorded desktop or solver alive with its start identity, or any process of the cgroup
+        started since the launch, is ``live``. Anything else, an empty process list, a vanished or reused pid, another
+        host, an unreadable cgroup included, is ``unknown``. Accounting and Slurm's settings are never read here.
+        """
+        try:
+            here = self.observer.host()
+        except Exception:                       # noqa: BLE001 - an observer that cannot name its host proves nothing
+            here = None
+        evidence: dict[str, Any] = {"utc": self._now(), "checked_on": here, "basis": None, "detail": None}
+        if rec["state"] == LEASE_RELEASED:
+            evidence.update(basis="released", detail="the lease is released")
+            return "stopped", evidence
+        scope = rec.get("scope")
+        if not isinstance(scope, dict):
+            if rec["state"] == LEASE_ACQUIRED and not rec.get("processes"):
+                evidence.update(basis="never_launched", detail="no launch scope was recorded, so Hfss() was never "
+                                                               "called under this lease")
+                return "stopped", evidence
+            evidence.update(basis="no_scope", detail="the lease records processes but no launch scope")
+            return "unknown", evidence
+        host = scope.get("host")
+        evidence["lease_host"] = host
+        if here is None or host != here:
+            evidence.update(basis="other_host", detail=f"recorded on host {host!r}; checked on {here!r}, where its "
+                                                        "processes cannot be seen: check on the lease's host")
+            return "unknown", evidence
+        recorded_boot = scope.get("boot_id")
+        try:
+            boot = self.observer.boot_id()
+        except Exception:                       # noqa: BLE001
+            boot = None
+        if recorded_boot and boot and recorded_boot != boot:
+            evidence.update(basis="rebooted", detail=f"host {host} has rebooted since the launch (boot "
+                                                     f"{recorded_boot}, now {boot}), which ended every process of it")
+            return "stopped", evidence
+        recorded = []
+        for p in rec.get("processes") or []:
+            entry = {"pid": p.get("pid"), "start": p.get("start"), "role": p.get("role")}
+            try:
+                st = self.observer.process(p.get("pid"))
+            except Exception as exc:            # noqa: BLE001
+                entry["now"], entry["error"] = "unreadable", str(exc)
+            else:
+                if st is None:
+                    entry["now"] = "gone"
+                elif not p.get("start") or not st.get("start"):
+                    entry["now"] = "unverifiable"
+                elif st["start"] != p.get("start"):
+                    entry["now"] = "reused"
+                elif st.get("state") in EXITED_STATES:
+                    entry["now"] = "exited"
+                else:
+                    entry["now"], entry["comm"] = "alive", st.get("comm")
+            recorded.append(entry)
+        evidence["recorded"] = recorded
+        alive = [r for r in recorded if r["now"] == "alive"]
+        if alive:
+            evidence.update(basis="recorded_process_alive", live=alive,
+                            detail=f"{len(alive)} recorded process(es) alive")
+            return "live", evidence
+        try:
+            cg = dict(self.observer.scope(scope))
+        except Exception as exc:                # noqa: BLE001
+            cg = {"complete": False, "reason": f"the observer failed: {type(exc).__name__}: {exc}"}
+        evidence["cgroup"] = {k: cg.get(k) for k in ("complete", "dir", "reason", "exited")}
+        if cg.get("complete"):
+            if cg.get("live"):
+                evidence.update(basis="cgroup", live=cg["live"],
+                                detail=f"{len(cg['live'])} process(es) of the launch cgroup started since the launch")
+                return "live", evidence
+            evidence.update(basis="cgroup_empty", detail=f"the launch cgroup {cg.get('dir')} holds no process started "
+                                                         "since the launch, other than the launcher and its ancestors")
+            return "stopped", evidence
+        seen = ", ".join(f"{r['pid']} {r['now']}" for r in recorded) or "none"
+        evidence.update(basis="incomplete", detail=f"{cg.get('reason')}; recorded processes: {seen}; a vanished pid "
+                                                   "alone is not proof of cleanup (HF-058(2))")
+        return "unknown", evidence
+
+    def _record_check(self, rec: dict, status: str, evidence: dict) -> None:
+        rec["cleanup"] = status
+        rec["cleanup_evidence"] = evidence
+        checks = rec.setdefault("cleanup_checks", [])
+        checks.append({"utc": evidence.get("utc"), "status": status, "basis": evidence.get("basis"),
+                       "live": [p.get("pid") for p in evidence.get("live") or []]})
+        del checks[:-200]
+        self._save_lease(rec)
+
+    def cleanup_status(self, lease_id: str) -> str:
+        """Observe the lease's owned launch scope now (``_observe_cleanup``) and record what was seen."""
+        with self.locked():
+            rec = self.lease(lease_id)
+            status, evidence = self._observe_cleanup(rec)
+            if rec["state"] != LEASE_RELEASED:
+                self._record_check(rec, status, evidence)
+            return status
+
+    def release_lease(self, lease_id: str, *, confirm_cleanup: str | None = None,
+                      cleanup_waited_s: float | None = None) -> bool:
+        """Release a lease when its scope is observed ``stopped``, or on an operator's ``confirm_cleanup`` reason
+        attesting verified cleanup (refused while a process of it is seen alive here); otherwise keep it held and
+        return False. The release event records who, why, the evidence, the wait and the outcome; a direct reservation
+        is released with its cleaned lease. Accounting never releases a lease."""
+        reason = None
+        if confirm_cleanup is not None:
+            reason = confirm_cleanup.strip() if isinstance(confirm_cleanup, str) else ""
+            if not reason:
+                raise GuardRefused("--confirm-cleanup needs a reason: what verified the cleanup (scope-check on the "
+                                   "lease's host showing SCOPE EMPTY, and what else was checked)")
+        if cleanup_waited_s is not None and (isinstance(cleanup_waited_s, bool)
+                                             or not isinstance(cleanup_waited_s, (int, float))
+                                             or not math.isfinite(cleanup_waited_s) or cleanup_waited_s < 0):
+            raise GuardRefused(f"cleanup_waited_s must be a finite nonnegative number, got {cleanup_waited_s!r}")
+        with self.locked():
+            rec = self.lease(lease_id)
+            if rec["state"] == LEASE_RELEASED:
+                return True
+            status, evidence = self._observe_cleanup(rec)
+            self._record_check(rec, status, evidence)
+            if reason is None and status != "stopped":
+                return False
+            if reason is not None and status == "live":
+                raise GuardRefused(f"lease {lease_id}: its launch scope is seen live on this host "
+                                   f"({describe_evidence(evidence)}); a confirmation cannot override processes seen "
+                                   "alive")
+            outcome = "verified_cleanup" if status == "stopped" else "operator_confirmed"
+            rec["state"], rec["outcome"], rec["released_utc"] = LEASE_RELEASED, outcome, self._now()
+            if cleanup_waited_s is not None:
+                rec["cleanup_waited_s"] = float(cleanup_waited_s)
+            rec["release"] = {"by": _identity(), "reason": reason, "cleanup_status": status, "evidence": evidence}
+            self._lease_event(rec, "lease_released", outcome=outcome, reason=reason, cleanup_status=status,
+                              cleanup_waited_s=rec.get("cleanup_waited_s"), evidence=evidence)
+            if rec.get("direct"):
+                res = self._read_reservations().get(rec["reservation_id"])
+                if res is not None and res["kind"] == DIRECT_KIND and res["state"] != "released":
+                    states = [lease["state"] for lease in self._read_leases()
+                              if lease["reservation_id"] == res["id"]]
+                    if states and all(s == LEASE_RELEASED for s in states):
+                        self._change(res, "released", event="released_with_lease", lease=rec["id"], outcome=outcome)
+            return True
+
+    def retain_lease(self, lease_id: str, *, cleanup_waited_s: float) -> None:
+        """Keep a lease held after the cleanup wait ended without verified cleanup, recording the wait, the outcome
+        and the last evidence."""
+        with self.locked():
+            rec = self.lease(lease_id)
+            if rec["state"] == LEASE_RELEASED:
+                return
+            rec["state"], rec["outcome"], rec["cleanup_waited_s"] = LEASE_RETAINED, "retained", float(cleanup_waited_s)
+            self._lease_event(rec, "lease_retained", cleanup_status=rec.get("cleanup"),
+                              cleanup_waited_s=rec["cleanup_waited_s"], evidence=rec.get("cleanup_evidence"))
+
+    def leases_of_job(self, job_id: str) -> list[dict]:
+        """The leases of a Slurm job or array: its id is the lease's recorded job or array id, or the job its
+        reservation is bound to. Unreadable records are listed as such."""
+        if not isinstance(job_id, str) or not _JOB_ID.fullmatch(job_id):
+            raise GuardRefused(f"the job id must be a plain number, got {job_id!r}")
+        try:
+            bound = {rid for rid, r in self._read_reservations().items() if r.get("job_id") == job_id}
+        except GuardError:
+            bound = set()
+        found = []
+        if self._leases.is_dir():
+            for path in sorted(self._leases.glob("*.json")):
+                if path.name.startswith("."):
+                    continue
+                rec, error = _read_json(path)
+                if error is not None or not isinstance(rec, dict):
+                    found.append({"id": path.stem, "unreadable": error or "not an object"})
+                    continue
+                scope = rec.get("scope") if isinstance(rec.get("scope"), dict) else {}
+                if job_id in (scope.get("slurm_job_id"), scope.get("slurm_array_job_id")) \
+                        or rec.get("reservation_id") in bound:
+                    found.append(rec)
+        return sorted(found, key=lambda r: (str(r.get("created_utc", "")), r["id"]))
+
+
+# --- launch leases: the guard a job or session uses, and the cleanup wait -------------------------------------
+
+def _own_job_ids(env: Mapping[str, str]) -> list[str]:
+    return [v for v in (env.get("SLURM_JOB_ID"), env.get("SLURM_ARRAY_JOB_ID")) if v and _JOB_ID.fullmatch(v)]
+
+
+def _slurm_identity(env: Mapping[str, str]) -> dict:
+    """The Slurm identity of this process: its numeric job id (an array task's own), the array, step and restart."""
+    def numeric(name: str) -> str | None:
+        value = env.get(name)
+        return value if value and _JOB_ID.fullmatch(value) else None
+
+    job, step = numeric("SLURM_JOB_ID"), env.get("SLURM_STEP_ID")
+    restart = env.get("SLURM_RESTART_COUNT") or "0"
+    return {"slurm_job_id": job, "slurm_array_job_id": numeric("SLURM_ARRAY_JOB_ID"),
+            "slurm_array_task_id": numeric("SLURM_ARRAY_TASK_ID"), "slurm_step_id": step,
+            "slurm_restart_count": restart, "slurm_node": env.get("SLURMD_NODENAME"),
+            "step_incarnation": f"{job}.{step or 'batch'}.{restart}" if job else None}
+
+
+def _reservation_use_problem(rec: dict, env: Mapping[str, str], kinds: Sequence[str] | None = None) -> str | None:
+    """Why this process may not take a launch lease under ``rec``, or None."""
+    rid = rec["id"]
+    if rec["state"] == "released":
+        return f"reservation {rid} is released: it holds no capacity"
+    if rec["kind"] in ZERO_SLOT_KINDS or rec["slots"] < 1:
+        return f"reservation {rid} ({rec['kind']}, {rec['slots']} slot(s)) holds no solve slot"
+    if kinds is not None and rec["kind"] not in kinds:
+        return f"reservation {rid} is a {rec['kind']} reservation; this job takes {' or '.join(kinds)}"
+    if rec["state"] == "bound":
+        own = _own_job_ids(env)
+        if not own:
+            return (f"reservation {rid} is bound to job {rec['job_id']}, but this process is not in a Slurm job (no "
+                    "SLURM_JOB_ID): a reservation admits only the job it was submitted as")
+        if rec["job_id"] not in own:
+            return f"reservation {rid} is bound to job {rec['job_id']}, not to this job ({', '.join(own)})"
+    return None
+
+
+def check_job_guard(*, kinds: Sequence[str] | None = None, env: Mapping[str, str] | None = None,
+                    root: str | os.PathLike | None = None) -> dict:
+    """The guard a job or an owned AEDT session uses, verified before anything starts (OR-045, HF-057).
+
+    ``GUARD_ENV`` is required, never defaulted here, and must resolve to the shared ``DEFAULT_ROOT`` (or ``root``):
+    a second guard cannot bypass the shared cap. ``RESERVATION_ENV``, required when ``kinds`` is given, must name a
+    reservation in that guard that is not released, holds a solve slot, is of one of ``kinds`` and, once bound, is
+    bound to this Slurm job (``SLURM_JOB_ID``, or an array task's ``SLURM_ARRAY_JOB_ID``). Returns {root, reservation,
+    kind, state, job_id, slurm_job_id}; raises ``GuardRefused``.
+    """
+    env = os.environ if env is None else env
+    value = env.get(GUARD_ENV)
+    if not value:
+        raise GuardRefused(f"{GUARD_ENV} is not set: every owned AEDT start takes a launch lease from the shared guard "
+                           f"(OR-045); a job gets it from python -m bbsim.licence_guard submit, and a session started "
+                           f"by hand sets {GUARD_ENV}={DEFAULT_ROOT if root is None else root}")
+    shared_root = DEFAULT_ROOT if root is None else Path(root)
+    try:
+        here = Path(value).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise GuardRefused(f"{GUARD_ENV}={value} cannot be reached ({exc})") from exc
+    try:
+        shared = Path(shared_root).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise GuardRefused(f"the shared guard {shared_root} cannot be reached ({exc})") from exc
+    if here != shared:
+        raise GuardRefused(f"{GUARD_ENV}={value} resolves to {here}, not the shared guard {shared}: a second guard "
+                           "cannot bypass the cap")
+    if not here.is_dir():
+        raise GuardRefused(f"the guard {here} is not a directory")
+    found = {"root": str(here), "reservation": None, "kind": None, "state": None, "job_id": None,
+             "slurm_job_id": env.get("SLURM_JOB_ID") or None}
+    rid = env.get(RESERVATION_ENV) or None
+    if rid is None:
+        if kinds is not None:
+            raise GuardRefused(f"{RESERVATION_ENV} is not set: this job runs only under the reservation python -m "
+                               "bbsim.licence_guard submit admitted it with")
+        return found
+    if not _RESERVATION_ID.fullmatch(rid):
+        raise GuardRefused(f"{RESERVATION_ENV}={rid!r} is not a reservation id")
+    path = here / "reservations" / f"{rid}.json"
+    rec, error = _read_json(path)
+    if rec is None and error is None:
+        raise GuardRefused(f"there is no reservation {rid} in {here}")
+    problem = _reservation_problem(rec, error, rid)
+    if problem is not None:
+        raise GuardRefused(f"reservation record {path} is unreadable or malformed ({problem})")
+    problem = _reservation_use_problem(rec, env, kinds)
+    if problem is not None:
+        raise GuardRefused(problem)
+    found.update(reservation=rid, kind=rec["kind"], state=rec["state"], job_id=rec.get("job_id"))
+    return found
+
+
+class LaunchLease(str):
+    """A launch lease's id (a ``str``) with the ``Guard`` that holds it."""
+
+    guard: Guard
+
+    def __new__(cls, lease_id: str, guard: Guard) -> LaunchLease:
+        obj = super().__new__(cls, lease_id)
+        obj.guard = guard
+        return obj
+
+
+def _check_wait(value: Any, what: str = "cleanup_wait_s") -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise GuardRefused(f"{what} must be a finite nonnegative number of seconds, got {value!r}")
+    return float(value)
+
+
+@contextmanager
+def launch_lease_from_env(identity: dict, *, cleanup_wait_s: float = CLEANUP_WAIT_S, observer: Any = None,
+                          scheduler: Scheduler | None = None) -> Iterator[LaunchLease]:
+    """A launch lease from the job's guard (``GUARD_ENV``, required; ``RESERVATION_ENV``, optional): ``GuardError``
+    before anything when the guard is unset, unreachable or not the shared one, or the reservation is not this job's.
+
+    On exit, whatever happened inside, ``settle_lease`` polls the lease's scope every ``CLEANUP_POLL_S`` for up to
+    ``cleanup_wait_s`` and releases it on ``stopped``, or keeps it held and logs what it saw (HF-058(2)). A failure to
+    settle leaves the lease held and is logged, never raised over the body's own exception.
+    """
+    wait = _check_wait(cleanup_wait_s)
+    found = check_job_guard()
+    guard = Guard(found["root"], scheduler if scheduler is not None else SlurmScheduler(), observer=observer)
+    lease = LaunchLease(guard.acquire_lease(reservation_id=found["reservation"], identity=identity), guard)
+    try:
+        yield lease
+    finally:
+        try:
+            settle_lease(guard, lease, wait_s=wait)
+        except Exception as exc:                # noqa: BLE001 - the lease stays held; never mask the body's error
+            log.error("launch lease %s could not be settled (%s: %s); it stays held until python -m "
+                      "bbsim.licence_guard --root %s release %s --confirm-cleanup REASON after scope-check on its host",
+                      lease, type(exc).__name__, exc, guard.root, lease)
+
+
+def describe_evidence(evidence: Mapping[str, Any] | None) -> str:
+    """One line of a cleanup observation: its basis, the processes seen alive and the detail."""
+    if not isinstance(evidence, Mapping):
+        return "no observation recorded"
+    live = []
+    for p in evidence.get("live") or []:
+        if isinstance(p, Mapping):
+            live.append(f"pid {p.get('pid')} ({p.get('comm') or p.get('role') or '?'}, start {p.get('start')})")
+    text = f"basis {evidence.get('basis')}"
+    if live:
+        text += f"; live: {', '.join(live)}"
+    if evidence.get("detail"):
+        text += f"; {evidence['detail']}"
+    return text
+
+
+def settle_lease(guard: Guard, lease_id: str, *, wait_s: float, poll_s: float | None = None) -> bool:
+    """After ``release_desktop``: poll ``cleanup_status`` every ``poll_s`` (``CLEANUP_POLL_S``) for up to ``wait_s``
+    and release the lease on ``stopped``, recording ``cleanup_waited_s``; otherwise keep it held, record the wait and
+    log the scope seen (R-j, HF-058(2)). True if released."""
+    wait = _check_wait(wait_s, "wait_s")
+    poll = CLEANUP_POLL_S if poll_s is None else _check_wait(poll_s, "poll_s")
+    start = time.monotonic()
+    status = "unknown"
+    while True:
+        status = guard.cleanup_status(lease_id)
+        if status == "stopped" and guard.release_lease(lease_id,
+                                                       cleanup_waited_s=round(time.monotonic() - start, 3)):
+            log.info("launch lease %s released: its launch scope stopped", lease_id)
+            return True
+        elapsed = time.monotonic() - start
+        if elapsed >= wait:
+            break
+        time.sleep(max(0.0, min(poll, wait - elapsed)))
+    waited = round(time.monotonic() - start, 3)
+    guard.retain_lease(lease_id, cleanup_waited_s=waited)
+    rec = guard.lease(lease_id)
+    host = (rec.get("scope") or {}).get("host") if isinstance(rec.get("scope"), dict) else None
+    log.warning("launch lease %s retained after %.1f s: cleanup %s (%s). It holds its solve slot until its scope is "
+                "verified empty: python -m bbsim.licence_guard --root %s scope-check %s on host %s, then release %s "
+                "--confirm-cleanup REASON", lease_id, waited, status, describe_evidence(rec.get("cleanup_evidence")),
+                guard.root, lease_id, host, lease_id)
+    return False
+
+
+def scope_check(guard: Guard, lease_id: str) -> tuple[bool, list[str]]:
+    """The check behind ``scope-check LEASE``, run on the lease's host: empty only when no recorded process of the
+    lease (pid and start identity) is alive there and no process on the host is in a cgroup of the lease's job
+    (``job_<SLURM_JOB_ID>`` as a whole path component). It also lists this user's AEDT processes with their jobs."""
+    rec = guard.lease(lease_id)
+    obs = guard.observer
+    scope = rec.get("scope") if isinstance(rec.get("scope"), dict) else {}
+    here = obs.host()
+    job = scope.get("slurm_job_id")
+    lines = [f"lease {lease_id}: state {rec.get('state')}, cleanup {rec.get('cleanup')}, recorded on host "
+             f"{scope.get('host')!r}, slurm job {job or 'none'}; checked on {here!r}"]
+    blocking = []
+    if not scope:
+        blocking.append("the lease recorded no launch scope, so neither its host nor its job is known")
+    elif scope.get("host") != here:
+        blocking.append(f"the lease was recorded on host {scope.get('host')!r}; run scope-check there (this is "
+                        f"{here!r})")
+    else:
+        for p in rec.get("processes") or []:
+            pid, role = p.get("pid"), p.get("role")
+            try:
+                st = obs.process(pid)
+            except Exception as exc:            # noqa: BLE001
+                blocking.append(f"recorded process {pid} ({role}) cannot be read: {exc}")
+                continue
+            if st is None:
+                lines.append(f"recorded process {pid} ({role}): gone")
+            elif not p.get("start"):
+                blocking.append(f"recorded process {pid} ({role}) has no recorded start identity, and pid {pid} "
+                                f"exists ({st.get('comm')}, start {st.get('start')})")
+            elif st.get("start") != p.get("start"):
+                lines.append(f"recorded process {pid} ({role}): gone (pid {pid} is now {st.get('comm')}, start "
+                             f"{st.get('start')})")
+            elif st.get("state") in EXITED_STATES:
+                lines.append(f"recorded process {pid} ({role}): exited, not yet reaped")
+            else:
+                blocking.append(f"recorded process {pid} ({role}, {st.get('comm')}) is alive, start {st.get('start')}")
+        if not job:
+            blocking.append("the lease recorded no numeric SLURM_JOB_ID, so its job's cgroups cannot be checked")
+        else:
+            found = obs.job_processes(job)
+            if not found.get("complete"):
+                blocking.append(f"the processes in cgroups of job_{job} cannot be listed: {found.get('reason')}")
+            for p in found.get("processes") or []:
+                if p.get("state") in EXITED_STATES:
+                    lines.append(f"process {p['pid']} ({p.get('comm')}) in {p.get('cgroup')}: exited, not yet reaped")
+                else:
+                    blocking.append(f"process {p['pid']} ({p.get('comm')}) is in {p.get('cgroup')}, a cgroup of "
+                                    f"job_{job}")
+    for p in obs.aedt_processes():
+        lines.append(f"aedt process {p['pid']} ({p['comm']}) slurm job {p['job'] or 'none'}: {p.get('command')}")
+    lines += [f"NOT EMPTY: {b}" for b in blocking]
+    lines.append("SCOPE NOT EMPTY" if blocking else "SCOPE EMPTY")
+    return not blocking, lines
+
+
+def format_job_leases(root: Path, job_id: str, leases: Sequence[dict]) -> str:
+    lines = [f"guard {root}", f"leases of job {job_id}:"]
+    held, waits = 0, []
+    for rec in leases:
+        if "unreadable" in rec:
+            lines.append(f"  PROBLEM lease record {rec['id']} is unreadable ({rec['unreadable']})")
+            held += 1
+            continue
+        scope = rec.get("scope") if isinstance(rec.get("scope"), dict) else {}
+        array = (f" (array {scope['slurm_array_job_id']}_{scope.get('slurm_array_task_id')})"
+                 if scope.get("slurm_array_job_id") else "")
+        wait = rec.get("cleanup_waited_s")
+        if isinstance(wait, (int, float)) and not isinstance(wait, bool):
+            waits.append(wait)
+        if rec.get("state") != LEASE_RELEASED:
+            held += 1
+        lines.append(f"  lease {rec['id']} job {scope.get('slurm_job_id') or 'none'}{array} host "
+                     f"{scope.get('host') or 'none'} reservation {rec.get('reservation_id')}: state "
+                     f"{rec.get('state')}, cleanup {rec.get('cleanup')}, cleanup_waited_s "
+                     f"{wait if wait is not None else 'none'}, outcome {rec.get('outcome') or 'none'}")
+    largest = max(waits) if waits else "none"
+    lines.append(f"job {job_id}: {len(leases)} lease(s), {held} held, largest cleanup_waited_s {largest}")
+    if held:
+        lines.append("a held lease keeps its solve slot until its scope is verified empty: scope-check LEASE on its "
+                     "host, then release LEASE --confirm-cleanup REASON")
+    return "\n".join(lines)
+
 
 # --- the two-node lock test -----------------------------------------------------------------------------------
 
@@ -1709,8 +2628,12 @@ def _parser() -> argparse.ArgumentParser:
                    help=f"the shared guard directory (default {DEFAULT_ROOT}); an inherited {GUARD_ENV} naming "
                         "another directory refuses")
     sub = p.add_subparsers(dest="command", required=True)
-    status = sub.add_parser("status", help="the reconciled usage (takes the lock)")
-    status.add_argument("--lock-info", action="store_true", help="the lock's identity and owner, without the lock")
+    status = sub.add_parser("status", help="the reconciled usage (takes the lock); --lock-info and --job take none")
+    which = status.add_mutually_exclusive_group()
+    which.add_argument("--lock-info", action="store_true", help="the lock's identity and owner, without the lock")
+    which.add_argument("--job", metavar="JOBID",
+                       help="the launch leases of a Slurm job, or of an array by its parent id: state, "
+                            "cleanup_waited_s and outcome of each")
     submit = sub.add_parser("submit", help="submit one script of the bridge clone ../bbridge by path: submit "
                                            "--kind K --slots N --cap N -- <sbatch options> <script> [script args]")
     submit.add_argument("--kind", choices=KINDS, required=True)
@@ -1723,6 +2646,17 @@ def _parser() -> argparse.ArgumentParser:
     reconcile = sub.add_parser("reconcile", help="reconcile and print; or resolve one reservation")
     reconcile.add_argument("--resolve", metavar="RESERVATION=released|job:ID")
     reconcile.add_argument("--reason")
+    release = sub.add_parser("release", help="the operator's logged release of a launch lease whose cleanup was "
+                                             "verified (scope-check on its host first)")
+    release.add_argument("lease")
+    release.add_argument("--confirm-cleanup", required=True, metavar="REASON",
+                         help="what verified the cleanup; logged with who ran it and what the guard saw")
+    scope = sub.add_parser("scope-check", help="on the lease's host: SCOPE EMPTY only when none of its recorded "
+                                               "processes is alive and no process is in a cgroup of its job")
+    scope.add_argument("lease")
+    job_check = sub.add_parser("check-job", help="a job's check, before AEDT, that it runs under the shared guard "
+                                                 "and its own reservation (exit 2 refused)")
+    job_check.add_argument("--kind", choices=("single", "reexport", "array"), required=True)
     recover = sub.add_parser("recover-lock", help="the operator's recovery of a crashed owner's lock")
     recover.add_argument("--expected-lock", required=True, metavar="TOKEN")
     recover.add_argument("--confirm-quiescent", required=True, metavar="REASON")
@@ -1735,12 +2669,12 @@ def _parser() -> argparse.ArgumentParser:
     worker.add_argument("--hold-s", type=float, default=0.01)
     worker.add_argument("--pause-s", type=float, default=0.05)
     worker.add_argument("--lock-timeout-s", type=float, default=120.0)
-    check = sub.add_parser("lock-test-check", help="judge a lock test's artifacts")
-    check.add_argument("--test-dir", type=Path, required=True)
-    check.add_argument("--hosts", type=int, default=2)
-    check.add_argument("--iterations", type=int, default=200)
-    check.add_argument("--min-switches", type=int, default=LOCK_TEST_MIN_SWITCHES,
-                       help="hand-overs of the lock between hosts a PASS needs (default %(default)s)")
+    lock_check = sub.add_parser("lock-test-check", help="judge a lock test's artifacts")
+    lock_check.add_argument("--test-dir", type=Path, required=True)
+    lock_check.add_argument("--hosts", type=int, default=2)
+    lock_check.add_argument("--iterations", type=int, default=200)
+    lock_check.add_argument("--min-switches", type=int, default=LOCK_TEST_MIN_SWITCHES,
+                            help="hand-overs of the lock between hosts a PASS needs (default %(default)s)")
     return p
 
 
@@ -1768,7 +2702,7 @@ def _cmd_submit(args: argparse.Namespace, guard: Guard, sbatch_args: list[str]) 
     return 0
 
 
-def main(argv: list[str] | None = None, *, scheduler: Scheduler | None = None) -> int:
+def main(argv: list[str] | None = None, *, scheduler: Scheduler | None = None, observer: Any = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     sbatch_args = None
     if "--" in argv:
@@ -1787,6 +2721,13 @@ def main(argv: list[str] | None = None, *, scheduler: Scheduler | None = None) -
                                         min_switches=args.min_switches)
             print("\n".join(lines))
             return 0 if ok else 1
+        if args.command == "check-job":
+            # The job's own variables against the shared guard, never defaulted: checked before the root below.
+            found = check_job_guard(kinds=(args.kind,), root=args.root)
+            bound = f", bound to job {found['job_id']}" if found["job_id"] else ""
+            print(f"GUARD: OK {found['root']} reservation {found['reservation']} ({found['kind']}, "
+                  f"{found['state']}{bound}); this job {found['slurm_job_id'] or 'none'}")
+            return 0
         root = args.root if args.root is not None else DEFAULT_ROOT
         _check_inherited_root(root)
         if args.command == "lock-test-worker":
@@ -1794,12 +2735,15 @@ def main(argv: list[str] | None = None, *, scheduler: Scheduler | None = None) -
                                         iterations=args.iterations, hosts=args.hosts,
                                         barrier_timeout_s=args.barrier_timeout_s, hold_s=args.hold_s,
                                         pause_s=args.pause_s, lock_timeout_s=args.lock_timeout_s)
-        guard = Guard(root, scheduler if scheduler is not None else SlurmScheduler())
+        guard = Guard(root, scheduler if scheduler is not None else SlurmScheduler(), observer=observer)
         if args.command == "status":
             if args.lock_info:
                 info = guard.lock_info()
                 print(json.dumps(info, indent=2, sort_keys=True, default=str))
                 print(f"LOCK HELD {info['token']}" if info["held"] else "LOCK FREE")
+                return 0
+            if args.job is not None:
+                print(format_job_leases(guard.root, args.job, guard.leases_of_job(args.job)))
                 return 0
             print(format_usage(guard.root, guard.usage()))
             return 0
@@ -1823,6 +2767,15 @@ def main(argv: list[str] | None = None, *, scheduler: Scheduler | None = None) -
                 raise GuardRefused("--reason goes with --resolve")
             print(format_usage(guard.root, guard.usage()))
             return 0
+        if args.command == "release":
+            guard.release_lease(args.lease, confirm_cleanup=args.confirm_cleanup)
+            print(f"RELEASED {args.lease} ({guard.lease(args.lease).get('outcome')}); the reason, who ran it and what "
+                  f"the guard saw are in {guard.root / 'events.log'}")
+            return 0
+        if args.command == "scope-check":
+            ok, lines = scope_check(guard, args.lease)
+            print("\n".join(lines))
+            return 0 if ok else 1
         if args.command == "recover-lock":
             guard.recover_lock(args.expected_lock, confirm_quiescent=args.confirm_quiescent)
             print(f"LOCK RECOVERED {args.expected_lock}; the stale lock is kept under {guard.root / 'lock-evidence'}; "

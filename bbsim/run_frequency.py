@@ -27,7 +27,7 @@ from typing import Any
 
 import numpy as np
 
-from bbsim import dataset_v2
+from bbsim import dataset_v2, licence_guard
 from bbsim.config import RunConfig, build_config, config_to_dict, load_config
 from bbsim.dataset_record import REEXPORT_TOOL, build_dataset_record, build_dataset_record_v2, modes_record_v2
 from bbsim.dataset_v2 import DatasetV2Error
@@ -944,6 +944,19 @@ def run_from_solved(source: SourceJob, dirs: JobDirs, job_id: str, reference: di
         return extract_and_write(cfg, dirs, job_id, hfss, solved, t_start, reference, reexport)
 
 
+def check_guard_before_job() -> dict:
+    """The licence guard this run starts AEDT under (OR-045, HF-057), checked before any job directory exists:
+    ``BBSIM_LICENCE_GUARD`` naming the shared guard and, when set, ``BBSIM_GUARD_RESERVATION`` naming this job's own
+    reservation (``licence_guard.check_job_guard``). Raises ``licence_guard.GuardError``; the session checks again
+    when it takes its launch lease."""
+    return licence_guard.check_job_guard()
+
+
+def _guard_log_line(found: Mapping[str, Any]) -> str:
+    reservation = found.get("reservation") or "none (the session takes a direct one-slot reservation)"
+    return f"licence guard {found.get('root')}, reservation {reservation}"
+
+
 _FROM_SOLVED_EXCLUDES = (("--config", "config"), ("--frequency-ghz", "frequency_ghz"), ("--cores", "cores"),
                          ("--output-root", "output_root"), ("--project", "project"), ("--polarizations", "polarizations"),
                          ("--aedt-version", "aedt_version"))
@@ -965,13 +978,15 @@ def _main_from_solved(args: argparse.Namespace) -> int:
         if args.column_order_reference is not None:
             reference = load_reference(args.column_order_reference)
         check_before_copy(source, reference)
+        guard = check_guard_before_job()
         dirs = reexport_job_dirs(source, args.job_id)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, licence_guard.GuardError) as exc:
         print(f"refused before the job started: {exc}", file=sys.stderr)
         return 2
     _setup_logging(dirs.logs / "run.log", args.log_level)
     write_json(dirs.root / "effective_config.json", config_to_dict(source.config))
     log.info("job %s -> %s: schema-2 re-export of %s, no solve", args.job_id, dirs.root, source.job_dir)
+    log.info(_guard_log_line(guard))
     if reference is not None:
         log.info("column-order reference from %s (%s, %s)", args.column_order_reference, reference.get("source_job"),
                  reference.get("aedt_version"))
@@ -1004,7 +1019,8 @@ def main(argv: list[str] | None = None) -> int:
                                  f"{cfg.output.schema}")
             reference = load_reference(args.column_order_reference)
         check_before_aedt(cfg, reference)
-    except (OSError, ValueError) as exc:
+        guard = check_guard_before_job()
+    except (OSError, ValueError, licence_guard.GuardError) as exc:
         print(f"refused before the job started: {exc}", file=sys.stderr)
         return 2
     job_id = args.job_id or default_job_id()
@@ -1012,6 +1028,7 @@ def main(argv: list[str] | None = None) -> int:
     _setup_logging(dirs.logs / "run.log", args.log_level)
     write_json(dirs.root / "effective_config.json", config_to_dict(cfg))
     log.info("job %s -> %s (schema %d)", job_id, dirs.root, cfg.output.schema)
+    log.info(_guard_log_line(guard))
     if reference is not None:
         log.info("column-order reference from %s (%s, %s)", args.column_order_reference, reference.get("source_job"),
                  reference.get("aedt_version"))
