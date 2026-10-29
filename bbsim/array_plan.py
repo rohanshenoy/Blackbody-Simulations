@@ -64,6 +64,13 @@ captured from that copy, with ``config.build_config`` and exactly five overrides
   task's ``effective_l_resolution_mm``. That field is never null: it is the grid entry's requested step when the
   entry gives one (``l_resolution_mm``), else the config's own, after the c/(4f) rule (``frequency_grid``).
 
+After writing the plan the CLI prints its submission block (``submission_block``; spec section 4.3 replaced, OR-044,
+OR-045): from the frozen code ``<RUN>/code``, one ``python -m bbsim.array_submit submit`` line per class, the licence
+monitor when the plan runs one, and the assembly after every array; then the rerun and throttle lines. Every job goes
+through the guard from the recorded bridge blob, and nothing in the block calls sbatch or scontrol. ``--submit`` does
+the same at once (``array_submit.submit_plan``); ``plan_hfss_array.py --log-submission RUN KIND ID`` records a job
+submitted by hand, with no admission (``array_submit.log_submission``).
+
 The planner, the runner, the array_run self-check (``bbsim.run_acceptance``) and the assembler all build a task's
 config here, and the planner and the self-check predict its lattice with ``predict_exit_lattice``, so none can
 disagree on either. A caller that hashes the config copy passes the mapping it parsed from those bytes as
@@ -79,6 +86,7 @@ import logging
 import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1168,11 +1176,48 @@ def build_plan(options: PlanOptions, *, env: EnvironmentState, guard: Any, now: 
     return _create(_draft(options, env, guard, now, Path(repo)))
 
 
+# --- the submission block --------------------------------------------------------------------------------------------
+
+def submission_block(plan_path: Path, plan_sha256: str, plan: Mapping[str, Any]) -> str:
+    """The block the planner prints (spec section 4.3 replaced; OR-044, OR-045): from the frozen code, every job
+    through ``python -m bbsim.array_submit``, which captures the recorded bridge blob and repeats admission and the
+    cores rule at the moment each line runs; the reruns and live throttle changes through the guard. One subshell, so a
+    STOP leaves the operator's shell open."""
+    q = shlex.quote
+    code, plan_arg = q(str(plan["code"]["repo"])), q(str(plan_path))
+    submit = f"python -m bbsim.array_submit submit {plan_arg} {plan_sha256}"
+    names = [entry["name"] for entry in plan["classes"]]
+    monitor = plan["slurm"]["monitor"]["enabled"] is True
+    lines = ["# Submit through the licence guard (OR-045) from the frozen code, in a shell that has sourced bb_env.sh;",
+             "# each line repeats admission when it runs, so a delayed paste is checked again.",
+             f"cd {code} && ("]
+    for name in names:
+        lines.append(f'{name}=$({submit} array --class {name}) || {{ echo "STOP: class {name} was not submitted; '
+                     'the arrays submitted before it keep running"; exit 1; }')
+    if monitor:
+        lines.append(f'M=$({submit} monitor) || echo "the licence monitor was not submitted; the arrays keep running"')
+    dependency = "afterany:" + ":".join(f"${name}" for name in names)
+    lines.append(f'R=$({submit} assembly --dependency "{dependency}") || {{ echo "STOP: the assembly was not '
+                 'submitted; the arrays keep running: run its line again"; exit 1; }')
+    jobs = " ".join(f"{name}=${name}" for name in names) + (" monitor=$M" if monitor else "") + " assembly=$R"
+    lines += [f'echo "submitted: {jobs}"', ")",
+              "# Rerun failed indices of one class (the assembly report prints these lines): scancel the pending",
+              "# assembly that submissions.log names, then submit the rerun and a new assembly after it:",
+              f"#   cd {code} && python -m bbsim.array_submit rerun {plan_arg} {plan_sha256} --indices I,J "
+              "[--mem MEM] [--time TIME] [--qos QOS]",
+              f"#   cd {code} && {submit} assembly --dependency afterany:RERUN_ID",
+              "# Live throttle changes go through the guard, never through scontrol:",
+              f"#   python -m bbsim.licence_guard throttle ARRAY_ID THROTTLE --cap {plan['licence_cap']}"]
+    return "\n".join(lines)
+
+
 # --- the CLI ----------------------------------------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="plan_hfss_array.py", allow_abbrev=False,
-                                description="Freeze a job-array run plan (HF-057): no AEDT, nothing submitted.")
+                                description="Freeze a job-array run plan (HF-057), with no AEDT, and print its "
+                                            "guarded submission block (OR-045). plan_hfss_array.py --log-submission "
+                                            "RUN KIND ID records a job submitted by hand, with no admission.")
     p.add_argument("--config", type=Path, required=True,
                    help="the job array's config, with no frequency and [acceptance] kind = \"array_run\" "
                         "(configs/crack1_grid.toml; crack1_grid_single_angle.toml with --probe)")
@@ -1249,7 +1294,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--assembly-qos", help="the assembly job's QOS (default the cluster's)")
     p.add_argument("--probe", action="store_true",
                    help="the schema-1 single-angle diagnostic (HF-057, HF-058): no tree, never assembled")
-    p.add_argument("--submit", action="store_true", help="submit the plan's jobs through the guard")
+    p.add_argument("--submit", action="store_true",
+                   help="after writing the plan, submit its jobs through the guard as the printed block does")
     return p
 
 
@@ -1290,18 +1336,20 @@ def _summary(path: Path) -> str:
 
 def main(argv: list[str] | None = None, *, env: EnvironmentState | None = None, guard: Any = None,
          repo: Path = REPO_ROOT, now: datetime | None = None) -> int:
-    """The CLI: 0 with the plan written, 2 refused with nothing left, 1 when a failed plan's cleanup left something.
-    ``env``, ``guard``, ``repo`` and ``now`` replace the checkout's state, the shared guard, this checkout and the
-    clock (tests)."""
+    """The CLI: 0 with the plan written, 2 refused with nothing left, 1 when a failed plan's cleanup left something
+    or a ``--submit`` submission failed (the plan stays). ``--log-submission RUN KIND ID`` first records a
+    hand-submitted job (``array_submit.log_submission_main``). ``env``, ``guard``, ``repo`` and ``now`` replace the
+    checkout's state, the shared guard, this checkout and the clock (tests)."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["--log-submission"]:
+        from bbsim import array_submit
+
+        return array_submit.log_submission_main(argv[1:])
     try:
         args = build_parser().parse_args(argv)
     except SystemExit as exc:                    # argparse has printed its message
         return 2 if exc.code else 0
     options = options_from_args(args)
-    if options.submit:
-        print("plan_hfss_array: refused: --submit: submitting a plan's jobs through the guard is not part of this "
-              "version; plan without --submit", file=sys.stderr)
-        return 2
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(logging.Formatter("%(message)s"))
     level = log.level
@@ -1327,4 +1375,10 @@ def main(argv: list[str] | None = None, *, env: EnvironmentState | None = None, 
         log.removeHandler(handler)
         log.setLevel(level)
     print(_summary(path))
-    return 0
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    print(submission_block(path, digest, json.loads(path.read_text())))
+    if not options.submit:
+        return 0
+    from bbsim import array_submit
+
+    return array_submit.submit_plan(path, digest, guard=shared, env=env)

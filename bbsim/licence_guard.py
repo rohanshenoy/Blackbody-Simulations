@@ -73,8 +73,9 @@ the submission protocol. User sbatch arguments (``check_user_sbatch_args``) are 
 ``ALLOWED_USER_OPTIONS`` only, as ``--opt=value`` or ``--opt value``, passed on byte for byte; abbreviations (sbatch's
 getopt_long would take ``--pars`` as ``--parsable``), short options, unknown options, ``--`` and ``:`` are refused, and
 so is every option in ``OWNED_SBATCH_OPTIONS``. Internal callers add only the complete names of
-``INTERNAL_VALUE_OPTIONS`` (array, job name, comment, dependency, output, error, working directory) as
-``--name=value``, never the protocol (``--export*``, ``--parsable``, ``--quiet``, ``--wait``, ``--wrap``, ...); in stdin
+``INTERNAL_VALUE_OPTIONS`` (array, job name, comment, dependency and kill-on-invalid-dep, output, error, working
+directory) as ``--name=value``, never the protocol (``--export*``, ``--parsable``, ``--quiet``, ``--wait``, ``--wrap``,
+...); in stdin
 mode no script pathname is allowed, and the script's own ``#SBATCH`` header may not set the protocol, the array or the
 working directory, cluster short options or separate heterogeneous-job components either. sbatch's environment is the caller's without ``SBATCH_*`` and the scheduler-option aliases
 (``SCHEDULER_ENV_ALIASES``), plus the caller's validated context and, set by the guard alone, ``GUARD_ENV`` (the
@@ -162,8 +163,11 @@ OWNED_SBATCH_OPTIONS = frozenset({
     "--get-user-env",
 })
 # Internal callers (the job array's submission helper) may add these complete names to the user allowlist, each as
-# --name=value; nothing else, and no abbreviation (sbatch's getopt_long would take --ar=0-7 as --array=0-7).
-INTERNAL_VALUE_OPTIONS = ("--array", "--job-name", "--comment", "--dependency", "--output", "--error", "--chdir")
+# --name=value; nothing else, and no abbreviation (sbatch's getopt_long would take --ar=0-7 as --array=0-7). The
+# dependent assembly sets --kill-on-invalid-dep=yes beside its --dependency, so a dependency Slurm cannot satisfy
+# ends it instead of leaving it pending; a user --sbatch-arg cannot.
+INTERNAL_VALUE_OPTIONS = ("--array", "--job-name", "--comment", "--dependency", "--kill-on-invalid-dep", "--output",
+                          "--error", "--chdir")
 ALLOWED_INTERNAL_OPTIONS = frozenset(INTERNAL_VALUE_OPTIONS) | ALLOWED_USER_OPTIONS
 # The protocol the guard sets itself, named in the refusal of an internal option.
 _PROTOCOL_NAMES = ("export", "export-file", "parsable", "quiet", "wait", "wrap", "test-only", "clusters",
