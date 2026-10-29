@@ -19,8 +19,9 @@ the sha256 ``HEX`` the caller recorded, never a digest the job asserts. The plan
 Every file is read once through one ``acceptance_gate.InputCapture``, which hashes the very bytes each reader parses:
 the plan, its config copy and column-order reference copy, the sidecar, the manifest and its copies, the CSVs and the
 convergence tables. Every value is recomputed with the producer's own functions (``dataset_v2``, ``sampling``,
-``convergence``, ``extract.fit_axis``, ``field_pairing.schema1_grid``), never a second formula. The task's config is
-``array_plan.task_config`` of the captured config bytes. A is the entrance area and I = Ei^2 / (2 c mu0).
+``convergence``, ``array_plan.predict_exit_lattice``, ``field_pairing.schema1_grid``), never a second formula. The
+task's config is ``array_plan.task_config`` of the captured config bytes. A is the entrance area and
+I = Ei^2 / (2 c mu0).
 
 Rows, in order (every row is always present, at severity fail; a row whose input another row found unusable fails
 naming it):
@@ -72,9 +73,9 @@ naming it):
 14. exit_grid (HF-045, OR-037, OR-048): the manifest's step along l is the task's ``effective_l_resolution_mm`` (the
     requested ``l_resolution_mm`` when given, else the frozen config's), at most ``frequency_grid.max_l_step_mm`` at
     every frequency, as are the plan's and the declared fitted step; the plan's predicted lattice is the HF-045 lattice
-    of the frozen rectangle (``extract.fit_axis``); the sidecar's declared lattice (``dataset_v2.declared_grid``, or
-    ``field_pairing.schema1_grid`` for schema 1) and the manifest's ``step_mm`` equal it (bounds and steps to
-    ``NODE_TOL`` of the step, counts exactly); every key's exit points lie on it, each node once
+    of the frozen rectangle (``array_plan.predict_exit_lattice``, the planner's own); the sidecar's declared lattice
+    (``dataset_v2.declared_grid``, or ``field_pairing.schema1_grid`` for schema 1) and the manifest's ``step_mm`` equal
+    it (bounds and steps to ``NODE_TOL`` of the step, counts exactly); every key's exit points lie on it, each node once
     (``dataset_v2.node_weights``). At 1010 GHz on crack1 that is 10 mm / 135 = 0.074074 mm and 136 x 51, never the
     requested 0.0742 mm as a step.
 15. binding.inputs (CDX-038): every file read once and unchanged at the end, every evidence file
@@ -119,9 +120,8 @@ from bbsim.acceptance_rows import strict_records as _by_key
 from bbsim.compare import Check
 from bbsim.config import RunConfig, build_config, config_to_dict
 from bbsim.convergence import CRITERION, qualify
-from bbsim.dataset_record import exit_axes
 from bbsim.dataset_v2 import DatasetV2Error, key_text
-from bbsim.extract import PLANE_TOL_M, ExitGrid, fit_axis
+from bbsim.extract import PLANE_TOL_M, ExitGrid
 from bbsim.manifest import write_json
 from bbsim.naming import dataset_dir_name, dataset_record_name, frequency_label
 from bbsim.sampling import incident_angle_values, incoming_power_w
@@ -143,10 +143,10 @@ INTERCEPT_REL = 1e-12      # InterceptFactor, c_k and cell_90 against their reco
 DARK_REL = dataset_v2.DARK_REL
 FF_OVER_FLUX_REL = 1e-9    # ff_over_flux against the hemisphere power over the stored flux
 RHO_ABS = 1e-9             # rho against the manifest's rho_per_key
-AREA_REL = 1e-6            # the entrance face against the frozen rectangle (geometry.check_face_area's tolerance)
+AREA_REL = array_plan.AREA_REL  # the entrance face against the frozen rectangle (geometry.check_face_area's)
 NODE_TOL = dataset_v2.NODE_TOL
 KEY_DEG = dataset_v2.KEY_TOL_DEG
-LATTICE_SOURCE = "config.geometry.expected_box_size_mm"
+LATTICE_SOURCE = array_plan.LATTICE_SOURCE
 
 _WG = {name: i for i, name in enumerate(schema.WAVEGUIDE_COLUMNS_V2)}   # positions 0-14 are the same in 1.0
 _FF = {name: i for i, name in enumerate(schema.FAR_FIELD_COLUMNS)}
@@ -264,17 +264,11 @@ def _read_table(stream: Any, columns: Sequence[str], at: str) -> tuple[np.ndarra
 # --- the frozen rectangle and A I ---------------------------------------------------------------------------------------
 
 def _canonical_extent(cfg: RunConfig) -> tuple[float, float, float]:
-    """The frozen box's extents along the exit axes (p, l, g), in mm: ``geometry.expected_box_size_mm`` projected on
-    ``exit_cs_x``, ``exit_cs_y`` and their cross product (``dataset_record.exit_axes``)."""
-    box = cfg.geometry.expected_box_size_mm
-    if box is None:
-        raise _Refused("the frozen config gives no geometry.expected_box_size_mm, so the plan's canonical rectangle "
-                       "(its lattice and its entrance area A) cannot be derived")
-    sizes = np.asarray(box, dtype=float)
-    p, l, g = (float(np.sum(np.abs(row) * sizes)) for row in exit_axes(cfg.geometry.exit_cs_x, cfg.geometry.exit_cs_y))
-    if not all(math.isfinite(v) and v > 0.0 for v in (l, g)):
-        raise _Refused(f"the frozen box {list(box)} mm has no positive extent along l and g ({l!r}, {g!r} mm)")
-    return p, l, g
+    """The frozen box's extents along the exit axes (p, l, g), in mm: ``array_plan.canonical_extent``, the planner's."""
+    try:
+        return array_plan.canonical_extent(cfg)
+    except array_plan.LatticeError as exc:
+        raise _Refused(str(exc)) from None
 
 
 @dataclass(frozen=True)
@@ -364,16 +358,13 @@ def expected_incoming_power(cfg: RunConfig, task: Mapping, manifest: Mapping, si
     return incoming_power_w(cfg.excitation.ei_v_per_m, faces["entrance_face"])
 
 
-def _nominal_lattice(cfg: RunConfig) -> ExitGrid:
-    """The HF-045 lattice of the frozen rectangle at the config's resolution: bounds centred on the exit face, each
-    face axis's step fitted by ``extract.fit_axis``, the runner's rule."""
-    _, l, g = _canonical_extent(cfg)
-    lo, hi = (0.0, -l / 2.0, -g / 2.0), (0.0, l / 2.0, g / 2.0)
-    resolution = tuple(float(v) for v in cfg.exit_field.resolution_mm)
-    steps, fitted = list(resolution), [False, False, False]
-    for axis in (1, 2):
-        steps[axis], fitted[axis] = fit_axis(lo[axis], hi[axis], resolution[axis])
-    return ExitGrid(lo, hi, resolution, tuple(steps), tuple(fitted))
+def _nominal_lattice(cfg: RunConfig) -> dict:
+    """The HF-045 lattice of the frozen rectangle at the task config's step along l, bounds centred on the exit face:
+    ``array_plan.predict_exit_lattice``, the planner's own prediction, so the two never disagree on it."""
+    try:
+        return array_plan.predict_exit_lattice(cfg, cfg.exit_field.resolution_mm[1])
+    except array_plan.LatticeError as exc:
+        raise _Refused(str(exc)) from None
 
 
 def _node_tol_mm(step: float) -> float:
@@ -1303,11 +1294,11 @@ class _Acceptance:
         if lattice.step[1] > limit:
             problems.append(f"the plan's fitted step along l {lattice.step[1]!r} mm exceeds c/(4f) = {limit:.7g} mm")
         nominal = _nominal_lattice(cfg)
-        problems += self._lattice_problems("the frozen rectangle's HF-045 lattice", nominal.lo_mm, nominal.hi_mm,
-                                           nominal.step_mm, nominal.counts, lattice, axes=(0, 1, 2))
-        if tuple(nominal.fitted) != lattice.fitted:
+        problems += self._lattice_problems("the frozen rectangle's HF-045 lattice", nominal["lo_mm"], nominal["hi_mm"],
+                                           nominal["step_mm"], nominal["counts"], lattice, axes=(0, 1, 2))
+        if tuple(nominal["fitted"]) != lattice.fitted:
             problems.append(f"the plan's lattice fitted {list(lattice.fitted)}, the HF-045 rule gives "
-                            f"{list(nominal.fitted)}")
+                            f"{list(nominal['fitted'])}")
         if self._shape() != "rectangle":
             problems.append(f"the exit cross-section is {self._shape()!r}: the plan predicts a rectangle")
         try:
