@@ -8,37 +8,52 @@ writer: 2 by default (HF-050), 1 for the 1.0 tables until the ``_v2`` trees pass
 ``--from-solved JOB_DIR`` replaces the first phase: a finished job's project and ``.aedtresults`` are copied into a
 new job beside it, the solved run design is opened, and ``extract_and_write`` writes schema 2 from the copy with no
 solve, under the source manifest's configuration (HF-050).
+
+Every run (HF-057): the code checkout's state is read once before the job starts; the session opens with PyAEDT's
+launch timeout, must have opened the job's own copy, and records AEDT's process id and port; AEDT's temp directory is
+recorded and, by ``--aedt-temp``, pointed at the job (``bbsim.aedt_temp``); ``main`` owns its log handlers and turns
+SIGTERM into ``SystemExit(143)`` so the cleanup on the way out runs.
 """
 from __future__ import annotations
 
 import argparse
 import copy
+import functools
 import json
 import logging
+import math
 import os
 import shutil
+import signal
 import sys
+import threading
 import time
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from bbsim import aedt_temp as tempdir
 from bbsim import dataset_v2, licence_guard
 from bbsim.config import RunConfig, build_config, config_to_dict, load_config
 from bbsim.dataset_record import REEXPORT_TOOL, build_dataset_record, build_dataset_record_v2, modes_record_v2
 from bbsim.dataset_v2 import DatasetV2Error
 from bbsim.geometry_spec import is_vacuum, vacuum_refusal
-from bbsim.manifest import REPO_ROOT, build_manifest, git_commit, sha256_file, write_json
+from bbsim.manifest import (REPO_ROOT, EnvironmentState, EnvironmentStateError, build_manifest, environment_state,
+                            sha256_file, write_json)
 from bbsim.naming import dataset_record_name, frequency_design_name, frequency_label, last_adaptive_solution
 from bbsim.paths import JobDirs, create_job_dirs, default_job_id
 from bbsim.sampling import incident_angle_values, incoming_power_w
 from bbsim.schema import KEY_COLUMNS
+from bbsim.session import DEFAULT_LAUNCH_TIMEOUT_S
 
 log = logging.getLogger("bbsim.run")
+
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+EXIT_SIGTERM = 143   # 128 + SIGTERM, as a shell reports a process ended by it
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -59,8 +74,31 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--column-order-reference", type=Path, default=None, metavar="JSON",
                    help="Schema 2: the exporter column-order reference (HF-041) that the crack1 500 GHz reference "
                         "job keeps as scratch/column_order_reference.json; required by every other schema-2 job")
+    p.add_argument("--aedt-temp", default="off", metavar="{off,task,env,TEMPLATE}",
+                   help="AEDT's temp directory (HF-057): off leaves it; task points it at <job>/aedt_temp and sets it "
+                        "to --aedt-temp-restore at the end; a path holding {job} (the job directory) is task mode "
+                        "there; env exports TMPDIR and TMP = <job>/aedt_temp before AEDT starts. Every run records "
+                        "what AEDT reported at session start")
+    p.add_argument("--aedt-temp-restore", default=None, metavar="PATH",
+                   help="task mode: the TempDirectory AEDT is set back to at the end (step 4's aedt_temp.previous)")
+    p.add_argument("--aedt-temp-strict", action="store_true",
+                   help="task mode: fail the run instead of warning when AEDT does not report the requested "
+                        "directory or a temp-directory call raises")
+    p.add_argument("--launch-timeout-s", type=float, default=DEFAULT_LAUNCH_TIMEOUT_S,
+                   help="seconds PyAEDT waits for AEDT to start (its settings.desktop_launch_timeout)")
     p.add_argument("--log-level", default="INFO")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if not isinstance(logging.getLevelName(args.log_level.upper()), int):
+        p.error(f"--log-level {args.log_level!r} is not a logging level")
+    if not (math.isfinite(args.launch_timeout_s) and args.launch_timeout_s > 0):
+        p.error(f"--launch-timeout-s must be a finite number of seconds above 0, got {args.launch_timeout_s!r}")
+    try:
+        mode, template = tempdir.parse_mode(args.aedt_temp)
+        args.temp_settings = tempdir.TempSettings(mode, restore=args.aedt_temp_restore, strict=args.aedt_temp_strict,
+                                                  template=template)
+    except ValueError as exc:
+        p.error(str(exc))
+    return args
 
 
 def overrides_from_args(args: argparse.Namespace) -> dict[str, object]:
@@ -89,9 +127,42 @@ def _axis_summary(values, step: float) -> dict[str, float | int]:
 
 
 
-def _setup_logging(logfile: Path, level: str) -> None:
-    logging.basicConfig(level=level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-                        handlers=[logging.FileHandler(logfile), logging.StreamHandler()])
+def _setup_logging(logfile: Path, level: str) -> Callable[[], None]:
+    """Attach this run's handlers, ``logfile`` (the job's ``logs/run.log``) and the console, to the root logger at
+    ``level``, and return the function that removes and closes them and puts the root level back (``main`` calls it on
+    the way out). ``logging.basicConfig`` does nothing once the root logger has a handler: under pytest, and in a second
+    ``main()`` of one process."""
+    root = logging.getLogger()
+    previous_level = root.level
+    handlers = [logging.FileHandler(logfile), logging.StreamHandler()]
+    for handler in handlers:
+        handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        root.addHandler(handler)
+    root.setLevel(level.upper())
+
+    def remove() -> None:
+        for handler in handlers:
+            root.removeHandler(handler)
+            handler.close()
+        root.setLevel(previous_level)
+
+    return remove
+
+
+def _exit_on_sigterm(signum: int, frame: Any) -> None:
+    raise SystemExit(EXIT_SIGTERM)
+
+
+def _handle_sigterm() -> Callable[[], None]:
+    """For the length of ``main``, SIGTERM (Slurm's time limit, scancel) raises ``SystemExit(143)``, so the blocks on
+    the way out run when Python regains control: the temp-directory restore, the session's release and launch-lease
+    wait, the log handlers' removal. Best effort: a handler runs only between bytecodes, so during a blocking AEDT call
+    it waits, and Slurm's SIGKILL follows after KillWait. Returns the function that puts the previous handler back;
+    outside the main thread, where Python allows no handler, nothing changes."""
+    if threading.current_thread() is not threading.main_thread():
+        return lambda: None
+    previous = signal.signal(signal.SIGTERM, _exit_on_sigterm)
+    return lambda: signal.signal(signal.SIGTERM, signal.SIG_DFL if previous is None else previous)
 
 
 @contextmanager
@@ -155,6 +226,56 @@ class SolvedContext:
     record: Path | None
     run_design: str
     versions: dict
+
+
+@dataclass(frozen=True)
+class OpenSession:
+    """A run's open AEDT session: the app, the manifest's ``aedt`` {pid, port} and ``aedt_temp`` records, and
+    ``before_write``, which restores AEDT's temp directory once the run's last AEDT call is made, so the manifest
+    records the outcome (HF-057)."""
+
+    hfss: Any
+    aedt: dict
+    aedt_temp: dict
+    before_write: Callable[[], None]
+
+
+def _positive_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def check_open_project(hfss: Any, job_project: Path) -> dict[str, int | None]:
+    """After the session opens, the open project must be the job's own copy (``os.path.samefile``: ``/home`` resolves
+    to ``/resnick/home`` on the cluster), or the run stops before anything is set up. Returns the ``aedt`` record:
+    AEDT's process id and gRPC port as PyAEDT reports them (``hfss.desktop_class``), each null when PyAEDT gives no
+    positive integer (HF-057)."""
+    opened = getattr(hfss, "project_file", None)
+    try:
+        same = bool(opened) and os.path.samefile(opened, job_project)
+    except OSError:
+        same = False
+    if not same:
+        raise RuntimeError(f"AEDT opened {opened!r}, not the job's own copy {job_project}; nothing was set up")
+    desktop = getattr(hfss, "desktop_class", None)
+    pid, port = getattr(desktop, "aedt_process_id", None), getattr(desktop, "port", None)
+    log.info("AEDT process %r, gRPC port %r, open project %s", pid, port, opened)
+    return {"pid": _positive_int(pid), "port": _positive_int(port)}
+
+
+@contextmanager
+def open_session(job_project: Path, design: str, version: str, dirs: JobDirs, temp: tempdir.TempSettings,
+                 launch_timeout_s: float) -> Iterator[OpenSession]:
+    """The run's one AEDT session (HF-057): in env mode TMPDIR and TMP are exported first; the session starts with
+    the launch timeout; the open project is checked to be the job's copy; AEDT's temp directory is recorded and, in
+    task mode, pointed at the job and restored on the way out, however the block ends."""
+    from bbsim.session import aedt_session
+
+    with tempdir.exported_env(temp, dirs.root):
+        with aedt_session(job_project, design, version, launch_timeout_s=launch_timeout_s) as hfss:
+            aedt = check_open_project(hfss, job_project)
+            with tempdir.around_session(hfss, temp, dirs.root) as record:
+                yield OpenSession(hfss=hfss, aedt=aedt, aedt_temp=record,
+                                  before_write=functools.partial(tempdir.restore, hfss, temp, record))
 
 
 def is_reference_job(cfg: RunConfig) -> bool:
@@ -240,22 +361,31 @@ def stage_project(cfg: RunConfig, dirs: JobDirs) -> StagedProject:
                          job_sha=sha256_file(job_project), recorded_id=recorded_id, record=record)
 
 
-def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str, reference: dict | None = None) -> Path:
+def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str, reference: dict | None = None, *,
+            aedt_temp: tempdir.TempSettings | None = None, launch_timeout_s: float = DEFAULT_LAUNCH_TIMEOUT_S,
+            environment: EnvironmentState | None = None) -> Path:
     """One frequency: stage the project, open one AEDT session, solve, extract both polarizations, write.
 
-    ``reference`` is the column-order reference object every schema-2 job but the reference job embeds."""
-    from bbsim.session import aedt_session, aedt_versions
+    ``reference`` is the column-order reference object every schema-2 job but the reference job embeds. ``aedt_temp``
+    (default off) and ``launch_timeout_s`` set the session (HF-057); ``environment`` is the code checkout's state,
+    read here before anything is copied when the caller has not read it."""
+    from bbsim.session import aedt_versions
 
     t_start = time.perf_counter()
     check_before_aedt(cfg, reference)
+    environment = environment_state(REPO_ROOT) if environment is None else environment
+    temp = tempdir.TempSettings() if aedt_temp is None else aedt_temp
     staged = stage_project(cfg, dirs)
-    with aedt_session(staged.job_project, cfg.project.design, cfg.project.aedt_version) as hfss:
+    with open_session(staged.job_project, cfg.project.design, cfg.project.aedt_version, dirs, temp,
+                      launch_timeout_s) as session:
+        hfss = session.hfss
         if cfg.output.schema == 2:
             # A stale or unreadable version would stop the run after its licensed solve; it costs seconds here.
             _check_versions_for_reference(reference, aedt_versions(hfss))
         solved = prepare_and_solve(cfg, dirs, job_id, hfss, staged)
         try:
-            return extract_and_write(cfg, dirs, job_id, hfss, solved, t_start, reference, None)
+            return extract_and_write(cfg, dirs, job_id, hfss, solved, t_start, reference, None,
+                                     environment=environment, session=session)
         except Exception:
             # The licensed solve is saved in the job's copy (prepare_and_solve) and nothing here removes it; say so,
             # so that a failed check after it never ends in deleting the job and solving again.
@@ -469,7 +599,7 @@ def _require_shared_exit_points(waveguide0: Any, waveguide1: Any) -> None:
 
 
 def _column_order_check(cfg: RunConfig, dirs: JobDirs, solved: SolvedContext,
-                        extracted: Mapping[int, dataset_v2.Extracted], reference: Mapping | None
+                        extracted: Mapping[int, dataset_v2.Extracted], reference: Mapping | None, commit: str
                         ) -> tuple[dict, dict, dict | None]:
     """(block, reference, raw tables to keep as evidence or None). The reference job measures the reference on its
     own raw tables (HF-041); every other job validates the supplied one against its versions and exporter first."""
@@ -480,7 +610,7 @@ def _column_order_check(cfg: RunConfig, dirs: JobDirs, solved: SolvedContext,
                                  f"{float(cfg.solver.frequency_ghz):g} GHz (--column-order-reference JSON; HF-041)")
         raw = {e: extracted[e].waveguide for e in (0, 1)}
         measured = dataset_v2.build_reference(raw, cfg.project.dataset_id, cfg.solver.frequency_ghz, str(dirs.root),
-                                              git_commit(), aedt, pyaedt, REPO_ROOT)
+                                              commit, aedt, pyaedt, REPO_ROOT)
         return dataset_v2.order_check_block("reference", measured), measured, raw
     reference = dict(reference)
     dataset_v2.check_reference_compatible(reference, aedt, pyaedt, REPO_ROOT)
@@ -499,7 +629,8 @@ def _write_reference_evidence(scratch: Path, reference: Mapping, raw: Mapping[in
 
 
 def extract_and_write(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, solved: SolvedContext, t_start: float,
-                      reference: dict | None = None, reexport: dict | None = None) -> Path:
+                      reference: dict | None = None, reexport: dict | None = None, *,
+                      environment: EnvironmentState | None = None, session: OpenSession | None = None) -> Path:
     """Extract every polarization into memory, check, then write the CSVs, the manifest and the sidecar.
 
     Order (HF-052): both polarizations are extracted and checked for finite values; under
@@ -507,7 +638,9 @@ def extract_and_write(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sol
     tables and sidecar blocks are built (``dataset_v2.build``); then the pairing and lattice checks. Only then is
     anything written, so a failure leaves no CSV, manifest or sidecar. Schema 1 writes the 1.0 tables and sidecar
     exactly as before. ``reexport`` (schema 2 only) is the --from-solved provenance for the sidecar; ``t_start`` is
-    the job's start on ``time.perf_counter``. Returns the manifest path.
+    the job's start on ``time.perf_counter``. ``environment`` is the code checkout's state (read here when not
+    given); ``session``'s records go into the manifest, and its ``before_write`` runs after the last AEDT call
+    (HF-057). Returns the manifest path.
     """
     from bbsim.convergence import qualify
     from bbsim.extract import RIM_BAND_REL, evaluate_exit_powers, extract_far_field, extract_waveguide
@@ -520,6 +653,7 @@ def extract_and_write(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sol
     check_before_aedt(cfg, reference)   # pure; repeated here for callers that did not come through run_job
     if schema == 2:
         _require_v2_exit_face(cfg, solved)   # every path in, a --from-solved context included
+    environment = environment_state(REPO_ROOT) if environment is None else environment
     ctx = solved.ctx
     freq = cfg.solver.frequency_ghz
     dataset_id = cfg.project.dataset_id
@@ -544,6 +678,8 @@ def extract_and_write(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sol
                                                              dirs.logs / f"convergence_Ephi{ephi}.txt")
             log.info("extracted Ephi=%s (%d waveguide rows, %d far-field rows)", ephi, len(waveguide), len(far_field))
         hfss.save_project()
+    if session is not None:
+        session.before_write()          # the run's AEDT calls are done: AEDT's temp directory goes back now (HF-057)
 
     # CDX-025: whether each polarization met the configured target. Recorded, not yet a gate (OR-027): the
     # job array's assembly will refuse unqualified datasets.
@@ -558,7 +694,8 @@ def extract_and_write(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sol
     result = None
     evidence = None
     if schema == 2:
-        order_check, reference, evidence = _column_order_check(cfg, dirs, solved, extracted, reference)
+        order_check, reference, evidence = _column_order_check(cfg, dirs, solved, extracted, reference,
+                                                               environment.commit)
         modes = modes_record_v2(solved.face_geometry.cross_section)
         if modes is None:
             raise DatasetV2Error(f"schema 2 has no modes for a {solved.face_geometry.cross_section['shape']!r} "
@@ -641,6 +778,7 @@ def extract_and_write(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sol
         extra["transmittance_checks"] = {"flux_over_abs_re_s": result.flux_over_abs_re_s,
                                          "rho_per_key": result.rho_per_key}
     manifest = build_manifest(
+        environment=environment,
         config=config_to_dict(cfg),
         job={"id": job_id, "root": str(dirs.root), "wall_time_s": time.perf_counter() - t_start,
              "solve_time_s": solved.solve_s},
@@ -673,6 +811,8 @@ def extract_and_write(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sol
         exit_field=exit_field,
         outputs=outputs,
         versions=solved.versions,
+        aedt=session.aedt if session is not None else None,
+        aedt_temp=session.aedt_temp if session is not None else None,
         **extra,
     )
     manifest_path = dirs.root / "manifest.json"
@@ -926,22 +1066,29 @@ def prepare_from_solved(source: SourceJob, dirs: JobDirs, job_id: str, hfss: Any
     )
 
 
-def run_from_solved(source: SourceJob, dirs: JobDirs, job_id: str, reference: dict | None = None) -> Path:
+def run_from_solved(source: SourceJob, dirs: JobDirs, job_id: str, reference: dict | None = None, *,
+                    aedt_temp: tempdir.TempSettings | None = None, launch_timeout_s: float = DEFAULT_LAUNCH_TIMEOUT_S,
+                    environment: EnvironmentState | None = None) -> Path:
     """--from-solved: copy the source's solved project and results, open the copy, extract and write schema 2 with
     no solve. The convergence tables are exported fresh from the opened design and qualified against the source's
-    target (CDX-025); the sidecar records ``provenance.reexport`` and the manifest ``solver.reused_solution``."""
-    from bbsim.session import aedt_session, aedt_versions
+    target (CDX-025); the sidecar records ``provenance.reexport`` and the manifest ``solver.reused_solution``.
+    ``aedt_temp``, ``launch_timeout_s`` and ``environment`` as for ``run_job`` (HF-057)."""
+    from bbsim.session import aedt_versions
 
     t_start = time.perf_counter()
     cfg = source.config
     check_before_copy(source, reference)
+    environment = environment_state(REPO_ROOT) if environment is None else environment
+    temp = tempdir.TempSettings() if aedt_temp is None else aedt_temp
     staged = stage_solved_job(source, dirs)
     reexport = {"source_job": str(source.job_dir), "source_manifest_sha256": source.manifest_sha256,
-                "tool": REEXPORT_TOOL, "git_commit": git_commit()}
-    with aedt_session(staged.job_project, source.manifest["project"]["run_design"], cfg.project.aedt_version) as hfss:
-        _check_versions_for_reference(reference, aedt_versions(hfss))
-        solved = prepare_from_solved(source, dirs, job_id, hfss, staged)
-        return extract_and_write(cfg, dirs, job_id, hfss, solved, t_start, reference, reexport)
+                "tool": REEXPORT_TOOL, "git_commit": environment.commit}
+    with open_session(staged.job_project, source.manifest["project"]["run_design"], cfg.project.aedt_version, dirs,
+                      temp, launch_timeout_s) as session:
+        _check_versions_for_reference(reference, aedt_versions(session.hfss))
+        solved = prepare_from_solved(source, dirs, job_id, session.hfss, staged)
+        return extract_and_write(cfg, dirs, job_id, session.hfss, solved, t_start, reference, reexport,
+                                 environment=environment, session=session)
 
 
 def check_guard_before_job() -> dict:
@@ -962,7 +1109,29 @@ _FROM_SOLVED_EXCLUDES = (("--config", "config"), ("--frequency-ghz", "frequency_
                          ("--aedt-version", "aedt_version"))
 
 
-def _main_from_solved(args: argparse.Namespace) -> int:
+def _environment_log_line(environment: EnvironmentState) -> str:
+    dirty = " with uncommitted changes to tracked files" if environment.dirty else ""
+    return f"code {REPO_ROOT} at {environment.commit}{dirty}; PyAEDT {environment.pyaedt_version}"
+
+
+def _run_logged(what: str, run: Callable[[], Path]) -> int:
+    """Run the job and log how it ended: 0 with the manifest's path last, 1 on an error, and ``SystemExit`` (SIGTERM's
+    143) logged and raised again once the session's own cleanup has run."""
+    try:
+        manifest = run()
+    except SystemExit as exc:
+        log.error("%s stopped by SystemExit(%s)%s; what the cleanup on the way out did (the session's release, the "
+                  "launch lease, AEDT's temp directory) is logged above", what, exc.code,
+                  " from SIGTERM" if exc.code == EXIT_SIGTERM else "")
+        raise
+    except Exception:  # noqa: BLE001 - report and exit non-zero; the session is already released
+        log.exception("%s failed", what)
+        return 1
+    log.info("done; manifest at %s", manifest)
+    return 0
+
+
+def _main_from_solved(args: argparse.Namespace, cleanup: ExitStack) -> int:
     given = [flag for flag, attr in _FROM_SOLVED_EXCLUDES if getattr(args, attr) is not None]
     if given:
         print(f"refused: --from-solved takes its configuration from the source job's manifest; drop {', '.join(given)}",
@@ -979,30 +1148,36 @@ def _main_from_solved(args: argparse.Namespace) -> int:
             reference = load_reference(args.column_order_reference)
         check_before_copy(source, reference)
         guard = check_guard_before_job()
+        environment = environment_state(REPO_ROOT)
         dirs = reexport_job_dirs(source, args.job_id)
-    except (OSError, ValueError, licence_guard.GuardError) as exc:
+    except (OSError, ValueError, ImportError, licence_guard.GuardError, EnvironmentStateError) as exc:
         print(f"refused before the job started: {exc}", file=sys.stderr)
         return 2
-    _setup_logging(dirs.logs / "run.log", args.log_level)
+    cleanup.callback(_setup_logging(dirs.logs / "run.log", args.log_level))
     write_json(dirs.root / "effective_config.json", config_to_dict(source.config))
     log.info("job %s -> %s: schema-2 re-export of %s, no solve", args.job_id, dirs.root, source.job_dir)
     log.info(_guard_log_line(guard))
+    (log.warning if environment.dirty else log.info)(_environment_log_line(environment))
     if reference is not None:
         log.info("column-order reference from %s (%s, %s)", args.column_order_reference, reference.get("source_job"),
                  reference.get("aedt_version"))
-    try:
-        manifest = run_from_solved(source, dirs, args.job_id, reference)
-    except Exception:  # noqa: BLE001 - report and exit non-zero; the session is already released
-        log.exception("re-export failed")
-        return 1
-    log.info("done; manifest at %s", manifest)
-    return 0
+    return _run_logged("re-export", functools.partial(
+        run_from_solved, source, dirs, args.job_id, reference, aedt_temp=args.temp_settings,
+        launch_timeout_s=args.launch_timeout_s, environment=environment))
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
-    if args.from_solved is not None:
-        return _main_from_solved(args)
+    """The CLI. For the length of the run SIGTERM raises ``SystemExit(143)``, and the run's log handlers are removed
+    and closed on the way out, so ``main`` can run twice in one process (HF-057)."""
+    with ExitStack() as cleanup:
+        cleanup.callback(_handle_sigterm())
+        args = parse_args(argv)
+        if args.from_solved is not None:
+            return _main_from_solved(args, cleanup)
+        return _main_config(args, cleanup)
+
+
+def _main_config(args: argparse.Namespace, cleanup: ExitStack) -> int:
     if args.config is None:
         print("refused: one of --config or --from-solved is required", file=sys.stderr)
         return 2
@@ -1020,28 +1195,26 @@ def main(argv: list[str] | None = None) -> int:
             reference = load_reference(args.column_order_reference)
         check_before_aedt(cfg, reference)
         guard = check_guard_before_job()
-    except (OSError, ValueError, licence_guard.GuardError) as exc:
+        environment = environment_state(REPO_ROOT)
+    except (OSError, ValueError, ImportError, licence_guard.GuardError, EnvironmentStateError) as exc:
         print(f"refused before the job started: {exc}", file=sys.stderr)
         return 2
     job_id = args.job_id or default_job_id()
     dirs = create_job_dirs(cfg.output.root, cfg.project.dataset_id, cfg.solver.frequency_ghz, job_id)
-    _setup_logging(dirs.logs / "run.log", args.log_level)
+    cleanup.callback(_setup_logging(dirs.logs / "run.log", args.log_level))
     write_json(dirs.root / "effective_config.json", config_to_dict(cfg))
     log.info("job %s -> %s (schema %d)", job_id, dirs.root, cfg.output.schema)
     log.info(_guard_log_line(guard))
+    (log.warning if environment.dirty else log.info)(_environment_log_line(environment))
     if reference is not None:
         log.info("column-order reference from %s (%s, %s)", args.column_order_reference, reference.get("source_job"),
                  reference.get("aedt_version"))
     warning = allocation_warning(cfg.solver.cores)
     if warning:
         log.warning(warning)
-    try:
-        manifest = run_job(cfg, dirs, job_id, reference=reference)
-    except Exception:  # noqa: BLE001 - report and exit non-zero; the session is already released
-        log.exception("job failed")
-        return 1
-    log.info("done; manifest at %s", manifest)
-    return 0
+    return _run_logged("job", functools.partial(
+        run_job, cfg, dirs, job_id, reference=reference, aedt_temp=args.temp_settings,
+        launch_timeout_s=args.launch_timeout_s, environment=environment))
 
 
 if __name__ == "__main__":

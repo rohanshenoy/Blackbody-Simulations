@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import math
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -15,6 +16,17 @@ log = logging.getLogger(__name__)
 
 # Without these the session could open a blank project or attach to another user's desktop on the node.
 ESSENTIAL_KWARGS = ("project", "version", "non_graphical", "new_desktop")
+# PyAEDT 1.7.0's own default for settings.desktop_launch_timeout (generic/settings.py); cold starts took 43 to 77 s
+DEFAULT_LAUNCH_TIMEOUT_S = 120.0
+
+
+def launch_timeout_setting(launch_timeout_s: Any) -> int:
+    """PyAEDT's ``settings.desktop_launch_timeout`` for ``launch_timeout_s``: a finite number of seconds above 0,
+    rounded up, since PyAEDT keeps an int and the wait must never be shorter than asked (HF-057)."""
+    value = launch_timeout_s
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise ValueError(f"launch_timeout_s must be a finite number of seconds above 0, got {value!r}")
+    return math.ceil(value)
 
 
 def require_essential_kwargs(callable_obj: Any, extra: tuple[str, ...] = ()) -> None:
@@ -47,7 +59,7 @@ def supported_kwargs(callable_obj: Any, wanted: dict[str, Any]) -> tuple[dict[st
 @contextmanager
 def aedt_session(project_path: Path | None, design: str | None, version: str = "2025.2",
                  non_graphical: bool = True, *, cleanup_wait_s: float = 120.0,
-                 scope_observer: Any = None) -> Iterator[Any]:
+                 scope_observer: Any = None, launch_timeout_s: float = DEFAULT_LAUNCH_TIMEOUT_S) -> Iterator[Any]:
     """Start a new headless AEDT desktop under a launch lease, open ``project_path``, and release everything on exit.
 
     ``project_path=None`` starts with a new empty project (used by the smoke test).
@@ -62,7 +74,11 @@ def aedt_session(project_path: Path | None, design: str | None, version: str = "
     raises as well as an error in the body: it releases the desktop when one exists, then polls the scope every 2 s for
     up to ``cleanup_wait_s`` and releases the lease only once the scope has stopped; otherwise the lease stays held and
     the scope it saw is logged (HF-058(2)). ``scope_observer`` replaces this host's ``/proc`` observer, for tests.
+
+    ``launch_timeout_s`` becomes PyAEDT's ``settings.desktop_launch_timeout`` before ``Hfss()`` (HF-057); a value that
+    is not a finite number above 0 is refused before the lease.
     """
+    launch_timeout = launch_timeout_setting(launch_timeout_s)
     stale = sorted(k for k in os.environ if k.startswith("PYAEDT_"))
     if stale:
         log.warning("Removing %s from the environment so PyAEDT starts its own desktop", ", ".join(stale))
@@ -78,6 +94,11 @@ def aedt_session(project_path: Path | None, design: str | None, version: str = "
         # its session to a failed mesh-statistics export). This session owns the desktop; it is released here.
         if hasattr(settings, "release_on_exception"):
             settings.release_on_exception = False
+        if hasattr(settings, "desktop_launch_timeout"):
+            settings.desktop_launch_timeout = launch_timeout
+        else:
+            log.warning("This PyAEDT has no settings.desktop_launch_timeout; launch_timeout_s = %s is not applied",
+                        launch_timeout_s)
         wanted = dict(
             project=str(project_path) if project_path is not None else None,
             design=design,
@@ -92,8 +113,8 @@ def aedt_session(project_path: Path | None, design: str | None, version: str = "
         if dropped:
             log.warning("This PyAEDT's Hfss() does not accept %s; continuing without them", dropped)
         lease.guard.begin_launch_scope(lease, identity)
-        log.info("Starting AEDT %s non_graphical=%s project=%s design=%s under launch lease %s", version,
-                 non_graphical, project_path, design, lease)
+        log.info("Starting AEDT %s non_graphical=%s project=%s design=%s under launch lease %s (launch timeout %d s)",
+                 version, non_graphical, project_path, design, lease, launch_timeout)
         hfss = None
         try:
             try:
