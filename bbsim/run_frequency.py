@@ -80,7 +80,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                         "there; env exports TMPDIR and TMP = <job>/aedt_temp before AEDT starts. Every run records "
                         "what AEDT reported at session start")
     p.add_argument("--aedt-temp-restore", default=None, metavar="PATH",
-                   help="task mode: the TempDirectory AEDT is set back to at the end (step 4's aedt_temp.previous)")
+                   help="task mode: the TempDirectory AEDT is set back to at the end, the host's TempDirectory "
+                        "before any plan-mode run, read from AEDT's .cfg by the cluster probe")
     p.add_argument("--aedt-temp-strict", action="store_true",
                    help="task mode: fail the run instead of warning when AEDT does not report the requested "
                         "directory or a temp-directory call raises")
@@ -630,7 +631,7 @@ def _write_reference_evidence(scratch: Path, reference: Mapping, raw: Mapping[in
 
 def extract_and_write(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, solved: SolvedContext, t_start: float,
                       reference: dict | None = None, reexport: dict | None = None, *,
-                      environment: EnvironmentState | None = None, session: OpenSession | None = None) -> Path:
+                      environment: EnvironmentState, session: OpenSession | None = None) -> Path:
     """Extract every polarization into memory, check, then write the CSVs, the manifest and the sidecar.
 
     Order (HF-052): both polarizations are extracted and checked for finite values; under
@@ -638,9 +639,9 @@ def extract_and_write(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sol
     tables and sidecar blocks are built (``dataset_v2.build``); then the pairing and lattice checks. Only then is
     anything written, so a failure leaves no CSV, manifest or sidecar. Schema 1 writes the 1.0 tables and sidecar
     exactly as before. ``reexport`` (schema 2 only) is the --from-solved provenance for the sidecar; ``t_start`` is
-    the job's start on ``time.perf_counter``. ``environment`` is the code checkout's state (read here when not
-    given); ``session``'s records go into the manifest, and its ``before_write`` runs after the last AEDT call
-    (HF-057). Returns the manifest path.
+    the job's start on ``time.perf_counter``. ``environment`` is the code checkout's state, which the caller read
+    before the session: this runs after the licensed solve, so it never reads git itself. ``session``'s records go
+    into the manifest, and its ``before_write`` runs after the last AEDT call (HF-057). Returns the manifest path.
     """
     from bbsim.convergence import qualify
     from bbsim.extract import RIM_BAND_REL, evaluate_exit_powers, extract_far_field, extract_waveguide
@@ -653,7 +654,6 @@ def extract_and_write(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sol
     check_before_aedt(cfg, reference)   # pure; repeated here for callers that did not come through run_job
     if schema == 2:
         _require_v2_exit_face(cfg, solved)   # every path in, a --from-solved context included
-    environment = environment_state(REPO_ROOT) if environment is None else environment
     ctx = solved.ctx
     freq = cfg.solver.frequency_ghz
     dataset_id = cfg.project.dataset_id

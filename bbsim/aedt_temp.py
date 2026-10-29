@@ -42,9 +42,9 @@ class AedtTempError(RuntimeError):
 @dataclass(frozen=True)
 class TempSettings:
     """One run's temp-directory settings. ``restore`` is required by ``task``, a template included: the absolute
-    TempDirectory AEDT is set back to at the end (the value step 4's manifest recorded as ``aedt_temp.previous``).
-    ``strict`` needs ``task``. ``template`` (``task`` only) is an absolute path holding ``{job}``. A plan may carry a
-    restore value to an ``env`` task, which ignores it."""
+    TempDirectory AEDT is set back to at the end, the host's TempDirectory before any plan-mode run, read from AEDT's
+    .cfg by the cluster probe. ``strict`` needs ``task``. ``template`` (``task`` only) is an absolute path holding
+    ``{job}``. A plan may carry a restore value to an ``env`` task, which ignores it."""
 
     mode: str = "off"
     restore: str | None = None
@@ -63,8 +63,9 @@ class TempSettings:
                 raise ValueError(f"the path template {self.template!r} must give an absolute path")
         if self.mode == "task" and not self.restore:
             raise ValueError("--aedt-temp task needs --aedt-temp-restore, the TempDirectory AEDT is set back to at the "
-                             "end (step 4's aedt_temp.previous); a run never restores what it found, which can be "
-                             "another task's job directory")
+                             "end: the host's TempDirectory before any plan-mode run, read from AEDT's .cfg by the "
+                             "cluster probe; a run never restores what it found, which can be another task's job "
+                             "directory")
         if self.restore is not None and not os.path.isabs(self.restore):
             raise ValueError(f"--aedt-temp-restore must be an absolute path, got {self.restore!r}")
         if self.strict and self.mode != "task":
