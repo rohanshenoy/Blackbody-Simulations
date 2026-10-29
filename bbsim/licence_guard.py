@@ -21,28 +21,31 @@ sbatch_argv, throttle_target}, state ``pending`` (sbatch in flight, or a direct 
 job id; an array's parent id), ``uncertain`` (sbatch's answer was ambiguous) or ``released``. Every record is written
 atomically under the lock, and every change appends one JSON line to ``<root>/events.log``.
 
-Usage is reconciled under the lock from the scheduler's queue (pending, running, completing, suspended), the
-reservations and the leases:
+Usage is reconciled under the lock from the scheduler's queue, the reservations and the leases:
 
+- the queue holds pending, running, completing, suspended, configuring, stopped, requeued and staging-out jobs
+  (``QUEUE_STATES``), read with ``SLURM_BITSTR_LEN=0`` so no array index string is cut short;
 - array tasks are grouped by parent; an array whose comment starts ``bbsim:``, or that a reservation is bound to,
-  counts its ``ArrayTaskThrottle``, or its remaining tasks when the throttle is 0; a ``bbsim_hfss`` or
-  ``bbsim_reexport`` job counts 1, and so does any queued job a slot-bearing reservation is bound to; a held job
-  still counts;
-- a ``pending`` or ``uncertain`` reservation counts its slots; a ``bound`` one counts, once per job id, the largest of
+  counts the larger of its ``ArrayTaskThrottle`` and its running tasks, or its remaining tasks when the throttle is
+  0; an array of ``bbsim_hfss`` or ``bbsim_reexport`` tasks without that comment counts its running tasks; such a
+  job counts 1, and so does any queued job a slot-bearing reservation is bound to; a held job still counts;
+- a ``pending`` or ``uncertain`` reservation counts its slots, and a pending submission is uncertain (only a crash
+  leaves one, since ``submit`` holds the lock from reservation to bind); a ``bound`` one counts, once per job id, the largest of
   its slots, the scheduler's count for that id and its held leases while the job is queued; once the job has left the
   queue it is released only when accounting (``sacct``) calls it terminal and no held lease names it, and counts its
   slots until then;
 - a direct session's reservation (kind ``direct``, ``reserve_direct``) is released only when the leases that name it
   are all released, i.e. after its own lease verified cleanup;
-- a throttle decrease keeps the reservation at the largest of the new throttle, the array's running tasks and its
-  held leases, and drains down to the new throttle as those stop.
+- a throttle change sets the reservation to the largest of the requested throttle, the array's running tasks and
+  its held leases, admits what that adds like a submission, and drains down to the request as those stop.
 
 Admission: the reconciled total plus the new slots must not exceed ``min(CEILING, cap)``, ``cap`` an integer 1 to 10;
 no slot is admitted while an uncertain reservation holds slots. Zero-slot kinds (``monitor``, ``assembly``) are
 logged and never counted. A submission reserves before calling ``sbatch --parsable --export=ALL`` and binds the
 returned id before the lock is released; a non-zero exit, an id that is not a plain number (``;cluster`` is dropped)
-or an error leaves the reservation ``uncertain``, counted, until ``reconcile --resolve RESERVATION=released|job:<id>
---reason TEXT`` after checking ``squeue``. ``sbatch --wait`` is never run under the lock.
+or any interruption (``KeyboardInterrupt`` included) leaves the reservation ``uncertain``, counted, until
+``reconcile --resolve RESERVATION=released|job:<id> --reason TEXT`` after checking ``squeue``; a bind that cannot be
+written after sbatch accepted the job names the job and that command. ``sbatch --wait`` is never run under the lock.
 
 Leases (``<root>/leases/<id>.json``) belong to the launch-lease layer; this module reads only their
 ``reservation_id`` and ``state``. Any state but ``released`` holds, unknown cleanup included (HF-058(2)); a held lease
@@ -52,23 +55,29 @@ The guard owns the script, the job's context and identity, its array indices and
 the submission protocol. User sbatch arguments (``check_user_sbatch_args``) are complete canonical long names from
 ``ALLOWED_USER_OPTIONS`` only, as ``--opt=value`` or ``--opt value``, passed on byte for byte; abbreviations (sbatch's
 getopt_long would take ``--pars`` as ``--parsable``), short options, unknown options, ``--`` and ``:`` are refused, and
-so is every option in ``OWNED_SBATCH_OPTIONS``. Internal callers pass identity options as ``--name=value`` and may not
-touch the protocol (``--export*``, ``--parsable``, ``--quiet``, ``--wait``, ``--wrap``, ...); in stdin mode no script
-pathname is allowed, and the script's own ``#SBATCH`` header may not set the protocol, the array or the working
-directory either. sbatch's environment is the caller's without ``SBATCH_*`` and the scheduler-option aliases
+so is every option in ``OWNED_SBATCH_OPTIONS``. Internal callers add only the complete names of
+``INTERNAL_VALUE_OPTIONS`` (array, job name, comment, dependency, output, error, working directory) as
+``--name=value``, never the protocol (``--export*``, ``--parsable``, ``--quiet``, ``--wait``, ``--wrap``, ...); in stdin
+mode no script pathname is allowed, and the script's own ``#SBATCH`` header may not set the protocol, the array or the
+working directory, cluster short options or separate heterogeneous-job components either. sbatch's environment is the caller's without ``SBATCH_*`` and the scheduler-option aliases
 (``SCHEDULER_ENV_ALIASES``), plus the caller's validated context and, set by the guard alone, ``GUARD_ENV`` (the
 resolved root) and ``RESERVATION_ENV``. An inherited or explicit ``GUARD_ENV`` or a plan's ``guard_dir`` that resolves
 to another directory refuses before anything is reserved, so a second guard cannot bypass the cap.
 
-Path mode (the CLI's ``submit``; OR-044, HF-058(3)): one script, one of ``PATH_MODE_SCRIPTS``, whose real path lies in
-the bridge clone's ``scripts/hpc/hfss/`` (the sibling ``../bbridge`` of this checkout, or ``--bridge-repo``), tracked
-there and byte-equal to its ``HEAD`` blob, then literal script arguments. Its kind and slots follow the script.
+Path mode (the CLI's ``submit``, and ``Guard.submit`` without stdin; OR-044, HF-058(3)): one script, one of
+``PATH_MODE_SCRIPTS``, whose real path lies in the bridge clone's ``scripts/hpc/hfss/``, tracked there and byte-equal
+to its ``HEAD`` blob, then literal script arguments. The bridge clone is only the sibling ``../bbridge`` of the checkout
+this module runs from: no caller can name another repository, whose own committed edits would pass every check. Its
+kind and slots follow the script.
 
 The two-node lock test (``lock-test-worker``, ``lock-test-check``): each worker refuses unless this checkout is clean
 and at the recorded commit, waits at a barrier until the expected number of distinct hosts has announced itself, then
 visits the production lock ``--iterations`` times; inside each visit it creates the test's ``active`` sentinel
-directory (an existing one is an overlap), advances the shared sequence and logs an enter and a leave record. The
-check judges serialization by the sentinel and the sequence in the shared log, never by clocks.
+directory (an existing one is an overlap), advances the shared sequence, lists ``records/`` (every earlier visit's
+record must be there: admission discovers reservations by listing a directory, which an NFS client may cache) and
+adds its own, and logs an enter and a leave record. The check judges serialization by the sentinel, the sequence and
+the listings in the shared log, never by clocks, and needs at least ``LOCK_TEST_MIN_SWITCHES`` hand-overs of the lock
+between hosts, so a PASS shows exclusion under contention.
 
 Exit codes: 2 refused before anything was reserved or submitted, 1 failed, 0 success. Standard library only.
 """
@@ -112,7 +121,8 @@ STATES = ("pending", "bound", "uncertain", "released")
 SOLVE_JOB_NAMES = frozenset({"bbsim_hfss", "bbsim_reexport"})
 MANAGED_COMMENT_PREFIX = "bbsim:"
 LEASE_RELEASED = "released"
-PENDING_QUEUE_STATES = frozenset({"PENDING"})
+QUEUE_STATES = "PD,R,CG,S,CF,ST,RQ,SO"
+PENDING_QUEUE_STATES = frozenset({"PENDING"})             # every other listed state is an active task
 TERMINAL_STATES = frozenset({"BOOT_FAIL", "CANCELLED", "COMPLETED", "DEADLINE", "FAILED", "NODE_FAIL",
                              "OUT_OF_MEMORY", "PREEMPTED", "REVOKED", "TIMEOUT"})
 
@@ -134,7 +144,11 @@ OWNED_SBATCH_OPTIONS = frozenset({
     "--chdir", "-D", "--wrap", "--wait", "-W", "--requeue", "--no-requeue", "--test-only", "--clusters", "-M",
     "--get-user-env",
 })
-# Internal callers may set identity, array and dependency options, never these (nor an abbreviation of one).
+# Internal callers (the job array's submission helper) may add these complete names to the user allowlist, each as
+# --name=value; nothing else, and no abbreviation (sbatch's getopt_long would take --ar=0-7 as --array=0-7).
+INTERNAL_VALUE_OPTIONS = ("--array", "--job-name", "--comment", "--dependency", "--output", "--error", "--chdir")
+ALLOWED_INTERNAL_OPTIONS = frozenset(INTERNAL_VALUE_OPTIONS) | ALLOWED_USER_OPTIONS
+# The protocol the guard sets itself, named in the refusal of an internal option.
 _PROTOCOL_NAMES = ("export", "export-file", "parsable", "quiet", "wait", "wrap", "test-only", "clusters",
                    "get-user-env", "help", "usage", "version")
 # A script's own #SBATCH header may set none of these either.
@@ -149,6 +163,9 @@ LOCK_TEST_SEQUENCE = "sequence"
 LOCK_TEST_ACTIVE = "active"
 LOCK_TEST_READY = "ready"
 LOCK_TEST_FAILURES = "failures"
+LOCK_TEST_RECORDS = "records"
+# A PASS needs the lock handed between hosts at least this often in log order; two back-to-back runs give one.
+LOCK_TEST_MIN_SWITCHES = 5
 
 _OWNER = "owner.json"
 _LONG = re.compile(r"--([A-Za-z0-9][A-Za-z0-9-]*)(?:(=)(.*))?", re.S)
@@ -202,14 +219,20 @@ class Usage:
 
 
 def _query_env() -> dict[str, str]:
-    return {k: v for k, v in os.environ.items()
-            if not (k.startswith(("SBATCH_", "SQUEUE_", "SACCT_", "SCONTROL_")) or k in SCHEDULER_ENV_ALIASES)}
+    env = {k: v for k, v in os.environ.items()
+           if not (k.startswith(("SBATCH_", "SQUEUE_", "SACCT_", "SCONTROL_")) or k in SCHEDULER_ENV_ALIASES)}
+    # squeue cuts an array's index string at 64 characters unless SLURM_BITSTR_LEN is 0; a cut string cannot be
+    # counted, and an uncountable queue refuses every admission.
+    env["SLURM_BITSTR_LEN"] = "0"
+    return env
 
 
 class SlurmScheduler:
     """The scheduler through Slurm's commands, each with a timeout; any failure is a ``GuardError``.
 
-    ``sacct`` runs with ``-P`` so a state such as ``CANCELLED by 1234`` is not truncated to ``CANCELLED+``.
+    ``squeue`` lists ``QUEUE_STATES``: pending, running, completing, suspended, configuring (about to run), stopped
+    (it keeps its processes and licences), requeued and staging out. ``sacct`` runs with ``-P`` so a state such as
+    ``CANCELLED by 1234`` is not truncated to ``CANCELLED+``.
     """
 
     def __init__(self, user: str | None = None, timeout_s: float = SCHEDULER_TIMEOUT_S):
@@ -237,7 +260,7 @@ class SlurmScheduler:
         return run.stdout.decode(errors="replace")
 
     def queue(self) -> list[QueueEntry]:
-        out = self._checked(["squeue", "-h", "-u", self.user, "-t", "PD,R,CG,S", "-o", "%i|%F|%j|%k|%T"])
+        out = self._checked(["squeue", "-h", "-u", self.user, "-t", QUEUE_STATES, "-o", "%i|%F|%j|%k|%T"])
         entries = []
         for line in out.splitlines():
             if not line.strip():
@@ -497,8 +520,12 @@ class _Option:
     value: str | None
 
 
-def _split_internal(argv: Sequence[str], *, stdin_mode: bool) -> tuple[list[_Option], str | None]:
-    """Internal sbatch arguments: long options before the script; in stdin mode, no pathname at all."""
+def _split_internal(argv: Sequence[str], *, stdin_mode: bool) -> tuple[list[_Option], int | None]:
+    """Internal sbatch arguments: listed long options, then (by path) the script's index; in stdin mode, no pathname.
+
+    Only the complete names of ``ALLOWED_INTERNAL_OPTIONS`` pass. ``INTERNAL_VALUE_OPTIONS`` take ``--name=value``
+    with a value; the user allowlist's value options may also take a separate token, as the CLI passes them on.
+    """
     options: list[_Option] = []
     argv = list(argv)
     i = 0
@@ -508,24 +535,36 @@ def _split_internal(argv: Sequence[str], *, stdin_mode: bool) -> tuple[list[_Opt
             match = _LONG.fullmatch(token)
             if match is None:
                 raise GuardRefused(f"internal sbatch argument {token!r}: internal options use canonical long names")
-            name = match.group(1)
+            name, has_value, value = match.group(1), match.group(2) is not None, match.group(3)
             owned = [p for p in _PROTOCOL_NAMES if p.startswith(name)]
             if owned:
                 raise GuardRefused(f"internal sbatch option --{name} would change the submission protocol "
                                    f"(--{', --'.join(owned)}), which the guard sets itself")
-            if match.group(2) is None and f"--{name}" in USER_VALUE_OPTIONS:
+            if f"--{name}" not in ALLOWED_INTERNAL_OPTIONS:
+                like = sorted(n for n in ALLOWED_INTERNAL_OPTIONS if n.startswith(f"--{name}"))
+                what = f"an abbreviation of {', '.join(like)}" if like else "not on the guard's internal list"
+                raise GuardRefused(f"internal sbatch option --{name} is {what}; internal options are the complete "
+                                   f"names {', '.join(sorted(ALLOWED_INTERNAL_OPTIONS))}")
+            if has_value and value == "":
+                raise GuardRefused(f"internal sbatch option {token!r} has an empty value")
+            if f"--{name}" in INTERNAL_VALUE_OPTIONS and not has_value:
+                raise GuardRefused(f"internal sbatch option --{name} takes --{name}=VALUE")
+            if not has_value and f"--{name}" in USER_VALUE_OPTIONS:
                 if i + 1 >= len(argv):
                     raise GuardRefused(f"sbatch option --{name} needs a value")
-                options.append(_Option(name, _refuse_token(argv[i + 1])))
+                value_token = _refuse_token(argv[i + 1])
+                if value_token == "" or value_token.startswith("-"):
+                    raise GuardRefused(f"sbatch option --{name} is followed by {value_token!r}, not a value")
+                options.append(_Option(name, value_token))
                 i += 2
                 continue
-            options.append(_Option(name, match.group(3)))
+            options.append(_Option(name, value))
             i += 1
             continue
         if stdin_mode:
             raise GuardRefused(f"{token!r} among the sbatch arguments: sbatch would read it as the script, but the "
                                "guard submits the captured script on stdin (internal options use --name=value)")
-        return options, token
+        return options, i
     if not stdin_mode:
         raise GuardRefused("a submission by path names its script after the sbatch options")
     return options, None
@@ -580,7 +619,11 @@ def _check_array(kind: str, slots: int, options: list[_Option]) -> None:
 
 
 def script_directive_problems(script: bytes) -> list[str]:
-    """``#SBATCH`` header lines that would set the protocol, the array or the working directory."""
+    """``#SBATCH`` header lines that would set the protocol, the array or the working directory.
+
+    A header gives long options, or single short options with a separate value (``-p expansion``): a cluster or an
+    attached value (``-sa0-3`` is ``-s`` and ``-a 0-3``) is refused, as are heterogeneous-job separators.
+    """
     problems = []
     for number, line in enumerate(script.decode("utf-8", errors="replace").splitlines(), start=1):
         stripped = line.strip()
@@ -593,12 +636,18 @@ def script_directive_problems(script: bytes) -> list[str]:
         for token in stripped[len("#SBATCH"):].split():
             if token.startswith("#"):
                 break
-            if token.startswith("--"):
+            if token in ("hetjob", "packjob", ":", "--"):
+                problems.append(f"line {number}: directive {token} separates heterogeneous-job components or ends "
+                                "the options")
+            elif token.startswith("--"):
                 name = token[2:].split("=", 1)[0]
                 if name and any(p.startswith(name) for p in _DIRECTIVE_NAMES):
                     problems.append(f"line {number}: directive {token} sets what the guard owns")
             elif token.startswith("-") and len(token) > 1:
-                if token[1] in _DIRECTIVE_SHORT or set(token[2:]) & {"W", "Q"}:
+                if len(token) > 2:
+                    problems.append(f"line {number}: directive {token} is a short-option cluster or an attached "
+                                    "value, which can hide an option the guard owns; give long options")
+                elif token[1] in _DIRECTIVE_SHORT:
                     problems.append(f"line {number}: directive {token} sets what the guard owns")
     return problems
 
@@ -617,16 +666,24 @@ class PathScript:
     sha256: str
     bridge_repo: Path
     bridge_commit: str
+    data: bytes = field(repr=False, default=b"")
+
+    def facts(self) -> dict:
+        return {"path": str(self.path), "rel": self.rel, "sha256": self.sha256, "bridge_repo": str(self.bridge_repo),
+                "bridge_commit": self.bridge_commit}
 
 
 def default_bridge_repo() -> Path:
-    """The bridge clone beside this checkout, ``../bbridge`` (OR-044)."""
+    """The bridge clone beside this checkout, ``../bbridge`` (OR-044): the only one path mode takes.
+
+    No caller can name another: a repository passed in would carry its own committed scripts past every check.
+    """
     return HFSS_CHECKOUT.parent / "bbridge"
 
 
-def check_path_mode_script(script: str | os.PathLike, bridge_repo: str | os.PathLike | None = None) -> PathScript:
+def check_path_mode_script(script: str | os.PathLike) -> PathScript:
     """The script, if its real path is a listed script of the bridge clone's folder, tracked and equal to HEAD."""
-    bridge = Path(bridge_repo) if bridge_repo is not None else default_bridge_repo()
+    bridge = default_bridge_repo()
     try:
         bridge_real = bridge.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
@@ -662,7 +719,7 @@ def check_path_mode_script(script: str | os.PathLike, bridge_repo: str | os.Path
     kind, slots = PATH_MODE_SCRIPTS[real.name]
     return PathScript(path=real, name=real.name, rel=rel, kind=kind, slots=slots,
                       sha256=hashlib.sha256(data).hexdigest(), bridge_repo=bridge_real,
-                      bridge_commit=head.stdout.decode().strip())
+                      bridge_commit=head.stdout.decode().strip(), data=data)
 
 
 # --- the guard ------------------------------------------------------------------------------------------------
@@ -756,6 +813,7 @@ class _Reconciled:
     counts: dict[str, int]                  # reservation id -> the slots counted for it (its job's, if bound)
     blocking: list[str]                     # uncertain reservations holding slots
     held: dict[str, int]                    # reservation id -> held leases
+    throttles: dict[str, int | None]        # array parent -> ArrayTaskThrottle, for the arrays asked
 
 
 class Guard:
@@ -778,6 +836,7 @@ class Guard:
         self.lock_timeout_s = float(lock_timeout_s)
         self.clock = clock
         self.last_reservation_id: str | None = None
+        self.last_path_script: PathScript | None = None
         self._depth = 0
         self._nonce: str | None = None
 
@@ -1053,13 +1112,16 @@ class Guard:
         throttles: dict[str, int | None] = {}
 
         def scheduler_count(group: _Group, managed_slots: bool) -> int:
+            # A throttled array counts its throttle, or its running tasks if more run (a throttle lowered outside the
+            # guard stops no running task); an unlimited one counts every remaining task. An array of solves without
+            # the bbsim: comment counts its running tasks.
             if group.is_array:
                 if managed_slots or any(c.startswith(MANAGED_COMMENT_PREFIX) for c in group.comments):
                     if group.key not in throttles:
                         throttles[group.key] = self.scheduler.array_throttle(group.key)
                     throttle = throttles[group.key]
-                    return throttle if throttle else group.tasks
-                return 0
+                    return max(throttle, group.active) if throttle else group.tasks
+                return group.active if group.names & SOLVE_JOB_NAMES else 0
             return 1 if (group.names & SOLVE_JOB_NAMES or managed_slots) else 0
 
         total, sources, uncertain, unmanaged, blocking = 0, [], [], [], []
@@ -1081,10 +1143,12 @@ class Guard:
             counts[rid] = n
             total += n
             if n:
+                what = state if state == "uncertain" or rec["kind"] == DIRECT_KIND else \
+                    "pending with no bind: a crashed submission, uncertain"
                 sources.append({"source": "reservation", "id": rid, "kind": rec["kind"], "state": state,
-                                "job_id": None, "count": n,
-                                "detail": f"{state}, held leases {held.get(rid, 0)}"})
-            if state == "uncertain":
+                                "job_id": None, "count": n, "detail": f"{what}, held leases {held.get(rid, 0)}"})
+            # submit holds the lock from reservation to bind, so only a crash leaves a submission pending
+            if state == "uncertain" or rec["kind"] != DIRECT_KIND:
                 uncertain.append(rid)
                 if rec["slots"]:
                     blocking.append(rid)
@@ -1147,7 +1211,8 @@ class Guard:
                                 "detail": f"held ({lease['state']}) and naming no live reservation "
                                           f"({lease['reservation_id']!r})"})
         usage = Usage(total=total, sources=sources, uncertain=uncertain, unmanaged=unmanaged)
-        return _Reconciled(usage=usage, groups=groups, counts=counts, blocking=blocking, held=held)
+        return _Reconciled(usage=usage, groups=groups, counts=counts, blocking=blocking, held=held,
+                           throttles=throttles)
 
     def _reconcile_refusing(self) -> _Reconciled:
         try:
@@ -1191,7 +1256,13 @@ class Guard:
     # admission
     def submit(self, *, kind: str, slots: int, cap: int, argv: list[str], stdin: bytes | None = None,
                env: Mapping[str, str] | None = None, context: dict) -> str:
-        """Reserve, run ``sbatch --parsable --export=ALL <argv>`` and bind the returned job id, under one lock."""
+        """Reserve, run ``sbatch --parsable --export=ALL <argv>`` and bind the returned job id, under one lock.
+
+        By path (``stdin`` None) the script is verified as ``check_path_mode_script`` verifies it, whoever calls:
+        ``kind`` and ``slots`` must be the script's, sbatch gets its resolved path, and the context records the
+        verified facts as ``path_script`` (also ``last_path_script``). Any interruption of sbatch, an exception or
+        not, leaves the reservation uncertain.
+        """
         _check_kind_slots(kind, slots)
         cap = _check_cap(cap)
         context = _check_context(context)
@@ -1199,15 +1270,21 @@ class Guard:
         extras = _check_env_extras(env)
         if stdin is not None and not isinstance(stdin, (bytes, bytearray)):
             raise GuardRefused("stdin must be the captured script's bytes")
-        options, script = _split_internal(argv, stdin_mode=stdin is not None)
+        argv = list(argv)
+        options, index = _split_internal(argv, stdin_mode=stdin is not None)
         _check_array(kind, slots, options)
+        self.last_path_script = None
         if stdin is not None:
             data = bytes(stdin)
         else:
-            try:
-                data = Path(script).read_bytes()
-            except OSError as exc:
-                raise GuardRefused(f"script {script} cannot be read: {exc}") from exc
+            verified = check_path_mode_script(argv[index])
+            if (kind, slots) != (verified.kind, verified.slots):
+                raise GuardRefused(f"{verified.name} is submitted as --kind {verified.kind} --slots {verified.slots}, "
+                                   f"not --kind {kind} --slots {slots}")
+            argv[index] = str(verified.path)
+            data = verified.data
+            context["path_script"] = verified.facts()
+            self.last_path_script = verified
         problems = script_directive_problems(data)
         if problems:
             raise GuardRefused("the script's #SBATCH header sets what the guard owns: " + "; ".join(problems))
@@ -1223,18 +1300,37 @@ class Guard:
             sub_env[RESERVATION_ENV] = rid
             try:
                 returncode, stdout = self.scheduler.submit(list(full), data if stdin is not None else None, sub_env)
-            except Exception as exc:
-                self._change(record, "uncertain", event="submit_error", error=str(exc))
-                raise GuardError(self._uncertain_message(record, f"sbatch failed: {exc}")) from exc
+            except BaseException as exc:          # KeyboardInterrupt and SystemExit included
+                self._mark_uncertain(record, event="submit_error", error=f"{type(exc).__name__}: {exc}")
+                if isinstance(exc, Exception):
+                    raise GuardError(self._uncertain_message(record, f"sbatch failed: {exc}")) from exc
+                raise
             job = _parse_job_id(stdout) if returncode == 0 else None
             if job is None:
-                self._change(record, "uncertain", event="submit_ambiguous", returncode=returncode,
-                             stdout=stdout[-2000:])
+                self._mark_uncertain(record, event="submit_ambiguous", returncode=returncode, stdout=stdout[-2000:])
                 raise GuardError(self._uncertain_message(record, f"sbatch exited {returncode} with stdout "
                                                                  f"{stdout.strip()[-200:]!r}"))
             record["job_id"] = job
-            self._change(record, "bound", event="bound", job_id=job)
+            try:
+                self._change(record, "bound", event="bound", job_id=job)
+            except BaseException as exc:
+                message = (f"sbatch accepted job {job}, but binding reservation {rid} to it could not be recorded "
+                           f"({type(exc).__name__}: {exc}). The reservation stays counted and blocks admission until "
+                           f"it is resolved: python -m bbsim.licence_guard --root {self.root} reconcile --resolve "
+                           f"{rid}=job:{job} --reason 'sbatch accepted job {job}; the bind write failed' (nothing is "
+                           "needed if status already lists it bound)")
+                if isinstance(exc, Exception):
+                    raise GuardError(message) from exc
+                print(f"licence_guard: {message}", file=sys.stderr)
+                raise
             return job
+
+    def _mark_uncertain(self, record: dict, *, event: str, **details: Any) -> None:
+        try:
+            self._change(record, "uncertain", event=event, **details)
+        except BaseException as exc:          # the record stays pending, which reconciliation treats as uncertain
+            log.warning("reservation %s could not be marked uncertain (%s); it stays pending, which counts the "
+                        "same", record["id"], exc)
 
     def _uncertain_message(self, record: dict, why: str) -> str:
         return (f"the submission's result is ambiguous ({why}): reservation {record['id']} stays uncertain and keeps "
@@ -1254,7 +1350,12 @@ class Guard:
             return self._create(kind=DIRECT_KIND, slots=1, cap=cap, context=context, sbatch_argv=None)["id"]
 
     def change_throttle(self, parent_id: str, throttle: int, *, cap: int) -> None:
-        """Change a guarded array's throttle: an increase is admitted like a submission, a decrease drains."""
+        """Set a guarded array's throttle; the reservation never counts fewer than the tasks that may run.
+
+        The reservation becomes the largest of the requested throttle, the array's running tasks and its held leases,
+        with a drain target when that exceeds the request; whatever this adds to what was counted is admitted like a
+        submission. Only a request equal to the scheduler's throttle, with no drain pending, changes nothing.
+        """
         cap = _check_cap(cap)
         if not isinstance(parent_id, str) or not _JOB_ID.fullmatch(parent_id):
             raise GuardRefused(f"the array's parent job id must be a plain number, got {parent_id!r}")
@@ -1271,21 +1372,25 @@ class Guard:
             group = state.groups.get(parent_id)
             if group is None:
                 raise GuardRefused(f"array {parent_id} is not in the queue")
-            previous = record["slots"]
-            if throttle > previous:
-                counted = state.counts.get(record["id"], previous)
-                self._admit(state, max(0, throttle - counted), cap, f"raising array {parent_id}'s throttle to "
-                                                                     f"{throttle}")
-                record["slots"], record["throttle_target"] = throttle, None
-                self._change(record, "bound", event="throttle_increase", previous=previous, throttle=throttle)
-            elif throttle < previous:
-                held = state.held.get(record["id"], 0)
-                record["slots"] = max(throttle, group.active, held)
-                record["throttle_target"] = throttle if record["slots"] > throttle else None
-                self._change(record, "bound", event="throttle_decrease", previous=previous, throttle=throttle,
-                             active_tasks=group.active, held_leases=held)
+            if parent_id in state.throttles:
+                in_effect = state.throttles[parent_id]
             else:
+                try:
+                    in_effect = self.scheduler.array_throttle(parent_id)
+                except Exception as exc:        # nothing has changed yet
+                    raise GuardRefused(f"array {parent_id}'s throttle cannot be read: {exc}") from exc
+            if in_effect == throttle and record.get("throttle_target") is None:
                 return
+            held = state.held.get(record["id"], 0)
+            counted = state.counts.get(record["id"], record["slots"])
+            new = max(throttle, group.active, held)
+            self._admit(state, max(0, new - counted), cap, f"setting array {parent_id}'s throttle to {throttle}")
+            previous, previous_target = record["slots"], record.get("throttle_target")
+            record["slots"] = new
+            record["throttle_target"] = throttle if new > throttle else None
+            self._change(record, "bound", event="throttle_change", previous=previous, previous_target=previous_target,
+                         throttle=throttle, scheduler_throttle=in_effect, active_tasks=group.active,
+                         held_leases=held)
             try:
                 self.scheduler.set_throttle(parent_id, throttle)
             except Exception as exc:
@@ -1369,11 +1474,15 @@ def run_lock_test_worker(root: str | os.PathLike, test_dir: str | os.PathLike, *
                          expect_commit_file: str | os.PathLike, iterations: int = 200, hosts: int = 2,
                          barrier_timeout_s: float = 300.0, hold_s: float = 0.01, pause_s: float = 0.05,
                          lock_timeout_s: float = 120.0, host: str | None = None, checkout: Path = HFSS_CHECKOUT,
-                         clock: Callable[[], float] = time.time) -> int:
+                         clock: Callable[[], float] = time.time,
+                         listdir: Callable[[Path], Sequence[str]] = os.listdir) -> int:
     """One worker of the two-node lock test on the production lock in ``root``; artifacts in ``test_dir``.
 
-    Exit 2 when it refuses (the checkout, stale artifacts, the barrier's timeout), 1 on an overlap or a lock error,
-    0 after ``iterations`` visits. ``host`` and ``clock`` are injectable for local tests only.
+    Each visit, under the lock, also lists ``records/`` and requires every earlier visit's record there before it
+    adds its own: admission finds reservations by listing a directory, and an NFS client can serve a cached listing
+    that misses another node's new entry. Exit 2 when it refuses (the checkout, stale artifacts, the barrier's
+    timeout), 1 on an overlap, a lock error or a record another visit could not see, 0 after ``iterations`` clean
+    visits. ``host``, ``clock`` and ``listdir`` are injectable for local tests only.
     """
     host = host or socket.gethostname()
     pid = os.getpid()
@@ -1392,7 +1501,7 @@ def run_lock_test_worker(root: str | os.PathLike, test_dir: str | os.PathLike, *
         return code
 
     try:
-        for sub in (LOCK_TEST_READY, LOCK_TEST_FAILURES):
+        for sub in (LOCK_TEST_READY, LOCK_TEST_FAILURES, LOCK_TEST_RECORDS):
             (test_dir / sub).mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         print(f"lock-test-worker: refused: the test directory {test_dir} cannot be created: {exc}", file=sys.stderr)
@@ -1404,6 +1513,8 @@ def run_lock_test_worker(root: str | os.PathLike, test_dir: str | os.PathLike, *
         check_checkout(checkout, Path(expect_commit_file))
         guard = Guard(root, _NoScheduler(), lock_timeout_s=lock_timeout_s, clock=clock)
         stale = [n for n in (LOCK_TEST_LOG, LOCK_TEST_SEQUENCE, LOCK_TEST_ACTIVE) if (test_dir / n).exists()]
+        if any((test_dir / LOCK_TEST_RECORDS).iterdir()):
+            stale.append(LOCK_TEST_RECORDS)
         if stale:
             raise GuardRefused(f"{test_dir} holds {', '.join(stale)} from an earlier run; use a fresh directory")
     except GuardRefused as exc:
@@ -1424,6 +1535,7 @@ def run_lock_test_worker(root: str | os.PathLike, test_dir: str | os.PathLike, *
                                    f"after {barrier_timeout_s:g} s", 2)
         time.sleep(0.1)
     log_path = test_dir / LOCK_TEST_LOG
+    unseen = 0
     for visit in range(1, iterations + 1):
         start = time.monotonic()
         try:
@@ -1436,9 +1548,21 @@ def run_lock_test_worker(root: str | os.PathLike, test_dir: str | os.PathLike, *
                                            "holds the guard lock", 1, visit=visit)
                 seq = _read_sequence(test_dir) + 1
                 (test_dir / LOCK_TEST_SEQUENCE).write_text(f"{seq}\n")
+                earlier = {str(i) for i in range(1, seq)}
+                names = set(listdir(test_dir / LOCK_TEST_RECORDS))
+                if names != earlier:
+                    unseen += 1
+                    fail("discovery", f"visit {visit} (seq {seq}): records/ listed {len(names & earlier)} of the "
+                                      f"{seq - 1} earlier visits' records", 1, visit=visit, seq=seq,
+                         missing=sorted(earlier - names, key=int)[:20], extra=sorted(names - earlier)[:20])
+                try:
+                    os.mkdir(test_dir / LOCK_TEST_RECORDS / str(seq))
+                except FileExistsError:
+                    unseen += 1
+                    fail("discovery", f"visit {visit}: records/{seq} exists already", 1, visit=visit, seq=seq)
                 record = {"host": host, "pid": pid, "visit": visit, "seq": seq}
                 _append_line(log_path, {"event": "enter", **record, "utc": _utc(clock()),
-                                        "lock_wait_s": round(waited, 4)})
+                                        "lock_wait_s": round(waited, 4), "listed": len(names & earlier)})
                 if hold_s:
                     time.sleep(hold_s)
                 _append_line(log_path, {"event": "leave", **record, "utc": _utc(clock())})
@@ -1451,12 +1575,22 @@ def run_lock_test_worker(root: str | os.PathLike, test_dir: str | os.PathLike, *
             return fail("lock", f"visit {visit}: {exc}", 1, visit=visit)
         if pause_s:
             time.sleep(pause_s)
+    if unseen:
+        print(f"lock-test-worker: {unseen} visit(s) on {host} missed records written before them", file=sys.stderr)
+        return 1
     print(f"lock-test-worker: {iterations} visits on {host} (pid {pid})")
     return 0
 
 
-def check_lock_test(test_dir: str | os.PathLike, *, hosts: int = 2, iterations: int = 200) -> tuple[bool, list[str]]:
-    """Judge a lock test's artifacts: distinct hosts, complete visits, a gapless sequence, no overlap, no sentinel."""
+def check_lock_test(test_dir: str | os.PathLike, *, hosts: int = 2, iterations: int = 200,
+                    min_switches: int = LOCK_TEST_MIN_SWITCHES) -> tuple[bool, list[str]]:
+    """Judge a lock test's artifacts, never by clocks.
+
+    It requires: the expected distinct hosts with ``iterations`` complete visits each, enter and leave in pairs in
+    log order, a sequence without gaps or repeats, every visit listing all earlier visits' records, ``records/``
+    holding exactly one record per visit, no failure record, no sentinel at the end, and, with two or more hosts,
+    the lock handed from one host to another at least ``min_switches`` times in log order.
+    """
     test_dir = Path(test_dir)
     if not test_dir.is_dir():
         raise GuardRefused(f"the lock test directory {test_dir} does not exist")
@@ -1485,6 +1619,7 @@ def check_lock_test(test_dir: str | os.PathLike, *, hosts: int = 2, iterations: 
     open_enter: tuple[int, dict] | None = None
     visits: dict[str, list[tuple[Any, Any]]] = {}
     waits: dict[str, int] = {}
+    order: list[str] = []
 
     def who(rec: dict) -> str:
         return f"{rec.get('host')} pid {rec.get('pid')} visit {rec.get('visit')} seq {rec.get('seq')}"
@@ -1500,6 +1635,9 @@ def check_lock_test(test_dir: str | os.PathLike, *, hosts: int = 2, iterations: 
                                 "repeat)")
             expected = (seq + 1) if isinstance(seq, int) and not isinstance(seq, bool) else expected + 1
             open_enter = (number, rec)
+            if isinstance(seq, int) and not isinstance(seq, bool) and rec.get("listed") != seq - 1:
+                problems.append(f"log line {number}: visit {who(rec)} listed {rec.get('listed')!r} of the {seq - 1} "
+                                "earlier visits' records")
             if isinstance(rec.get("lock_wait_s"), (int, float)) and rec["lock_wait_s"] > 0.1:
                 waits[str(rec.get("host"))] = waits.get(str(rec.get("host")), 0) + 1
         elif event == "leave":
@@ -1508,6 +1646,7 @@ def check_lock_test(test_dir: str | os.PathLike, *, hosts: int = 2, iterations: 
                 problems.append(f"log line {number}: leave of {who(rec)} without its own enter just before")
             else:
                 visits.setdefault(str(rec.get("host")), []).append((rec.get("pid"), rec.get("visit")))
+                order.append(str(rec.get("host")))
             open_enter = None
         else:
             problems.append(f"log line {number}: unknown event {event!r}")
@@ -1529,8 +1668,19 @@ def check_lock_test(test_dir: str | os.PathLike, *, hosts: int = 2, iterations: 
             problems.append(f"the sequence file holds {final}, but {pairs} complete visits were logged")
     except GuardError as exc:
         problems.append(str(exc))
+    records_dir = test_dir / LOCK_TEST_RECORDS
+    found = sorted(p.name for p in records_dir.iterdir()) if records_dir.is_dir() else None
+    if found is None:
+        problems.append(f"no records directory {records_dir}")
+    elif sorted(found) != sorted(str(i) for i in range(1, pairs + 1)):
+        problems.append(f"records/ holds {len(found)} entries, not exactly one per visit 1 to {pairs}")
+    switches = sum(1 for a, b in zip(order, order[1:]) if a != b)
+    if hosts > 1 and switches < min_switches:
+        problems.append(f"the lock passed between hosts {switches} time(s) in log order, fewer than {min_switches}: "
+                        "the hosts did not alternate, so the run shows no exclusion under contention")
     lines = [f"host {name}: {len(done)} visits, {waits.get(name, 0)} waited over 0.1 s for the lock"
              for name, done in sorted(visits.items())]
+    lines.append(f"hand-overs between hosts: {switches}")
     lines += [f"PROBLEM {p}" for p in problems]
     lines.append(f"LOCK TEST: PASS ({len(visits)} hosts, {pairs} visits, sequence 1 to {pairs})" if not problems
                  else f"LOCK TEST: FAIL ({len(problems)} problem(s))")
@@ -1561,13 +1711,11 @@ def _parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
     status = sub.add_parser("status", help="the reconciled usage (takes the lock)")
     status.add_argument("--lock-info", action="store_true", help="the lock's identity and owner, without the lock")
-    submit = sub.add_parser("submit", help="submit one bridge script by path: submit --kind K --slots N --cap N -- "
-                                           "<sbatch options> <script> [script args]")
+    submit = sub.add_parser("submit", help="submit one script of the bridge clone ../bbridge by path: submit "
+                                           "--kind K --slots N --cap N -- <sbatch options> <script> [script args]")
     submit.add_argument("--kind", choices=KINDS, required=True)
     submit.add_argument("--slots", type=int, required=True)
     submit.add_argument("--cap", type=int, required=True)
-    submit.add_argument("--bridge-repo", type=Path, default=None,
-                        help="the bridge clone (default: ../bbridge beside this checkout)")
     throttle = sub.add_parser("throttle", help="change a guarded array's throttle")
     throttle.add_argument("parent")
     throttle.add_argument("throttle", type=int)
@@ -1591,6 +1739,8 @@ def _parser() -> argparse.ArgumentParser:
     check.add_argument("--test-dir", type=Path, required=True)
     check.add_argument("--hosts", type=int, default=2)
     check.add_argument("--iterations", type=int, default=200)
+    check.add_argument("--min-switches", type=int, default=LOCK_TEST_MIN_SWITCHES,
+                       help="hand-overs of the lock between hosts a PASS needs (default %(default)s)")
     return p
 
 
@@ -1606,16 +1756,11 @@ def _cmd_submit(args: argparse.Namespace, guard: Guard, sbatch_args: list[str]) 
     check_user_sbatch_args(options)
     if script is None:
         raise GuardRefused("submit names one bridge script after the sbatch options")
-    verified = check_path_mode_script(script, args.bridge_repo)
-    if (args.kind, args.slots) != (verified.kind, verified.slots):
-        raise GuardRefused(f"{verified.name} is submitted as --kind {verified.kind} --slots {verified.slots}, not "
-                           f"--kind {args.kind} --slots {args.slots}")
-    context = {"source": "submit by path", "script": str(verified.path), "script_rel": verified.rel,
-               "script_sha256": verified.sha256, "bridge_repo": str(verified.bridge_repo),
-               "bridge_commit": verified.bridge_commit, "sbatch_options": options, "script_args": script_args,
+    context = {"source": "submit by path", "sbatch_options": options, "script_args": script_args,
                "cwd": os.getcwd()}
-    job = guard.submit(kind=args.kind, slots=args.slots, cap=args.cap,
-                       argv=[*options, str(verified.path), *script_args], context=context)
+    job = guard.submit(kind=args.kind, slots=args.slots, cap=args.cap, argv=[*options, script, *script_args],
+                       context=context)
+    verified = guard.last_path_script
     print(job)
     print(f"licence_guard: submitted {verified.name} as job {job}, reservation {guard.last_reservation_id} "
           f"({args.kind}, {args.slots} slot(s), cap {args.cap}); bridge {verified.bridge_commit}, script sha256 "
@@ -1638,7 +1783,8 @@ def main(argv: list[str] | None = None, *, scheduler: Scheduler | None = None) -
         if (args.command == "submit") != (sbatch_args is not None):
             raise GuardRefused("submit, and only submit, takes '--' followed by the sbatch options and the script")
         if args.command == "lock-test-check":
-            ok, lines = check_lock_test(args.test_dir, hosts=args.hosts, iterations=args.iterations)
+            ok, lines = check_lock_test(args.test_dir, hosts=args.hosts, iterations=args.iterations,
+                                        min_switches=args.min_switches)
             print("\n".join(lines))
             return 0 if ok else 1
         root = args.root if args.root is not None else DEFAULT_ROOT
