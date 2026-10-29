@@ -21,9 +21,12 @@ creates nothing until every check has passed; each refusal is one ``PlanError`` 
   diagnostic of one key and Ephi=0 (HF-057, HF-058), with none of ``--tree``, ``--include-job``, a reference or an
   expectation;
 - every task's config, built by ``task_config`` from the plan being written, passes the runner's own pre-AEDT check;
-- the project exists; cores, the throttle L, the classes (which partition the task indices, their throttles summing
+- the project exists, and the record beside it (``.mapping.json`` from prepare_project, or ``.build.json``) gives the
+  config's dataset_id for its design and object (``mapping.recorded_dataset_id``, the runner's check, which a single
+  run only warns about); cores, the throttle L, the classes (which partition the task indices, their throttles summing
   to L), the resources, the stagger and the AEDT temp settings are well formed;
-- every ``--sbatch-arg`` passes ``licence_guard.check_user_sbatch_args``; ``--licence-cap`` is 1 to 10; ``--guard-dir``
+- every ``--sbatch-arg`` passes ``licence_guard.check_user_sbatch_args`` and sets none of ``PLAN_RESOURCE_OPTIONS``,
+  which the plan sets itself; ``--licence-cap`` is 1 to 10; ``--guard-dir``
   and an inherited ``BBSIM_LICENCE_GUARD`` are the guard's root; every pending or running array the guard manages
   (comment ``bbsim:``) runs at the plan's ``--cores``, read from ``scontrol show job``, since arrays at two core counts
   share the per-user ``pyaedt_config`` registry entry; and the guard's reconciled usage plus L fits the smaller of the
@@ -35,23 +38,24 @@ creates nothing until every check has passed; each refusal is one ``PlanError`` 
 
 Then it creates ``<RUN>/{inputs,jobs,slurm}`` (and any missing parent), the detached worktree ``<RUN>/code`` at the
 commit, where the reference is checked against the exporter files (``dataset_v2.check_reference_before_aedt``), the
-byte copies of the config, the reference and the project in ``<RUN>/inputs/``, and ``plan.json`` and ``plan.sha256``
-last. A failure removes everything it created, ``git worktree remove --force`` included, and is a refusal; only a
-cleanup that cannot finish is ``PlanLeftovers`` (exit 1), naming what is left.
+byte copies of the config, the reference, the project and its record (beside the project copy under its own name, so
+each task's ``run_frequency.stage_project`` confirms the dataset again) in ``<RUN>/inputs/``, and ``plan.json`` and
+``plan.sha256`` last. A failure removes everything it created, ``git worktree remove --force`` included, and is a
+refusal; only a cleanup that cannot finish is ``PlanLeftovers`` (exit 1), naming what is left.
 
 ``plan.json`` (``PLAN_SCHEMA``): schema, created_utc, name, run_dir, tree (null for a probe), dataset_id, probe, policy
 (``production`` or ``probe``), acceptance_kind (``array_run``), code {repo (the worktree), source_repo, commit,
 pyaedt_version}, bridge {repo, commit, scripts {repo-relative path: sha256 of the HEAD blob}}, config, project and
-column_order_reference (null for a probe) {source, copy, sha256}, grid {source, sha256, entries}, order, tasks [{index,
-frequency_ghz, label, class, l_resolution_mm (the grid entry's requested step, may be null),
-effective_l_resolution_mm (the applied one), l_step_mm (the fitted one, the lattice's step along l), lattice,
-aedt_temp {mode, template, restore, strict}}], classes [{name, indices, mem, time, qos, throttle}], slurm {cores,
-throttle, stagger {step_s, modulus}, sbatch_args, tmpdir, job_name, comment, max_array_size, assembly {mem, time, qos},
-monitor {enabled, interval_s, time}}, incidence and expect_incidence {theta_deg, phi_deg}, aedt {temp,
-launch_timeout_s}, include_jobs [{job, dataset_id, frequency_ghz, acceptance_kind, files {path: sha256}, source_plan
-{path, sha256, index} or null}], licence_cap, guard_dir, jobs_root. Every path it records is absolute and resolved; an
-include job's file inside the job is keyed by its path relative to the job, a file outside it (a reference job's, a
-plan) by its absolute path.
+column_order_reference (null for a probe) {source, copy, sha256}, the project also its record {source, copy, sha256},
+grid {source, sha256, entries}, order, tasks [{index, frequency_ghz, label, class, l_resolution_mm (the grid entry's
+requested step, may be null), effective_l_resolution_mm (the applied one), l_step_mm (the fitted one, the lattice's
+step along l), lattice, aedt_temp {mode, template, restore, strict}}], classes [{name, indices, mem, time, qos,
+throttle}], slurm {cores, throttle, stagger {step_s, modulus}, sbatch_args, tmpdir, job_name, comment, max_array_size,
+assembly {mem, time, qos}, monitor {enabled, interval_s, time}}, incidence and expect_incidence {theta_deg, phi_deg},
+aedt {temp, launch_timeout_s}, include_jobs [{job, dataset_id, frequency_ghz, acceptance_kind, files {path: sha256},
+source_plan {path, sha256, index} or null}], licence_cap, guard_dir, jobs_root. Every path it records is absolute and
+resolved; an include job's file inside the job is keyed by its path relative to the job, a file outside it (a reference
+job's, a plan) by its absolute path.
 
 ``task_config`` builds a task's run configuration from the config copy, or from the caller's raw TOML mapping already
 captured from that copy, with ``config.build_config`` and exactly five overrides through the validated override path:
@@ -124,6 +128,10 @@ ARRAY_SCRIPT = "run_frequency_array.sbatch"
 ASSEMBLY_SCRIPT = "assemble_dataset.sbatch"
 MONITOR_SCRIPT = "monitor_licences.sbatch"
 MONITOR_MARGIN_S = 1800          # the monitor's default time is the plan's duration estimate plus 30 min
+# The resources the plan sets on every job itself, and the planner option that sets each: a --sbatch-arg may not set
+# them again, since sbatch would take one of the two values silently (submission refuses them too, HF-057).
+PLAN_RESOURCE_OPTIONS = {"--cpus-per-task": "--cores", "--mem": "--mem (or --class mem=)",
+                         "--time": "--time (or --class time=)", "--qos": "--qos (or --class qos=)"}
 JOB_DIRS = ("inputs", "jobs", "slurm")
 
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -829,6 +837,36 @@ def _reference(path: object) -> tuple[Path, bytes, dict]:
     return reference_path, reference_bytes, reference
 
 
+def _project_record(project: Path, cfg: RunConfig) -> tuple[str, Path, bytes]:
+    """The record beside the prepared project (``.mapping.json``, which prepare_project writes, or ``.build.json``)
+    read by the runner's own ``mapping.recorded_dataset_id``: it must give the config's dataset_id for its design and
+    object, else the plan is refused, where a single run only warns (HF-057). Returns the record's name beside the
+    project, its resolved path and its bytes, which the plan freezes beside the project copy so that each task's
+    ``run_frequency.stage_project`` confirms the dataset again."""
+    from bbsim.mapping import recorded_dataset_id
+
+    design, obj, dataset = cfg.project.design, cfg.geometry.object, cfg.project.dataset_id
+    try:
+        recorded, record = recorded_dataset_id(project, design, obj)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise PlanError(f"the record beside the project {project} (.mapping.json or .build.json) cannot be read "
+                        f"({type(exc).__name__}: {exc})") from None
+    if record is None:
+        raise PlanError(f"the project {project} has no .mapping.json or .build.json beside it, so the config's "
+                        f"dataset_id {dataset!r} cannot be confirmed; a plan runs a prepared project, whose record "
+                        "prepare_project writes (HF-057)")
+    if recorded is None:
+        raise PlanError(f"{record} has no entry for {design}/{obj}, so the config's dataset_id {dataset!r} cannot be "
+                        "confirmed (HF-057)")
+    if recorded != dataset:
+        raise PlanError(f"the config's dataset_id {dataset!r} disagrees with {record}, which gives {recorded!r} for "
+                        f"design {design!r} object {obj!r}")
+    try:
+        return Path(record).name, Path(record).resolve(strict=True), Path(record).read_bytes()
+    except (OSError, RuntimeError) as exc:
+        raise PlanError(f"the record {record} cannot be read ({exc})") from None
+
+
 def _check_cores(guard: Any, cores: int) -> None:
     """Every pending or running array the guard manages (comment ``bbsim:``) must run at the plan's cores per task:
     two arrays at different core counts share the per-user ``pyaedt_config`` registry entry, so one's tasks could solve
@@ -891,6 +929,8 @@ class _Draft:
     project_source: Path
     reference: dict | None
     reference_bytes: bytes | None
+    record_bytes: bytes
+    design_object: tuple[str, str]
 
 
 def _draft(o: PlanOptions, env: EnvironmentState, guard: Any, now: datetime, repo: Path) -> _Draft:
@@ -935,6 +975,11 @@ def _draft(o: PlanOptions, env: EnvironmentState, guard: Any, now: datetime, rep
         licence_guard.check_user_sbatch_args(sbatch_args)
     except licence_guard.GuardRefused as exc:
         raise PlanError(f"--sbatch-arg: {exc}") from None
+    named = {token.split("=", 1)[0] for token in sbatch_args if token.startswith("--")}
+    twice = [name for name in PLAN_RESOURCE_OPTIONS if name in named]
+    if twice:
+        uses = ", ".join(f"{n}, which the plan sets itself: use {PLAN_RESOURCE_OPTIONS[n]}" for n in twice)
+        raise PlanError(f"--sbatch-arg sets {uses}; sbatch would take one of the two values silently (HF-057)")
     try:
         guard_dir = Path(os.fspath(o.guard_dir)).resolve(strict=True)
     except (OSError, RuntimeError, TypeError) as exc:
@@ -975,9 +1020,10 @@ def _draft(o: PlanOptions, env: EnvironmentState, guard: Any, now: datetime, rep
 
     incidence, expect = _incidence(base, o.expect_incidence, probe)
     project_source = _existing_file(o.project if o.project is not None else base.project.path, "the project")
+    record_name, record_source, record_bytes = _project_record(project_source, base)
     reference_path, reference_bytes, reference = (None, None, None) if probe else \
         _reference(o.column_order_reference)
-    names = [p.name for p in (config_path, project_source, reference_path) if p is not None]
+    names = [p.name for p in (config_path, project_source, reference_path) if p is not None] + [record_name]
     if len(set(names)) != len(names):
         raise PlanError(f"the inputs copied into <RUN>/inputs/ under their own names share a name: {names}")
 
@@ -1026,7 +1072,9 @@ def _draft(o: PlanOptions, env: EnvironmentState, guard: Any, now: datetime, rep
         "config": {"source": str(config_path), "copy": str(inputs / config_path.name),
                    "sha256": hashlib.sha256(config_bytes).hexdigest()},
         "project": {"source": str(project_source), "copy": str(inputs / project_source.name),
-                    "sha256": sha256_file(project_source)},
+                    "sha256": sha256_file(project_source),
+                    "record": {"source": str(record_source), "copy": str(inputs / record_name),
+                               "sha256": hashlib.sha256(record_bytes).hexdigest()}},
         "column_order_reference": None if reference_path is None else {
             "source": str(reference_path), "copy": str(inputs / reference_path.name),
             "sha256": hashlib.sha256(reference_bytes).hexdigest()},
@@ -1079,7 +1127,8 @@ def _draft(o: PlanOptions, env: EnvironmentState, guard: Any, now: datetime, rep
     _check_licence(guard, throttle, cap)
     return _Draft(plan=plan, run_dir=run_dir, source_repo=source_repo, commit=env.commit,
                   pyaedt_version=env.pyaedt_version, config_bytes=config_bytes, project_source=project_source,
-                  reference=reference, reference_bytes=reference_bytes)
+                  reference=reference, reference_bytes=reference_bytes, record_bytes=record_bytes,
+                  design_object=(base.project.design, base.geometry.object))
 
 
 # --- making the plan --------------------------------------------------------------------------------------------------
@@ -1147,6 +1196,13 @@ def _create(d: _Draft) -> Path:
         shutil.copyfile(d.project_source, copy)
         if sha256_file(copy) != plan["project"]["sha256"]:
             raise PlanError(f"the project {d.project_source} changed while it was copied")
+        _write_new(Path(plan["project"]["record"]["copy"]), d.record_bytes)
+        from bbsim.mapping import recorded_dataset_id
+
+        confirmed, record = recorded_dataset_id(copy, *d.design_object)
+        if confirmed != plan["dataset_id"]:
+            raise PlanError(f"the frozen record {record} gives {confirmed!r}, not the plan's dataset "
+                            f"{plan['dataset_id']!r}, for {'/'.join(d.design_object)}: it changed while it was read")
         step = "writing plan.json"
         data = (json.dumps(plan, indent=2, sort_keys=True) + "\n").encode()
         tmp = run_dir / ".plan.json.tmp"
