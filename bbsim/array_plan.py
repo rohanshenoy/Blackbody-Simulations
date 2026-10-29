@@ -7,8 +7,9 @@ creates nothing until every check has passed; each refusal is one ``PlanError`` 
 - ``--run-dir`` does not exist and its name is a plain word (it names the Slurm jobs); ``--tree`` likewise, required
   unless ``--probe`` and refused with it;
 - the code checkout is clean at the commit the plan records (``manifest.environment_state``, one seam, injected by the
-  tests); the bridge clone of ``--scripts-dir`` (default the sibling ``../bbridge``'s ``scripts/hpc/hfss``, OR-044) has
-  no uncommitted change to a tracked file, and every script the plan names is in its ``HEAD``;
+  tests); the bridge is the checkout's sibling clone ``../bbridge`` and no other repository (``--scripts-dir`` may only
+  name its ``scripts/hpc/hfss``; OR-044), with no uncommitted change to a tracked file and every script the plan names
+  in its ``HEAD``;
 - the grid file parses with at most ``--max-array-size`` entries, and each task's effective step along l is at most
   c/(4f) (``frequency_grid``, OR-048);
 - the config loads with no ``solver.frequency_ghz`` and declares ``[acceptance] kind = "array_run"``, so a
@@ -23,8 +24,10 @@ creates nothing until every check has passed; each refusal is one ``PlanError`` 
 - the project exists; cores, the throttle L, the classes (which partition the task indices, their throttles summing
   to L), the resources, the stagger and the AEDT temp settings are well formed;
 - every ``--sbatch-arg`` passes ``licence_guard.check_user_sbatch_args``; ``--licence-cap`` is 1 to 10; ``--guard-dir``
-  and an inherited ``BBSIM_LICENCE_GUARD`` are the guard's root; and the guard's reconciled usage plus L fits the
-  smaller of the ceiling and the cap. That count is advisory: admission is repeated at every submission (OR-045);
+  and an inherited ``BBSIM_LICENCE_GUARD`` are the guard's root; every pending or running array the guard manages
+  (comment ``bbsim:``) runs at the plan's ``--cores``, read from ``scontrol show job``, since arrays at two core counts
+  share the per-user ``pyaedt_config`` registry entry; and the guard's reconciled usage plus L fits the smaller of the
+  ceiling and the cap. That count is advisory: admission is repeated at every submission (OR-045);
 - each ``--include-job`` (HF-057, S65) is a schema-2 job of another dataset ID on the expected incidence grid, qualified
   for both polarizations (``acceptance_gate.convergence_problems``), whose files are its sidecar's and whose recorded
   acceptance passes the gate (``required_acceptance``, then ``report_problems`` on its bound report); an ``array_run``
@@ -124,6 +127,7 @@ _STAGGER = re.compile(r"([0-9]+)(?::([0-9]+))?")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _COMMIT = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _CLASS_KEYS = ("indices", "mem", "time", "qos", "throttle")
+_CORE_STATES = frozenset({"PENDING", "RUNNING"})       # the queue states whose arrays the cores rule compares
 
 
 class PlanError(ValueError):
@@ -477,11 +481,19 @@ def _temp_record(settings: aedt_temp.TempSettings) -> dict:
 
 # --- the planner's checks --------------------------------------------------------------------------------------------
 
-def _bridge(scripts_dir: object, names: Sequence[str]) -> dict:
-    """The bridge clone holding ``scripts_dir`` (its ``scripts/hpc/hfss``): clean, with every named script in its
-    ``HEAD``, recorded as {repo, commit, scripts {repo-relative path: sha256 of the HEAD blob}} (OR-044)."""
-    folder = Path(os.fspath(scripts_dir)) if scripts_dir is not None else \
-        licence_guard.default_bridge_repo() / licence_guard.BRIDGE_SCRIPTS_DIR
+def _sibling_bridge(repo: Path) -> Path:
+    """The bridge clone beside the code checkout ``repo``, ``../bbridge`` (OR-044); for this checkout it is
+    ``licence_guard.default_bridge_repo()``, the one clone the guard's path mode takes."""
+    return Path(repo).resolve().parent / licence_guard.default_bridge_repo().name
+
+
+def _bridge(scripts_dir: object, names: Sequence[str], repo: Path) -> dict:
+    """The code checkout ``repo``'s sibling bridge clone, whose ``scripts/hpc/hfss`` ``scripts_dir`` names (default
+    that folder): clean, with every named script in its ``HEAD``, recorded as {repo, commit, scripts {repo-relative
+    path: sha256 of the HEAD blob}}. No other repository is taken, so no other repository's committed scripts can
+    reach sbatch through a plan (OR-044)."""
+    sibling = _sibling_bridge(repo)
+    folder = Path(os.fspath(scripts_dir)) if scripts_dir is not None else sibling / licence_guard.BRIDGE_SCRIPTS_DIR
     try:
         folder = folder.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
@@ -490,6 +502,14 @@ def _bridge(scripts_dir: object, names: Sequence[str]) -> dict:
     if not folder.is_dir():
         raise PlanError(f"--scripts-dir {folder} is not a directory")
     top = Path(_git_out(folder, "rev-parse", "--show-toplevel").strip()).resolve()
+    try:
+        expected = sibling.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise PlanError(f"the code checkout's sibling bridge clone {sibling} cannot be reached ({exc}) "
+                        "(OR-044)") from None
+    if top != expected:
+        raise PlanError(f"--scripts-dir {folder} lies in the git repository {top}, not in the code checkout's sibling "
+                        f"bridge clone {expected}: a plan takes its scripts from that clone only (OR-044)")
     if folder != top / licence_guard.BRIDGE_SCRIPTS_DIR:
         raise PlanError(f"--scripts-dir {folder} is not {licence_guard.BRIDGE_SCRIPTS_DIR} of its bridge clone {top}")
     if _git_out(top, "status", "--porcelain", "--untracked-files=no").strip():
@@ -801,6 +821,34 @@ def _reference(path: object) -> tuple[Path, bytes, dict]:
     return reference_path, reference_bytes, reference
 
 
+def _check_cores(guard: Any, cores: int) -> None:
+    """Every pending or running array the guard manages (comment ``bbsim:``) must run at the plan's cores per task:
+    two arrays at different core counts share the per-user ``pyaedt_config`` registry entry, so one's tasks could solve
+    at the other's count (HF-057). Its CPUs/Task comes from ``scontrol show job`` (the comment names no plan file to
+    read); a value that cannot be read refuses too."""
+    try:
+        entries = guard.scheduler.queue()
+    except licence_guard.GuardError as err:
+        raise PlanError(f"the scheduler's queue cannot be read, so the cores of running bbsim arrays are unknown: "
+                        f"{err}") from None
+    parents = sorted({e.array_parent for e in entries if e.array_parent and e.state in _CORE_STATES
+                      and e.comment.startswith(licence_guard.MANAGED_COMMENT_PREFIX)})
+    for parent in parents:
+        try:
+            found = guard.scheduler.cpus_per_task(parent)
+        except licence_guard.GuardError as err:
+            raise PlanError(f"the bbsim array {parent}'s cores per task cannot be read ({err}), so --cores {cores} "
+                            "cannot be checked against it (HF-057)") from None
+        if isinstance(found, bool) or not isinstance(found, int):
+            raise PlanError(f"the bbsim array {parent}'s cores per task cannot be read: scontrol show job {parent} "
+                            f"prints no CPUs/Task, so --cores {cores} cannot be checked against it (HF-057)")
+        if found != cores:
+            raise PlanError(f"the bbsim array {parent} runs at {found} cores per task and this plan at --cores "
+                            f"{cores}: two arrays at different core counts share the per-user pyaedt_config registry "
+                            f"entry, so one's tasks could solve at the other's (HF-057); plan with --cores {found}, or "
+                            f"once {parent} has left the queue")
+
+
 def _check_licence(guard: Any, throttle: int, cap: int) -> None:
     """The guard's reconciled usage plus the plan's throttle must fit min(CEILING, cap); advisory at plan time, since
     admission is repeated at every submission (OR-045)."""
@@ -925,7 +973,7 @@ def _draft(o: PlanOptions, env: EnvironmentState, guard: Any, now: datetime, rep
     if len(set(names)) != len(names):
         raise PlanError(f"the inputs copied into <RUN>/inputs/ under their own names share a name: {names}")
 
-    bridge = _bridge(o.scripts_dir, [ARRAY_SCRIPT, ASSEMBLY_SCRIPT] + ([MONITOR_SCRIPT] if monitor else []))
+    bridge = _bridge(o.scripts_dir, [ARRAY_SCRIPT, ASSEMBLY_SCRIPT] + ([MONITOR_SCRIPT] if monitor else []), repo)
     try:
         source_repo = Path(repo).resolve(strict=True)
     except (OSError, RuntimeError) as err:
@@ -1019,6 +1067,7 @@ def _draft(o: PlanOptions, env: EnvironmentState, guard: Any, now: datetime, rep
         seen_keys[key] = record["job"]
         plan["include_jobs"].append(record)
 
+    _check_cores(guard, cores)
     _check_licence(guard, throttle, cap)
     return _Draft(plan=plan, run_dir=run_dir, source_repo=source_repo, commit=env.commit,
                   pyaedt_version=env.pyaedt_version, config_bytes=config_bytes, project_source=project_source,
@@ -1179,7 +1228,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="schema 2: the HF-041 reference crack1's accepted 500 GHz solve keeps as "
                         "scratch/column_order_reference.json; copied and hashed into the plan")
     p.add_argument("--scripts-dir", type=Path,
-                   help="the bridge clone's scripts/hpc/hfss (default the sibling ../bbridge's, OR-044)")
+                   help="scripts/hpc/hfss of the code checkout's sibling bridge clone ../bbridge, the only bridge a "
+                        "plan takes (OR-044); the default")
     p.add_argument("--guard-dir", type=Path, default=licence_guard.DEFAULT_ROOT,
                    help="the shared licence guard (default %(default)s)")
     p.add_argument("--sbatch-arg", dest="sbatch_args", action="append", default=[], metavar="OPT",

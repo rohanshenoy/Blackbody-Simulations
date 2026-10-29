@@ -230,6 +230,8 @@ class Scheduler(Protocol):
 
     def array_throttle(self, parent_id: str) -> int | None: ...
 
+    def cpus_per_task(self, parent_id: str) -> int | None: ...
+
     def terminal_state(self, job_id: str) -> str | None: ...
 
     def submit(self, argv: list[str], stdin: bytes | None, env: Mapping[str, str]) -> tuple[int, str]: ...
@@ -307,6 +309,15 @@ class SlurmScheduler:
         match = re.search(r"\bArrayTaskThrottle=([0-9]+)", out)
         return int(match.group(1)) if match else None
 
+    def cpus_per_task(self, parent_id: str) -> int | None:
+        """The job's (or array's) CPUs/Task, None when ``scontrol show job`` prints none; an array's records that
+        disagree are a ``GuardError``. Read by the planner, never by admission (HF-057)."""
+        out = self._checked(["scontrol", "show", "job", parent_id])
+        values = {int(v) for v in re.findall(r"\bCPUs/Task=([0-9]+)", out)}
+        if len(values) > 1:
+            raise GuardError(f"scontrol show job {parent_id} prints CPUs/Task {sorted(values)}, not one value")
+        return values.pop() if values else None
+
     def terminal_state(self, job_id: str) -> str | None:
         out = self._checked(["sacct", "-n", "-X", "-P", "-o", "State", "-j", job_id])
         states = [line.split()[0].rstrip("+") for line in out.splitlines() if line.strip()]
@@ -330,7 +341,7 @@ class _NoScheduler:
     def _refuse(self, *args: Any, **kwargs: Any) -> Any:
         raise GuardError("this guard was opened for its lock only and has no scheduler")
 
-    queue = array_throttle = terminal_state = submit = set_throttle = _refuse
+    queue = array_throttle = cpus_per_task = terminal_state = submit = set_throttle = _refuse
 
 
 # --- identity of this process and of a lock owner -------------------------------------------------------------
