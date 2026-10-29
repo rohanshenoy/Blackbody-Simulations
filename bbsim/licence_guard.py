@@ -25,10 +25,11 @@ Usage is reconciled under the lock from the scheduler's queue, the reservations 
 
 - the queue holds pending, running, completing, suspended, configuring, stopped, requeued and staging-out jobs
   (``QUEUE_STATES``), read with ``SLURM_BITSTR_LEN=0`` so no array index string is cut short;
-- array tasks are grouped by parent; an array whose comment starts ``bbsim:``, or that a reservation is bound to,
-  counts the larger of its ``ArrayTaskThrottle`` and its running tasks, or its remaining tasks when the throttle is
-  0; an array of ``bbsim_hfss`` or ``bbsim_reexport`` tasks without that comment counts its running tasks; such a
-  job counts 1, and so does any queued job a slot-bearing reservation is bound to; a held job still counts;
+- array tasks are grouped by parent; an array whose comment starts ``bbsim:``, whose tasks are ``bbsim_hfss`` or
+  ``bbsim_reexport`` jobs, or that a reservation is bound to, counts the larger of its ``ArrayTaskThrottle`` and its
+  running tasks, or all its remaining tasks when the throttle is 0 or unknown; other arrays count 0; a single
+  ``bbsim_hfss`` or ``bbsim_reexport`` job counts 1, and so does any queued job a slot-bearing reservation is bound
+  to; held and pending tasks still count;
 - a ``pending`` or ``uncertain`` reservation counts its slots, and a pending submission is uncertain (only a crash
   leaves one, since ``submit`` holds the lock from reservation to bind); a ``bound`` one counts, once per job id, the largest of
   its slots, the scheduler's count for that id and its held leases while the job is queued; once the job has left the
@@ -1445,16 +1446,18 @@ class Guard:
         throttles: dict[str, int | None] = {}
 
         def scheduler_count(group: _Group, managed_slots: bool) -> int:
-            # A throttled array counts its throttle, or its running tasks if more run (a throttle lowered outside the
-            # guard stops no running task); an unlimited one counts every remaining task. An array of solves without
-            # the bbsim: comment counts its running tasks.
+            # A counted array (bound to a slot-bearing reservation, commented bbsim:, or of bbsim_hfss or
+            # bbsim_reexport tasks) counts its throttle, or its running tasks if more run (a throttle lowered outside
+            # the guard stops no running task); an unthrottled one, or one whose throttle is unknown, counts every
+            # remaining task. Pending and held tasks free nothing (OR-045). Arrays of other jobs count 0.
             if group.is_array:
-                if managed_slots or any(c.startswith(MANAGED_COMMENT_PREFIX) for c in group.comments):
+                if (managed_slots or any(c.startswith(MANAGED_COMMENT_PREFIX) for c in group.comments)
+                        or group.names & SOLVE_JOB_NAMES):
                     if group.key not in throttles:
                         throttles[group.key] = self.scheduler.array_throttle(group.key)
                     throttle = throttles[group.key]
                     return max(throttle, group.active) if throttle else group.tasks
-                return group.active if group.names & SOLVE_JOB_NAMES else 0
+                return 0
             return 1 if (group.names & SOLVE_JOB_NAMES or managed_slots) else 0
 
         total, sources, uncertain, unmanaged, blocking = 0, [], [], [], []
