@@ -19,6 +19,11 @@ line (exit 2):
   column-order reference still has its recorded sha256 and still fits the worktree's exporter files and the installed
   PyAEDT (``dataset_v2.check_reference_before_aedt``), and a probe plan records none;
   a monitor: the plan runs one, and an array of the plan is in ``submissions.log`` for it to watch;
+- a first submission (a class's array, not a rerun; the monitor; the assembly): no reservation of the plan's in the
+  guard (``Guard._read_reservations``) that is pending, uncertain or bound, or released with a job id, lacks its
+  ``submissions.log`` line (``_unaccounted``): such a job was or may have been submitted, and the refusal names
+  ``reconcile --resolve`` when its job is unknown, else the planner's ``--log-submission`` line. ``remaining`` prints
+  no block while one exists, only those lines;
 - the plan's own sbatch arguments pass ``licence_guard.check_user_sbatch_args`` and set none of the resources the plan
   sets itself (``PLAN_RESOURCE_OPTIONS``); a dependency is ``after[any|ok|notok]:JOBID[:JOBID...]``;
 - the script is the git blob of the recorded bridge commit with the recorded sha256 (``capture_script``): a commit or
@@ -458,6 +463,84 @@ def _check_sbatch_args(plan: Mapping) -> list[str]:
     return list(args)
 
 
+def _is_refusal(exc: BaseException) -> bool:
+    """A refusal reserved and submitted nothing; any other failure may have left a job behind."""
+    return isinstance(exc, (SubmitError, licence_guard.GuardRefused))
+
+
+def _unaccounted(guard: Any, plan_sha256: str, lines: Sequence[Mapping]) -> list[dict]:
+    """This plan's first submissions (no rerun) that the guard's reservations show were or may have been made and that
+    ``submissions.log`` has no line for: a reservation pending, uncertain or bound, or released with a job id, whose
+    id and job id no log line names. One released with no job id (resolved as not submitted) is left out. Read with
+    the guard's own reader; nothing is reserved or changed."""
+    try:
+        records = guard._read_reservations()
+    except licence_guard.GuardError as exc:
+        raise SubmitError(f"the guard's reservations cannot be read, so whether this plan's jobs were submitted "
+                          f"cannot be decided: {_one_line(exc)}") from None
+    logged_reservations = {line.get("reservation") for line in lines if line.get("reservation")}
+    logged_jobs = {line["id"] for line in lines}
+    found = []
+    for rec in records.values():
+        context = rec.get("context") if isinstance(rec.get("context"), Mapping) else {}
+        if context.get("source") != "bbsim.array_submit" or context.get("plan_sha256") != plan_sha256 \
+                or context.get("rerun") is True:
+            continue
+        job = rec.get("job_id")
+        if (rec["state"] == "released" and not job) or rec["id"] in logged_reservations or job in logged_jobs:
+            continue
+        found.append({"reservation": rec["id"], "state": rec["state"], "job_id": job, "kind": context.get("kind"),
+                      "class": context.get("class")})
+    return sorted(found, key=lambda item: item["reservation"])
+
+
+def _kind_token(item: Mapping) -> str:
+    return f"array:{item['class']}" if item["kind"] == "array" else str(item["kind"])
+
+
+def _unaccounted_lines(items: Sequence[Mapping], plan: Mapping, plan_path: Path, plan_sha256: str,
+                       root: Path) -> list[str]:
+    """What settles ``_unaccounted`` submissions: a job the guard knows is recorded with the planner's
+    ``--log-submission`` line (a command, ready to paste); one it does not know is first resolved with ``reconcile
+    --resolve`` (comments: a person reads squeue and sacct first). Then ``remaining`` again."""
+    code, run = shlex.quote(str(plan["code"]["repo"])), shlex.quote(str(plan["run_dir"]))
+    guard_root = shlex.quote(str(root))
+    out = []
+    for item in items:
+        what = f"class {item['class']}" if item["kind"] == "array" else f"the {item['kind']}"
+        rid = item["reservation"]
+        if item["job_id"]:
+            out += [f"# STOP: {what} was submitted as job {item['job_id']} (reservation {rid}, {item['state']}), and "
+                    f"{SUBMISSIONS_LOG} has no line for it: record it, then print what remains again:",
+                    f"cd {code} && python plan_hfss_array.py --log-submission {run} {_kind_token(item)} "
+                    f"{item['job_id']}"]
+        else:
+            out += [f"# STOP: {what} may have been submitted: reservation {rid} is {item['state']} and names no job. "
+                    "Check squeue -u $USER and sacct for it, then resolve it with one of",
+                    f"#   python -m bbsim.licence_guard --root {guard_root} reconcile --resolve {rid}=job:JOBID "
+                    "--reason TEXT",
+                    f"#   python -m bbsim.licence_guard --root {guard_root} reconcile --resolve {rid}=released "
+                    "--reason TEXT",
+                    "# and print what remains again; it then names the --log-submission line of a job:"]
+    out.append(f"cd {code} && python -m bbsim.array_submit remaining {shlex.quote(str(plan_path))} {plan_sha256}")
+    return out
+
+
+def _unaccounted_refusal(items: Sequence[Mapping], plan: Mapping, root: Path) -> str:
+    run = shlex.quote(str(plan["run_dir"]))
+    parts = []
+    for item in items:
+        if item["job_id"]:
+            parts.append(f"reservation {item['reservation']} ({item['state']}) was submitted as job {item['job_id']}, "
+                         f"which {SUBMISSIONS_LOG} does not record: record it with plan_hfss_array.py "
+                         f"--log-submission {run} {_kind_token(item)} {item['job_id']}")
+        else:
+            parts.append(f"reservation {item['reservation']} is {item['state']} and names no job: check squeue and "
+                         f"sacct, then python -m bbsim.licence_guard --root {shlex.quote(str(root))} reconcile "
+                         f"--resolve {item['reservation']}=job:JOBID (or =released) --reason TEXT")
+    return "; ".join(parts)
+
+
 # --- submission -------------------------------------------------------------------------------------------------------
 
 def submit(plan_path: Path, plan_sha256: str, what: str, *, class_name: str | None = None, indices: str | None = None,
@@ -509,6 +592,11 @@ def submit(plan_path: Path, plan_sha256: str, what: str, *, class_name: str | No
                                   f"({run_dir / SUBMISSIONS_LOG}); submit its failed indices with rerun --indices, and "
                                   f"print what remains of the plan's block with python -m bbsim.array_submit "
                                   f"remaining {shlex.quote(str(path))} {plan_sha256}")
+            unsure = [item for item in _unaccounted(guard, plan_sha256, lines)
+                      if item["kind"] == "array" and item["class"] == cls["name"]]
+            if unsure:
+                raise SubmitError(f"class {cls['name']} was or may have been submitted already, and nothing is "
+                                  f"submitted until that is settled: {_unaccounted_refusal(unsure, plan, guard.root)}")
         throttle = cls.get("throttle")
         if isinstance(throttle, bool) or not isinstance(throttle, int) or throttle < 1:
             raise SubmitError(f"class {cls['name']}'s throttle {throttle!r} is not a positive integer")
@@ -529,6 +617,10 @@ def submit(plan_path: Path, plan_sha256: str, what: str, *, class_name: str | No
     else:
         if class_name is not None or indices is not None:
             raise SubmitError(f"a {what} job takes no class or indices")
+        unsure = [item for item in _unaccounted(guard, plan_sha256, lines) if item["kind"] == what]
+        if unsure:
+            raise SubmitError(f"the {what} was or may have been submitted already, and nothing is submitted until "
+                              f"that is settled: {_unaccounted_refusal(unsure, plan, guard.root)}")
         if what == "monitor":
             if _get(plan, "slurm", "monitor", "enabled") is not True:
                 raise SubmitError("the plan runs no licence monitor (it was planned without --monitor-licences)")
@@ -586,17 +678,28 @@ def submit(plan_path: Path, plan_sha256: str, what: str, *, class_name: str | No
     return job
 
 
-def _after_stop(exc: BaseException, plan_path: Path, plan_sha256: str) -> str:
+def _after_stop(exc: BaseException, plan_path: Path, plan_sha256: str, *, guard: Any) -> str:
     """What a stopped ``--submit`` prints next: after a refusal (nothing reserved or submitted) what remains of the
-    block, ready to paste; after any other failure the command that prints it, to run once that failure is dealt
-    with."""
-    if isinstance(exc, (SubmitError, licence_guard.GuardRefused)):
+    block, ready to paste; after any other failure no block, but what settles it (the ``--log-submission`` line of a
+    job the guard knows, or ``reconcile --resolve`` first) and the command that prints what remains afterwards."""
+    if _is_refusal(exc):
         try:
-            return "Once the guard admits it, paste what remains:\n" + remaining_block(plan_path, plan_sha256)
-        except (SubmitError, OSError) as err:
+            return "Once the guard admits it, paste what remains:\n" + remaining_block(plan_path, plan_sha256,
+                                                                                       guard=guard)
+        except (SubmitError, licence_guard.GuardError, OSError) as err:
             return f"what remains cannot be printed ({_one_line(err)})"
-    return (f"its result is uncertain or unrecorded: do what the message above says first, then print what remains "
-            f"with python -m bbsim.array_submit remaining {shlex.quote(str(plan_path))} {plan_sha256}")
+    text = ("its result is uncertain or unrecorded: do what the message above says first (a reservation whose job is "
+            "unknown is settled with python -m bbsim.licence_guard reconcile --resolve), and record a job that was "
+            "submitted with plan_hfss_array.py --log-submission RUN KIND ID before anything is submitted again")
+    try:
+        path, plan = read_plan(plan_path, plan_sha256)
+        items = _unaccounted(guard, plan_sha256, _read_log(Path(plan["run_dir"])))
+        if items:
+            return text + ":\n" + "\n".join(_unaccounted_lines(items, plan, path, plan_sha256, guard.root))
+    except (SubmitError, licence_guard.GuardError, OSError, KeyError, TypeError, AttributeError):
+        pass
+    return (f"{text}; then print what remains with python -m bbsim.array_submit remaining "
+            f"{shlex.quote(str(plan_path))} {plan_sha256}")
 
 
 def submit_plan(plan_path: Path, plan_sha256: str, *, guard: Any, env: EnvironmentState | None = None) -> int:
@@ -620,7 +723,7 @@ def submit_plan(plan_path: Path, plan_sha256: str, *, guard: Any, env: Environme
             print(f"plan_hfss_array: --submit: class {name} was not submitted: {_one_line(exc)}. The arrays "
                   f"submitted before it ({', '.join(arrays) or 'none'}) keep running; no monitor or assembly was "
                   "submitted", file=sys.stderr)
-            print(_after_stop(exc, plan_path, plan_sha256))
+            print(_after_stop(exc, plan_path, plan_sha256, guard=guard))
             return 1
         arrays.append(job)
         print(f"array {name}: job {job}")
@@ -633,10 +736,11 @@ def submit_plan(plan_path: Path, plan_sha256: str, *, guard: Any, env: Environme
         except failures as exc:
             print(f"plan_hfss_array: --submit: the {what} was not submitted: {_one_line(exc)}; the arrays keep "
                   "running", file=sys.stderr)
-            stopped = stopped or exc
+            if stopped is None or (_is_refusal(stopped) and not _is_refusal(exc)):
+                stopped = exc                   # a failure that may have left a job decides over a refusal
     if stopped is None:
         return 0
-    print(_after_stop(stopped, plan_path, plan_sha256))
+    print(_after_stop(stopped, plan_path, plan_sha256, guard=guard))
     return 1
 
 
@@ -661,13 +765,22 @@ def change_throttle(plan_path: Path, plan_sha256: str, array_id: str, throttle: 
                                   f"record the change ({exc})") from exc
 
 
-def remaining_block(plan_path: Path, plan_sha256: str) -> str:
+def remaining_block(plan_path: Path, plan_sha256: str, *, guard: Any) -> str:
     """What remains of the plan's printed block (``array_plan.submission_block``) after the jobs in
     ``submissions.log``: the classes not yet submitted, the monitor when the plan runs one and it is not in the log,
     and the assembly unless one follows the last class's array in the log; the classes already submitted appear as
-    their literal ids, so the lines hold no variable they do not set. Nothing is submitted here."""
+    their literal ids, so the lines hold no variable they do not set. While ``guard`` holds a reservation of this plan
+    that was or may have been submitted and the log has no line for it (``_unaccounted``), no block is printed, only
+    what settles it, so nothing is printed to be submitted twice. Nothing is submitted here."""
     path, plan = read_plan(plan_path, plan_sha256)
+    _check_root(plan, guard)
     lines = _read_log(Path(plan["run_dir"]))
+    unsure = _unaccounted(guard, plan_sha256, lines)
+    if unsure:
+        try:
+            return "\n".join(_unaccounted_lines(unsure, plan, path, plan_sha256, guard.root))
+        except (KeyError, TypeError) as exc:
+            raise SubmitError(f"the plan {path} cannot give its lines: {exc!r} is missing or malformed") from None
     names = [c.get("name") for c in _get(plan, "classes") if isinstance(c, Mapping)]
     admitted: dict[str, str] = {}
     last_array = -1
@@ -883,11 +996,11 @@ def main(argv: list[str] | None = None, *, scheduler: Any = None, env: Environme
         if args.command == "job-field":
             print(job_field(args.name, environ=environ, root=args.root, module_root=module_root))
             return 0
-        if args.command == "remaining":
-            print(remaining_block(args.plan, args.sha256))
-            return 0
         root = args.root if args.root is not None else licence_guard.DEFAULT_ROOT
         guard = licence_guard.Guard(root, scheduler if scheduler is not None else licence_guard.SlurmScheduler())
+        if args.command == "remaining":
+            print(remaining_block(args.plan, args.sha256, guard=guard))
+            return 0
         if args.command == "throttle":
             change_throttle(args.plan, args.sha256, args.array_id, args.throttle, guard=guard)
             print(f"THROTTLE {args.array_id} {args.throttle}")

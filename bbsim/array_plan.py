@@ -1261,7 +1261,10 @@ def submission_block(plan_path: Path, plan_sha256: str, plan: Mapping[str, Any],
              'bbsim_stop() { echo "STOP: $1 was not submitted (exit $2); the arrays submitted before it keep '
              'running."; if [ "$2" = 2 ]; then echo "Nothing was reserved or submitted for it. Once the guard '
              f'admits it, paste what remains:"; {remaining}; else echo "Its result is uncertain or unrecorded: do '
-             f'what the message above says first, then print what remains: cd {code} && {remaining}"; fi; exit 1; }}']
+             'what the message above says first: settle a reservation whose job is unknown with python -m '
+             'bbsim.licence_guard reconcile --resolve, and record a job that was submitted with plan_hfss_array.py '
+             '--log-submission RUN KIND ID before anything is submitted again. Then print what remains (it names '
+             f'those lines exactly while one is needed): cd {code} && {remaining}"; fi; exit 1; }}']
     for name in names:
         if name not in admitted:
             lines.append(f'{name}=$({submit} array --class {name}) || bbsim_stop "class {name}" $?')
