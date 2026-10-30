@@ -13,31 +13,56 @@ Every run (HF-057): the code checkout's state is read once before the job starts
 launch timeout, must have opened the job's own copy, and records AEDT's process id and port; AEDT's temp directory is
 recorded and, by ``--aedt-temp``, pointed at the job (``bbsim.aedt_temp``); ``main`` owns its log handlers and turns
 SIGTERM into ``SystemExit(143)`` so the cleanup on the way out runs.
+
+Plan mode, one job-array task (HF-057, OR-037, OR-045, HF-058): ``--plan PLAN --plan-sha256 HEX [--plan-index N]
+[--log-level L]`` and no other option. ``plan_preflight`` checks everything before a job directory or AEDT exists, and
+any refusal exits 2: the plan's bytes have the given sha256; the index (by default ``SLURM_ARRAY_TASK_ID``, which must
+agree with ``--plan-index``) is a task of the plan; the plan is an ``array_run`` plan of its policy; its code is the
+checkout this module was imported from, clean at the plan's commit, with the plan's PyAEDT; the config, project,
+mapping record and (production) column-order reference copies have the plan's sha256, the record beside the project
+copy confirms the plan's dataset, and the reference fits this checkout's exporter and PyAEDT; the task's config
+(``array_plan.task_config`` of the captured config bytes) is the policy's and passes ``check_before_aedt``; its
+effective step along l is at most c/(4f) (OR-048) and its recorded lattice is the frozen rectangle's HF-045 lattice
+(``array_plan.predict_exit_lattice``); ``SLURM_CPUS_PER_TASK``, when set, is at least the plan's cores;
+``PYAEDT_DESKTOP_PORT`` and ``PYAEDT_PROCESS_ID`` are unset; the plan's guard is the shared one, named by
+``BBSIM_LICENCE_GUARD``, and an array task runs under its own ``array`` reservation; the job directory does not exist.
+The job is ``a<SLURM_ARRAY_JOB_ID>_<index>`` in an array, else ``<default_job_id>_<index>``. ``start.json`` is
+written before AEDT starts; ``run_job`` then compares the exit face's lattice with the plan's prediction before the
+solve and records the plan block in the manifest; ``bbsim.run_acceptance`` judges the run against its plan; once its
+report is written, ``done.json`` records the completion and its verdict, PASS or a deterministic FAIL. The log ends
+``done; manifest at <path>`` (exit 0) or ``completed; acceptance FAIL (<rows>); manifest at <path>`` (exit 1); a run
+that stops before the report writes no ``done.json`` (exit 1), and a launch lease the guard refuses is named as such.
 """
 from __future__ import annotations
 
 import argparse
 import copy
 import functools
+import hashlib
 import json
 import logging
 import math
 import os
+import re
 import shutil
 import signal
+import socket
+import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+import tomllib
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from bbsim import aedt_temp as tempdir
-from bbsim import dataset_v2, licence_guard
+from bbsim import array_plan, dataset_v2, frequency_grid, licence_guard
 from bbsim.config import RunConfig, build_config, config_to_dict, load_config
 from bbsim.dataset_record import REEXPORT_TOOL, build_dataset_record, build_dataset_record_v2, modes_record_v2
 from bbsim.dataset_v2 import DatasetV2Error
@@ -45,19 +70,45 @@ from bbsim.geometry_spec import is_vacuum, vacuum_refusal
 from bbsim.manifest import (REPO_ROOT, EnvironmentState, EnvironmentStateError, build_manifest, environment_state,
                             sha256_file, write_json)
 from bbsim.naming import dataset_record_name, frequency_design_name, frequency_label, last_adaptive_solution
-from bbsim.paths import JobDirs, create_job_dirs, default_job_id
+from bbsim.paths import JobDirs, create_job_dirs, default_job_id, job_root
 from bbsim.sampling import incident_angle_values, incoming_power_w
 from bbsim.schema import KEY_COLUMNS
-from bbsim.session import DEFAULT_LAUNCH_TIMEOUT_S
+from bbsim.session import DEFAULT_LAUNCH_TIMEOUT_S, launch_timeout_setting
 
 log = logging.getLogger("bbsim.run")
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 EXIT_SIGTERM = 143   # 128 + SIGTERM, as a shell reports a process ended by it
 
+# Plan mode (HF-057): the options it takes, the variables that would attach PyAEDT to another desktop, its records
+PLAN_MODE_OPTIONS = ("plan", "plan_sha256", "plan_index", "log_level")
+ATTACH_VARIABLES = ("PYAEDT_DESKTOP_PORT", "PYAEDT_PROCESS_ID")
+START_NAME, DONE_NAME = "start.json", "done.json"
+START_SLURM_VARIABLES = ("SLURM_ARRAY_JOB_ID", "SLURM_ARRAY_TASK_ID", "SLURM_JOB_ID", "SLURMD_NODENAME",
+                         "SLURM_CPUS_PER_TASK", "SLURM_MEM_PER_NODE", "SLURM_RESTART_COUNT")
+SCONTROL_TIMEOUT_S = 30
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_DIGITS = re.compile(r"[0-9]+")
+_UNSET = object()
+
+
+def _task_index_arg(text: str) -> int:
+    if not _DIGITS.fullmatch(text):
+        raise argparse.ArgumentTypeError(f"a task index is a nonnegative integer, got {text!r}")
+    return int(text)
+
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Headless HFSS gap simulation for one frequency.")
+    p.add_argument("--plan", type=Path, default=None, metavar="PLAN",
+                   help="Plan mode (HF-057): run one task of this frozen job-array plan.json; takes --plan-sha256, "
+                        "--plan-index and --log-level only, since the plan supplies everything else")
+    p.add_argument("--plan-sha256", default=None, metavar="HEX",
+                   help="plan mode: the sha256 the submission recorded for the plan (plan.sha256); the plan's bytes "
+                        "must have it")
+    p.add_argument("--plan-index", type=_task_index_arg, default=None, metavar="N",
+                   help="plan mode: the task's index in the plan; by default SLURM_ARRAY_TASK_ID, which must agree "
+                        "when both are given")
     p.add_argument("--config", type=Path, default=None,
                    help="TOML run configuration (see configs/); required unless --from-solved")
     p.add_argument("--from-solved", type=Path, default=None, metavar="JOB_DIR",
@@ -91,6 +142,21 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     args = p.parse_args(argv)
     if not isinstance(logging.getLevelName(args.log_level.upper()), int):
         p.error(f"--log-level {args.log_level!r} is not a logging level")
+    if args.plan is not None:
+        # Parsed again into a namespace pre-filled with a marker, so an option given at its default value, or
+        # abbreviated, is seen as given.
+        given = vars(p.parse_args(argv, namespace=argparse.Namespace(**dict.fromkeys(vars(args), _UNSET))))
+        others = sorted("--" + dest.replace("_", "-") for dest, value in given.items()
+                        if value is not _UNSET and dest not in PLAN_MODE_OPTIONS)
+        if others:
+            p.error(f"--plan takes only --plan-sha256, --plan-index and --log-level, since the plan supplies "
+                    f"everything else (HF-057); drop {', '.join(others)}")
+        if args.plan_sha256 is None:
+            p.error("--plan needs --plan-sha256, the plan's sha256 the submission recorded")
+        if not _SHA256.fullmatch(args.plan_sha256):
+            p.error(f"--plan-sha256 must be 64 lowercase hex digits, got {args.plan_sha256!r}")
+    elif args.plan_sha256 is not None or args.plan_index is not None:
+        p.error("--plan-sha256 and --plan-index belong to --plan")
     if not (math.isfinite(args.launch_timeout_s) and args.launch_timeout_s > 0):
         p.error(f"--launch-timeout-s must be a finite number of seconds above 0, got {args.launch_timeout_s!r}")
     try:
@@ -303,7 +369,8 @@ def check_before_aedt(cfg: RunConfig, reference: Mapping | None) -> None:
     job-array plan to supply; HF-057, OR-047), then an acceptance reference_job that is not an existing directory: the
     job that is to judge this one must exist before a licensed solve (CDX-039)."""
     if cfg.solver.frequency_ghz is None:
-        raise ValueError("no frequency: give solver.frequency_ghz in the config, --frequency-ghz, or a plan")
+        raise ValueError("no frequency: give solver.frequency_ghz in the config or --frequency-ghz; a job-array task "
+                         "takes its frequency from its plan (--plan)")
     reference_job = cfg.acceptance.reference_job
     if reference_job is not None and not Path(reference_job).is_dir():
         raise ValueError(f"[acceptance] reference_job {reference_job} is not an existing job directory: the "
@@ -339,9 +406,10 @@ def check_before_aedt(cfg: RunConfig, reference: Mapping | None) -> None:
         raise DatasetV2Error(f"the column-order reference must be an object, got {type(reference).__name__}")
 
 
-def stage_project(cfg: RunConfig, dirs: JobDirs) -> StagedProject:
+def stage_project(cfg: RunConfig, dirs: JobDirs, *, require_record: bool = False) -> StagedProject:
     """Check the config's dataset_id against the record beside the prepared project, then copy the project into the
-    job directory; both before any AEDT session, which opens the copy."""
+    job directory; both before any AEDT session, which opens the copy. A single run only warns when no record
+    confirms the dataset; ``require_record`` (a plan's task) refuses then (HF-057)."""
     from bbsim.mapping import recorded_dataset_id
 
     source = cfg.project.path
@@ -353,9 +421,12 @@ def stage_project(cfg: RunConfig, dirs: JobDirs) -> StagedProject:
         raise ValueError(f"config dataset_id {cfg.project.dataset_id!r} disagrees with {record}, which gives "
                          f"{recorded_id!r} for design {cfg.project.design!r} object {cfg.geometry.object!r}")
     if recorded_id is None:
-        log.warning("dataset_id %r not confirmed: %s", cfg.project.dataset_id,
-                    f"{record} has no entry for {cfg.project.design}/{cfg.geometry.object}" if record
-                    else f"no .mapping.json or .build.json beside {source}")
+        why = (f"{record} has no entry for {cfg.project.design}/{cfg.geometry.object}" if record
+               else f"no .mapping.json or .build.json beside {source}")
+        if require_record:
+            raise ValueError(f"dataset_id {cfg.project.dataset_id!r} not confirmed: {why}; a job-array task runs only "
+                             "a project its frozen record confirms (HF-057)")
+        log.warning("dataset_id %r not confirmed: %s", cfg.project.dataset_id, why)
     job_project = dirs.project / source.name
     shutil.copy2(source, job_project)
     return StagedProject(source=source, source_sha=sha256_file(source), job_project=job_project,
@@ -364,29 +435,33 @@ def stage_project(cfg: RunConfig, dirs: JobDirs) -> StagedProject:
 
 def run_job(cfg: RunConfig, dirs: JobDirs, job_id: str, reference: dict | None = None, *,
             aedt_temp: tempdir.TempSettings | None = None, launch_timeout_s: float = DEFAULT_LAUNCH_TIMEOUT_S,
-            environment: EnvironmentState | None = None) -> Path:
+            environment: EnvironmentState | None = None, expected_lattice: Mapping | None = None,
+            plan_record: Mapping | None = None) -> Path:
     """One frequency: stage the project, open one AEDT session, solve, extract both polarizations, write.
 
     ``reference`` is the column-order reference object every schema-2 job but the reference job embeds. ``aedt_temp``
     (default off) and ``launch_timeout_s`` set the session (HF-057); ``environment`` is the code checkout's state,
-    read here before anything is copied when the caller has not read it."""
+    read here before anything is copied when the caller has not read it. A job-array task (plan mode) also gives
+    ``expected_lattice``, its plan's predicted exit lattice, which the exit face must give before the solve, and
+    ``plan_record`` {path, sha256, index}, the manifest's ``plan`` block; it runs only a project its record
+    confirms."""
     from bbsim.session import aedt_versions
 
     t_start = time.perf_counter()
     check_before_aedt(cfg, reference)
     environment = environment_state(REPO_ROOT) if environment is None else environment
     temp = tempdir.TempSettings() if aedt_temp is None else aedt_temp
-    staged = stage_project(cfg, dirs)
+    staged = stage_project(cfg, dirs, require_record=plan_record is not None)
     with open_session(staged.job_project, cfg.project.design, cfg.project.aedt_version, dirs, temp,
                       launch_timeout_s) as session:
         hfss = session.hfss
         if cfg.output.schema == 2:
             # A stale or unreadable version would stop the run after its licensed solve; it costs seconds here.
             _check_versions_for_reference(reference, aedt_versions(hfss))
-        solved = prepare_and_solve(cfg, dirs, job_id, hfss, staged)
+        solved = prepare_and_solve(cfg, dirs, job_id, hfss, staged, expected_lattice=expected_lattice)
         try:
             return extract_and_write(cfg, dirs, job_id, hfss, solved, t_start, reference, None,
-                                     environment=environment, session=session)
+                                     environment=environment, session=session, plan_record=plan_record)
         except Exception:
             # The licensed solve is saved in the job's copy (prepare_and_solve) and nothing here removes it; say so,
             # so that a failed check after it never ends in deleting the job and solving again.
@@ -444,11 +519,62 @@ def _check_versions_for_reference(reference: Mapping | None, versions: Mapping[s
         dataset_v2.check_reference_compatible(dict(reference), aedt, pyaedt, REPO_ROOT)
 
 
-def prepare_and_solve(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, staged: StagedProject) -> SolvedContext:
+def lattice_differences(expected: Mapping, lo: Sequence[float], hi: Sequence[float], step: Sequence[float],
+                        counts: Sequence[int]) -> list[str]:
+    """How the lattice (``lo``, ``hi``, ``step``, ``counts`` along x_e, y_e, z_e, mm) differs from a plan task's
+    predicted one, ``expected`` (``array_plan.predict_exit_lattice``'s record): the bounds to ``dataset_v2.NODE_TOL``
+    of the predicted step (the exit-plane tolerance on the stepless x_e axis), the step to ``NODE_TOL`` relative and
+    the node count exactly, as the array_run check compares them (HF-045, HF-057). A record that is not a lattice is
+    one difference."""
+    from bbsim.extract import PLANE_TOL_M
+
+    try:
+        want = {name: [float(v) for v in expected[name]] for name in ("lo_mm", "hi_mm", "step_mm")}
+        want_counts = list(expected["counts"])
+        if not (all(len(v) == 3 for v in want.values()) and len(want_counts) == 3
+                and all(type(c) is int for c in want_counts)):
+            raise ValueError("three values per field")
+    except (KeyError, TypeError, ValueError) as exc:
+        return [f"the predicted lattice {expected!r} is not a lattice record ({exc})"]
+    problems = []
+    for axis, name in enumerate(("x_e", "y_e", "z_e")):
+        s = want["step_mm"][axis]
+        tol = dataset_v2.NODE_TOL * s if s > 0.0 else PLANE_TOL_M * 1e3
+        if not (abs(lo[axis] - want["lo_mm"][axis]) <= tol and abs(hi[axis] - want["hi_mm"][axis]) <= tol):
+            problems.append(f"along {name} it spans {lo[axis]!r} to {hi[axis]!r} mm, the prediction "
+                            f"{want['lo_mm'][axis]!r} to {want['hi_mm'][axis]!r} mm")
+        if not abs(step[axis] - s) <= dataset_v2.NODE_TOL * s:
+            problems.append(f"along {name} it steps {step[axis]!r} mm, the prediction {s!r} mm")
+        if counts[axis] != want_counts[axis]:
+            problems.append(f"along {name} it has {counts[axis]} nodes, the prediction {want_counts[axis]}")
+    return problems
+
+
+def _require_expected_lattice(face_geometry: Any, lattice: Any, expected: Mapping) -> None:
+    """Plan mode (HF-057): the exit face as AEDT describes it, before the solve, must be a rectangle whose HF-045
+    lattice is the one the plan predicted from the frozen geometry; otherwise nothing is solved."""
+    problems = []
+    shape = face_geometry.cross_section.get("shape")
+    if shape != "rectangle":
+        problems.append(f"the exit cross-section is {shape!r}, and the plan predicts a rectangle")
+    if lattice is None:
+        problems.append("the run exports no manual lattice")
+    else:
+        problems += lattice_differences(expected, lattice.lo_mm, lattice.hi_mm, lattice.step_mm, lattice.counts)
+    if problems:
+        raise RuntimeError("the exit face's lattice is not the plan's prediction from the frozen geometry, so nothing "
+                           "is solved (HF-057): " + "; ".join(problems))
+    log.info("exit lattice %s is the plan's prediction", " x ".join(str(n) for n in lattice.counts))
+
+
+def prepare_and_solve(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, staged: StagedProject, *,
+                      expected_lattice: Mapping | None = None) -> SolvedContext:
     """Set up the run design in the open job copy as the legacy script did, check what can be checked before the
     solve, solve, and verify that every requested polarization was solved. Returns what extraction needs.
 
-    ``staged`` is ``stage_project``'s result: the copy that ``hfss`` opened, made and hashed before the session."""
+    ``staged`` is ``stage_project``'s result: the copy that ``hfss`` opened, made and hashed before the session.
+    ``expected_lattice`` (plan mode) is the plan's predicted exit lattice, which the face's must equal before the
+    solve (HF-057)."""
     from bbsim.extract import ExtractionContext, describe_exit_face, exit_grid
     from bbsim.geometry import create_exit_coordinate_system, create_exit_face_list, select_faces
     from bbsim.hfss_setup import (
@@ -534,6 +660,8 @@ def prepare_and_solve(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sta
     lattice = exit_grid(face_geometry, cfg.exit_field) if cfg.exit_field.manual else None
     if lattice is not None:
         log.info("exit lattice: %d points per incident angle (%s)", lattice.lattice_points, face_geometry.bounds_method)
+    if expected_lattice is not None:
+        _require_expected_lattice(face_geometry, lattice, expected_lattice)
     if cfg.output.schema == 2:
         _require_v2_lattice(face_geometry.cross_section, lattice)
     hfss.save_project()
@@ -631,7 +759,8 @@ def _write_reference_evidence(scratch: Path, reference: Mapping, raw: Mapping[in
 
 def extract_and_write(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, solved: SolvedContext, t_start: float,
                       reference: dict | None = None, reexport: dict | None = None, *,
-                      environment: EnvironmentState, session: OpenSession | None = None) -> Path:
+                      environment: EnvironmentState, session: OpenSession | None = None,
+                      plan_record: Mapping | None = None) -> Path:
     """Extract every polarization into memory, check, then write the CSVs, the manifest and the sidecar.
 
     Order (HF-052): both polarizations are extracted and checked for finite values; under
@@ -641,7 +770,8 @@ def extract_and_write(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sol
     exactly as before. ``reexport`` (schema 2 only) is the --from-solved provenance for the sidecar; ``t_start`` is
     the job's start on ``time.perf_counter``. ``environment`` is the code checkout's state, which the caller read
     before the session: this runs after the licensed solve, so it never reads git itself. ``session``'s records go
-    into the manifest, and its ``before_write`` runs after the last AEDT call (HF-057). Returns the manifest path.
+    into the manifest, and its ``before_write`` runs after the last AEDT call (HF-057). ``plan_record`` (plan mode)
+    is the manifest's ``plan`` block {path, sha256, index}; a single run records none. Returns the manifest path.
     """
     from bbsim.convergence import qualify
     from bbsim.extract import RIM_BAND_REL, evaluate_exit_powers, extract_far_field, extract_waveguide
@@ -777,6 +907,9 @@ def extract_and_write(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sol
         exit_field["raw_powers_per_key"] = result.raw_powers_per_key
         extra["transmittance_checks"] = {"flux_over_abs_re_s": result.flux_over_abs_re_s,
                                          "rho_per_key": result.rho_per_key}
+    if plan_record is not None:
+        extra["plan"] = {"path": str(plan_record["path"]), "sha256": plan_record["sha256"],
+                         "index": plan_record["index"]}
     manifest = build_manifest(
         environment=environment,
         config=config_to_dict(cfg),
@@ -1120,9 +1253,7 @@ def _run_logged(what: str, run: Callable[[], Path]) -> int:
     try:
         manifest = run()
     except SystemExit as exc:
-        log.error("%s stopped by SystemExit(%s)%s; what the cleanup on the way out did (the session's release, the "
-                  "launch lease, AEDT's temp directory) is logged above", what, exc.code,
-                  " from SIGTERM" if exc.code == EXIT_SIGTERM else "")
+        _log_system_exit(what, exc)
         raise
     except Exception:  # noqa: BLE001 - report and exit non-zero; the session is already released
         log.exception("%s failed", what)
@@ -1166,12 +1297,481 @@ def _main_from_solved(args: argparse.Namespace, cleanup: ExitStack) -> int:
         launch_timeout_s=args.launch_timeout_s, environment=environment))
 
 
+# --- plan mode: one task of a frozen job-array plan (HF-057, OR-037, OR-045, HF-058) ---------------------------------
+
+class PlanRefused(ValueError):
+    """A plan-mode task refused by its pre-flight, before any job directory or AEDT exists (exit 2)."""
+
+
+@dataclass(frozen=True)
+class TaskContext:
+    """What ``plan_preflight`` verified and the run uses: the plan (parsed from the bytes whose sha256 was checked),
+    the task's index and record, its run configuration (``array_plan.task_config`` of the captured config bytes), the
+    column-order reference parsed from its checked bytes (None for a probe), the job id and directory, the plan's
+    predicted exit lattice, the policy, the code checkout's state, the temp-directory settings and launch timeout, the
+    guard and reservation (``licence_guard.check_job_guard``) and the warnings to log once the job's log exists."""
+
+    plan: dict
+    index: int
+    cfg: RunConfig
+    reference: dict | None
+    job_id: str
+    expected_lattice: dict
+    policy: str
+    state: EnvironmentState
+    plan_path: Path
+    plan_sha256: str
+    task: dict
+    aedt_temp: tempdir.TempSettings
+    launch_timeout_s: float
+    guard: dict
+    job_root: Path
+    array_job_id: str | None = None
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def plan_record(self) -> dict:
+        """The plan block of the manifest and ``start.json``: {path, sha256, index}."""
+        return {"path": str(self.plan_path), "sha256": self.plan_sha256, "index": self.index}
+
+
+def _plan_entry(plan: Mapping, name: str) -> Mapping:
+    entry = plan.get(name)
+    if not isinstance(entry, Mapping):
+        raise PlanRefused(f"the plan's {name} must be an object, got {entry!r}")
+    return entry
+
+
+def _absolute(value: object, what: str) -> Path:
+    if not isinstance(value, str) or not os.path.isabs(value):
+        raise PlanRefused(f"the plan's {what} must be an absolute path, as every path a plan records is, got {value!r}")
+    return Path(value)
+
+
+def _frozen_bytes(entry: Mapping, what: str) -> tuple[Path, bytes]:
+    """A plan input copy's bytes, read once, which must have the sha256 the plan records."""
+    copy = _absolute(entry.get("copy"), f"{what}.copy")
+    try:
+        data = copy.read_bytes()
+    except OSError as exc:
+        raise PlanRefused(f"the plan's {what} copy {copy} cannot be read ({exc})") from None
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != entry.get("sha256"):
+        raise PlanRefused(f"the plan's {what} copy {copy} has sha256 {digest}, the plan records "
+                          f"{entry.get('sha256')!r}: it changed after the plan was made")
+    return copy, data
+
+
+def _resolve_index(index: int | None, env: Mapping[str, str]) -> int:
+    value = env.get("SLURM_ARRAY_TASK_ID")
+    if value:
+        if not _DIGITS.fullmatch(value):
+            raise PlanRefused(f"SLURM_ARRAY_TASK_ID={value!r} is not a task index")
+        if index is not None and index != int(value):
+            raise PlanRefused(f"--plan-index {index} disagrees with SLURM_ARRAY_TASK_ID={value}")
+        return int(value)
+    if index is None:
+        raise PlanRefused("no task index: give --plan-index N, or run as a task of the plan's array "
+                          "(SLURM_ARRAY_TASK_ID)")
+    return index
+
+
+def _check_code(plan: Mapping) -> EnvironmentState:
+    """The plan's code: the checkout this module was imported from, at the plan's commit with no change to a tracked
+    file, and the plan's PyAEDT (``manifest.environment_state``, whose git error or timeout refuses)."""
+    code = _plan_entry(plan, "code")
+    repo = _absolute(code.get("repo"), "code.repo")
+    try:
+        same = os.path.samefile(repo, REPO_ROOT)
+    except OSError:
+        same = False
+    if not same:
+        raise PlanRefused(f"the plan's code {repo} is not the checkout this runner was imported from ({REPO_ROOT}): "
+                          "the task must run the plan's own worktree")
+    state = environment_state(repo)
+    if state.commit != code.get("commit"):
+        raise PlanRefused(f"the code {repo} is at {state.commit}, not the plan's commit {code.get('commit')!r}: its "
+                          "HEAD moved after the plan was made")
+    if state.dirty:
+        raise PlanRefused(f"the code {repo} has uncommitted changes to tracked files; the task runs the plan's commit")
+    if state.pyaedt_version != code.get("pyaedt_version"):
+        raise PlanRefused(f"PyAEDT {state.pyaedt_version} is installed, and the plan was made with "
+                          f"{code.get('pyaedt_version')!r}")
+    return state
+
+
+def _check_record(plan: Mapping, cfg: RunConfig) -> None:
+    """The mapping record frozen beside the project copy: the plan's bytes, the record ``stage_project`` reads, and it
+    confirms the plan's dataset for the config's design and object. A single run only warns without one (HF-057)."""
+    from bbsim.mapping import recorded_dataset_id
+
+    project = _plan_entry(plan, "project")
+    entry = project.get("record")
+    if not isinstance(entry, Mapping):
+        raise PlanRefused(f"the plan's project records no frozen mapping record {{source, copy, sha256}}, got "
+                          f"{entry!r}")
+    copy, _ = _frozen_bytes(entry, "project.record")
+    try:
+        recorded, found = recorded_dataset_id(cfg.project.path, cfg.project.design, cfg.geometry.object)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise PlanRefused(f"the record beside the project copy {cfg.project.path} cannot be read "
+                          f"({type(exc).__name__}: {exc})") from None
+    if found is None or Path(found).resolve() != copy.resolve():
+        raise PlanRefused(f"the record beside the project copy {cfg.project.path} is {found}, not the plan's frozen "
+                          f"record {copy}")
+    if recorded != plan.get("dataset_id"):
+        raise PlanRefused(f"the frozen record {copy} gives {recorded!r} for {cfg.project.design}/{cfg.geometry.object}, "
+                          f"not the plan's dataset {plan.get('dataset_id')!r}")
+
+
+def _check_policy(plan: Mapping, policy: str, cfg: RunConfig, reference: Mapping | None) -> None:
+    if cfg.acceptance.kind != "array_run":
+        raise PlanRefused(f"the task config's acceptance kind is {cfg.acceptance.kind!r}, not 'array_run'")
+    if cfg.project.dataset_id != plan.get("dataset_id"):
+        raise PlanRefused(f"the task config's dataset_id {cfg.project.dataset_id!r} is not the plan's "
+                          f"{plan.get('dataset_id')!r}")
+    pols = sorted(cfg.output.polarizations)
+    if policy == "production":
+        if cfg.output.schema != 2 or pols != [0, 1] or reference is None:
+            raise PlanRefused(f"a production plan runs schema 2, both polarizations, with the HF-041 column-order "
+                              f"reference; this task's config writes schema {cfg.output.schema}, polarizations {pols}, "
+                              f"and the plan records {'a' if reference is not None else 'no'} reference")
+        return
+    exc = cfg.excitation
+    keys = (len(incident_angle_values(exc.theta_lower_deg, exc.theta_upper_deg, exc.theta_step_deg))
+            * len(incident_angle_values(exc.phi_lower_deg, exc.phi_upper_deg, exc.phi_step_deg)))
+    if cfg.output.schema != 1 or pols != [0] or keys != 1:
+        raise PlanRefused(f"a probe plan runs the schema-1 single-angle diagnostic, one key and Ephi=0 exported "
+                          f"(HF-058); this task's config writes schema {cfg.output.schema}, polarizations {pols}, "
+                          f"{keys} keys")
+
+
+def _check_lattice(task: Mapping, cfg: RunConfig, index: int) -> dict:
+    """The task's effective step along l, at most c/(4f) (OR-048), and its recorded lattice, the frozen rectangle's
+    HF-045 lattice at that step (``array_plan.predict_exit_lattice``, the planner's own). Returns the recorded one."""
+    frequency = task.get("frequency_ghz")
+    effective = task.get("effective_l_resolution_mm")
+    try:
+        limit = frequency_grid.max_l_step_mm(frequency)
+        if isinstance(effective, bool) or not isinstance(effective, (int, float)) or not effective > 0:
+            raise ValueError(f"effective_l_resolution_mm {effective!r} is not a positive step")
+        if effective > limit:
+            raise ValueError(f"its effective step along l {effective!r} mm exceeds c/(4f) = {limit:.7g} mm at "
+                             f"{frequency!r} GHz (OR-048)")
+        predicted = json.loads(json.dumps(array_plan.predict_exit_lattice(cfg, effective)))
+    except (frequency_grid.GridError, ValueError) as exc:
+        raise PlanRefused(f"task {index}: {exc}") from None
+    recorded = task.get("lattice")
+    if recorded != predicted:
+        detail = (lattice_differences(recorded, predicted["lo_mm"], predicted["hi_mm"], predicted["step_mm"],
+                                      predicted["counts"]) if isinstance(recorded, Mapping) else [])
+        raise PlanRefused(f"task {index}'s recorded lattice {recorded!r} is not the frozen rectangle's HF-045 lattice "
+                          f"{predicted!r}" + (f": {'; '.join(detail)}" if detail else ""))
+    if task.get("l_step_mm") != predicted["step_mm"][1] or predicted["step_mm"][1] > limit:
+        raise PlanRefused(f"task {index}'s l_step_mm {task.get('l_step_mm')!r} is not its lattice's fitted step along "
+                          f"l {predicted['step_mm'][1]!r} mm, at most c/(4f) = {limit:.7g} mm (OR-048)")
+    return recorded
+
+
+def _check_guard(plan: Mapping, env: Mapping[str, str]) -> tuple[dict, str | None]:
+    """The plan's guard is the shared one every launch lease takes (OR-045), named by ``BBSIM_LICENCE_GUARD``; an
+    array task runs under its own ``array`` reservation, bound to its array job (``licence_guard.check_job_guard``)."""
+    guard_dir = _absolute(plan.get("guard_dir"), "guard_dir")
+    try:
+        here, shared = guard_dir.resolve(strict=True), Path(licence_guard.DEFAULT_ROOT).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise PlanRefused(f"the plan's guard {guard_dir} or the shared guard {licence_guard.DEFAULT_ROOT} cannot be "
+                          f"reached ({exc})") from None
+    if here != shared:
+        raise PlanRefused(f"the plan's guard_dir {guard_dir} is not the shared guard {shared}, whose launch lease every "
+                          "AEDT session takes (OR-045)")
+    array_job = env.get("SLURM_ARRAY_JOB_ID") or None
+    if array_job is not None and not _DIGITS.fullmatch(array_job):
+        raise PlanRefused(f"SLURM_ARRAY_JOB_ID={array_job!r} is not a job id")
+    found = licence_guard.check_job_guard(kinds=("array",) if array_job else None, env=env, root=guard_dir)
+    return found, array_job
+
+
+def plan_preflight(plan_path: Path, plan_sha256: str, index: int | None, env: Mapping[str, str]) -> TaskContext:
+    """Every check of a job-array task before a job directory or AEDT exists (the module docstring's list), reading
+    the plan's bytes and each frozen input's once and the job's variables from ``env`` only. Raises ``PlanRefused``,
+    ``licence_guard.GuardError``, ``EnvironmentStateError``, ``ImportError`` (no PyAEDT) or another ``ValueError``
+    (a config the overrides cannot build), each a refusal (exit 2)."""
+    plan_path = Path(os.path.abspath(plan_path))
+    try:
+        data = plan_path.read_bytes()
+    except OSError as exc:
+        raise PlanRefused(f"the plan {plan_path} cannot be read ({exc})") from None
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != plan_sha256:
+        raise PlanRefused(f"the plan {plan_path} has sha256 {digest}, not the {plan_sha256} this task was given")
+    try:
+        plan = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise PlanRefused(f"the plan {plan_path} is not JSON ({exc})") from None
+    if not isinstance(plan, dict) or plan.get("schema") != array_plan.PLAN_SCHEMA:
+        raise PlanRefused(f"the plan {plan_path} is not a {array_plan.PLAN_SCHEMA} plan")
+    index = _resolve_index(index, env)
+    tasks = plan.get("tasks") if isinstance(plan.get("tasks"), list) else []
+    found = [t for t in tasks if isinstance(t, dict) and type(t.get("index")) is int and t["index"] == index]
+    if len(found) != 1:
+        raise PlanRefused(f"the plan holds {len(found)} records of task {index}, not 1")
+    task = found[0]
+    policy = plan.get("policy")
+    if policy not in ("production", "probe") or plan.get("probe") is not (policy == "probe"):
+        raise PlanRefused(f"the plan's policy {policy!r} and probe flag {plan.get('probe')!r} are not production or "
+                          "probe")
+    if plan.get("acceptance_kind") != "array_run":
+        raise PlanRefused(f"the plan's acceptance_kind is {plan.get('acceptance_kind')!r}, not 'array_run'")
+
+    state = _check_code(plan)
+    _, config_bytes = _frozen_bytes(_plan_entry(plan, "config"), "config")
+    project = _plan_entry(plan, "project")
+    project_copy = _absolute(project.get("copy"), "project.copy")
+    try:
+        project_sha = sha256_file(project_copy)
+    except OSError as exc:
+        raise PlanRefused(f"the plan's project copy {project_copy} cannot be read ({exc})") from None
+    if project_sha != project.get("sha256"):
+        raise PlanRefused(f"the plan's project copy {project_copy} has sha256 {project_sha}, the plan records "
+                          f"{project.get('sha256')!r}: it changed after the plan was made")
+    reference = None
+    entry = plan.get("column_order_reference")
+    if policy == "probe" and entry is not None:
+        raise PlanRefused("a probe plan records no column-order reference (its schema-1 output neither needs nor "
+                          f"applies one), and this one records {entry!r}")
+    if policy == "production":
+        if not isinstance(entry, Mapping):
+            raise PlanRefused("a production plan records the HF-041 column-order reference its schema-2 runs embed, "
+                              "and this one records none")
+        _, reference_bytes = _frozen_bytes(entry, "column_order_reference")
+        try:
+            reference = json.loads(reference_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise PlanRefused(f"the plan's column-order reference copy is not JSON ({exc})") from None
+        if not isinstance(reference, dict):
+            raise PlanRefused("the plan's column-order reference copy is not a JSON object")
+        dataset_v2.check_reference_before_aedt(reference, state.pyaedt_version, REPO_ROOT)
+    try:
+        raw = tomllib.loads(config_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise PlanRefused(f"the plan's config copy is not TOML ({exc})") from None
+    cfg = array_plan.task_config(plan, index, raw_config=raw)
+    _check_record(plan, cfg)
+    _check_policy(plan, policy, cfg, reference)
+    check_before_aedt(cfg, reference)
+    expected_lattice = _check_lattice(task, cfg, index)
+    try:
+        temp = tempdir.TempSettings(**task["aedt_temp"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PlanRefused(f"task {index}'s aedt_temp {task.get('aedt_temp')!r} cannot be used: {exc}") from None
+    aedt = _plan_entry(plan, "aedt")
+    try:
+        launch_timeout_setting(aedt.get("launch_timeout_s"))
+    except ValueError as exc:
+        raise PlanRefused(f"the plan's aedt.launch_timeout_s: {exc}") from None
+
+    warnings = []
+    cpus = env.get("SLURM_CPUS_PER_TASK")
+    if cpus:
+        if not _DIGITS.fullmatch(cpus):
+            raise PlanRefused(f"SLURM_CPUS_PER_TASK={cpus!r} is not a number of CPUs")
+        if int(cpus) < cfg.solver.cores:
+            raise PlanRefused(f"SLURM_CPUS_PER_TASK = {cpus}, fewer than the plan's {cfg.solver.cores} cores")
+        if int(cpus) > cfg.solver.cores:
+            warnings.append(f"SLURM_CPUS_PER_TASK = {cpus}, more than the plan's {cfg.solver.cores} cores; the solve "
+                            f"uses {cfg.solver.cores}")
+    attach = [name for name in ATTACH_VARIABLES if name in env]
+    if attach:
+        raise PlanRefused(f"{', '.join(attach)} set: PyAEDT 1.7.0 would attach to that desktop instead of starting "
+                          "its own; the array script unsets every PYAEDT_* variable")
+    guard, array_job = _check_guard(plan, env)
+    job_id = f"a{array_job}_{index}" if array_job else f"{default_job_id(env)}_{index}"
+    root = job_root(cfg.output.root, cfg.project.dataset_id, cfg.solver.frequency_ghz, job_id)
+    if os.path.lexists(root):
+        raise PlanRefused(f"the job directory {root} already exists")
+    return TaskContext(plan=plan, index=index, cfg=cfg, reference=reference, job_id=job_id,
+                       expected_lattice=expected_lattice, policy=policy, state=state, plan_path=plan_path.resolve(),
+                       plan_sha256=digest, task=task, aedt_temp=temp,
+                       launch_timeout_s=float(aedt.get("launch_timeout_s")), guard=guard, job_root=root,
+                       array_job_id=array_job, warnings=tuple(warnings))
+
+
+def slurm_time_limit(job_id: str | None) -> dict:
+    """The job's ``TimeLimit`` as ``scontrol show job`` reports it, for ``start.json``: {value, error}. Never raises:
+    a record must not stop the run."""
+    if not job_id:
+        return {"value": None, "error": "not in a Slurm job (no SLURM_JOB_ID)"}
+    if not _DIGITS.fullmatch(job_id):
+        return {"value": None, "error": f"SLURM_JOB_ID={job_id!r} is not a job id"}
+    try:
+        run = subprocess.run(["scontrol", "show", "job", job_id], capture_output=True, text=True,
+                             timeout=SCONTROL_TIMEOUT_S, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"value": None, "error": f"scontrol could not run ({exc})"}
+    match = re.search(r"\bTimeLimit=(\S+)", run.stdout)
+    if run.returncode != 0 or match is None:
+        return {"value": None, "error": f"scontrol show job {job_id} exited {run.returncode} without a TimeLimit "
+                                        f"({run.stderr.strip()[:200]})"}
+    return {"value": match.group(1), "error": None}
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _write_json_atomic(path: Path, data: Any) -> None:
+    """``data`` as JSON at ``path`` through a temporary file in the same directory and ``os.replace``, so a reader never
+    sees part of it."""
+    tmp = path.with_name(f".{path.name}.tmp")
+    try:
+        write_json(tmp, data)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def start_record(task: TaskContext, dirs: JobDirs, argv: Sequence[str], env: Mapping[str, str]) -> dict:
+    """``start.json``, written in the job before AEDT starts: the plan and task, the job, the Slurm context and time
+    limit, the host, process and temp directory, the code, PyAEDT and its settings files, AEDT's temp mode, the guard."""
+    home_settings = Path.home() / "pyaedt_settings.yaml"
+    local = env.get("PYAEDT_LOCAL_SETTINGS_PATH") or None
+    return {
+        "plan": task.plan_record, "frequency_ghz": task.task.get("frequency_ghz"), "label": task.task.get("label"),
+        "class": task.task.get("class"), "job_id": task.job_id, "job_root": str(dirs.root),
+        "slurm": {name: env.get(name) for name in START_SLURM_VARIABLES},
+        "time_limit": slurm_time_limit(env.get("SLURM_JOB_ID")),
+        "host": socket.gethostname(), "pid": os.getpid(), "tmpdir": env.get("TMPDIR"), "argv": list(argv),
+        "executable": sys.executable, "code": {"repo": task.plan["code"]["repo"], "commit": task.state.commit},
+        "pyaedt_version": task.state.pyaedt_version,
+        "pyaedt_settings": {"home_settings": str(home_settings), "home_settings_exists": home_settings.is_file(),
+                            "local_settings_path": local,
+                            "local_settings_exists": bool(local) and Path(local).exists()},
+        "aedt_temp": {"mode": task.aedt_temp.mode,
+                      "requested": tempdir.requested_directory(task.aedt_temp, dirs.root)},
+        "guard": {"root": task.guard.get("root"), "reservation": task.guard.get("reservation")},
+        "created_utc": _utc_now(),
+    }
+
+
+def done_record(task: TaskContext, manifest_path: Path, report: Path, passed: bool) -> dict:
+    """``done.json``: the run completed and its report was written, PASS or a deterministic FAIL (HF-057). The digests
+    of the manifest, sidecar and report bind the completion to those bytes."""
+    manifest = json.loads(Path(manifest_path).read_text())
+    aedt = manifest.get("aedt") if isinstance(manifest.get("aedt"), Mapping) else {}
+    sidecar = Path(manifest_path).parent / dataset_record_name(task.cfg.project.dataset_id,
+                                                               task.cfg.solver.frequency_ghz)
+    return {"solve_completed": True, "acceptance_passed": bool(passed),
+            "manifest_sha256": sha256_file(manifest_path), "sidecar_sha256": sha256_file(sidecar),
+            "report_sha256": sha256_file(report), "report": str(report), "plan_sha256": task.plan_sha256,
+            "index": task.index, "aedt": {"pid": aedt.get("pid"), "port": aedt.get("port")},
+            "finished_utc": _utc_now()}
+
+
+def _lease_refused_line(task: TaskContext, exc: BaseException) -> str:
+    root = task.guard.get("root")
+    if task.array_job_id:
+        hint = (f"Under the array's reservation {task.guard.get('reservation')}, a launch lease an earlier task still "
+                f"holds, its AEDT cleanup not yet verified, keeps its slot (HF-058(2)), so this refusal is expected "
+                f"while it is held: list the job's leases with python -m bbsim.licence_guard --root {root} status "
+                f"--job {task.array_job_id}, release a held one only after scope-check on its host (release LEASE "
+                f"--confirm-cleanup REASON), then rerun task {task.index}")
+    else:
+        hint = f"python -m bbsim.licence_guard --root {root} status lists what holds the shared capacity"
+    return f"job failed: launch lease refused by the licence guard (OR-045), so nothing was solved: {exc}. {hint}"
+
+
+def _main_plan(args: argparse.Namespace, cleanup: ExitStack, argv: Sequence[str]) -> int:
+    try:
+        task = plan_preflight(args.plan, args.plan_sha256, args.plan_index, os.environ)
+        dirs = create_job_dirs(task.cfg.output.root, task.cfg.project.dataset_id, task.cfg.solver.frequency_ghz,
+                               task.job_id)
+    except (OSError, ValueError, ImportError, licence_guard.GuardError, EnvironmentStateError) as exc:
+        print(f"refused before the job started: {exc}", file=sys.stderr)
+        return 2
+    cleanup.callback(_setup_logging(dirs.logs / "run.log", args.log_level))
+    _write_json_atomic(dirs.root / START_NAME, start_record(task, dirs, argv, os.environ))
+    write_json(dirs.root / "effective_config.json", config_to_dict(task.cfg))
+    log.info("job %s -> %s: task %d (%s, class %s) of plan %s (sha256 %s), %s policy, schema %d", task.job_id,
+             dirs.root, task.index, task.task.get("label"), task.task.get("class"), task.plan_path, task.plan_sha256,
+             task.policy, task.cfg.output.schema)
+    log.info(_guard_log_line(task.guard))
+    log.info(_environment_log_line(task.state))
+    if task.reference is not None:
+        log.info("column-order reference from the plan's copy (%s, %s)", task.reference.get("source_job"),
+                 task.reference.get("aedt_version"))
+    for warning in task.warnings:
+        log.warning(warning)
+    try:
+        manifest = Path(run_job(task.cfg, dirs, task.job_id, reference=task.reference,
+                                aedt_temp=task.aedt_temp, launch_timeout_s=task.launch_timeout_s,
+                                environment=task.state, expected_lattice=task.expected_lattice,
+                                plan_record=task.plan_record))
+    except SystemExit as exc:
+        _log_system_exit("job", exc)
+        raise
+    except licence_guard.GuardError as exc:
+        log.error(_lease_refused_line(task, exc))
+        return 1
+    except Exception:  # noqa: BLE001 - report and exit non-zero; the session is already released
+        log.exception("job failed")
+        return 1
+    return _judge(task, dirs, manifest)
+
+
+def _judge(task: TaskContext, dirs: JobDirs, manifest: Path) -> int:
+    """The array_run check of a completed run against its plan (``bbsim.run_acceptance``), its rows logged and its
+    report written, then ``done.json`` and the run's last log line. A check that does not finish, or a report that
+    cannot be written, leaves no ``done.json``: the task is incomplete, never a verdict (HF-057)."""
+    from bbsim import run_acceptance
+
+    try:
+        result = run_acceptance.check(dirs.root, task.plan_path, task.plan_sha256, task.index, write=False)
+        for line in result.format_rows().splitlines():
+            log.info("%s", line)
+        run_acceptance.write_report(result)
+        for line in result.format_footer().splitlines():
+            if line:
+                log.info("%s", line)
+    except SystemExit as exc:
+        _log_system_exit("the array_run check", exc)
+        raise
+    except Exception:  # noqa: BLE001 - an incomplete task, rerun; the solved project stays in the job
+        log.exception("job failed: the solve and export completed but the array_run check did not finish, so there "
+                      "is no report and no %s; the solved project %s is kept", DONE_NAME, dirs.project)
+        return 1
+    if result.report is None:
+        log.error("job failed: the solve and export completed but the array_run report was not written (%s), so "
+                  "there is no %s", result.report_error, DONE_NAME)
+        return 1
+    try:
+        _write_json_atomic(dirs.root / DONE_NAME, done_record(task, manifest, Path(result.report), result.passed))
+    except (OSError, ValueError) as exc:
+        log.error("job failed: %s could not be written (%s); the report %s stands", DONE_NAME, exc, result.report)
+        return 1
+    if result.passed:
+        log.info("done; manifest at %s", manifest)
+        return 0
+    log.error("completed; acceptance FAIL (%s); manifest at %s", ", ".join(c.name for c in result.failures) or
+              "the report", manifest)
+    return 1
+
+
+def _log_system_exit(what: str, exc: SystemExit) -> None:
+    log.error("%s stopped by SystemExit(%s)%s; what the cleanup on the way out did (the session's release, the launch "
+              "lease, AEDT's temp directory) is logged above", what, exc.code,
+              " from SIGTERM" if exc.code == EXIT_SIGTERM else "")
+
+
 def main(argv: list[str] | None = None) -> int:
     """The CLI. For the length of the run SIGTERM raises ``SystemExit(143)``, and the run's log handlers are removed
     and closed on the way out, so ``main`` can run twice in one process (HF-057)."""
     with ExitStack() as cleanup:
         cleanup.callback(_handle_sigterm())
         args = parse_args(argv)
+        if args.plan is not None:
+            return _main_plan(args, cleanup, list(sys.argv[1:] if argv is None else argv))
         if args.from_solved is not None:
             return _main_from_solved(args, cleanup)
         return _main_config(args, cleanup)

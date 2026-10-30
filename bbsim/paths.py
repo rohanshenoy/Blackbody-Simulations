@@ -31,9 +31,14 @@ def default_job_id(env: Mapping[str, str] | None = None, now: datetime | None = 
     return now.strftime("%Y%m%dT%H%M%SZ")
 
 
+def job_root(output_root: Path, dataset_id: str, frequency_ghz: float, job_id: str) -> Path:
+    """``<root>/<dataset_id>_<label>/job_<id>``: the job directory ``create_job_dirs`` makes."""
+    return Path(output_root) / f"{dataset_id}_{frequency_label(frequency_ghz)}" / f"job_{job_id}"
+
+
 def create_job_dirs(output_root: Path, dataset_id: str, frequency_ghz: float, job_id: str) -> JobDirs:
     """Create ``<root>/<dataset_id>_<label>/job_<id>/{project,scratch,logs}``; refuse if it exists."""
-    root = Path(output_root) / f"{dataset_id}_{frequency_label(frequency_ghz)}" / f"job_{job_id}"
+    root = job_root(output_root, dataset_id, frequency_ghz, job_id)
     if root.exists():
         raise FileExistsError(f"job directory already exists: {root}")
     root.mkdir(parents=True, exist_ok=False)

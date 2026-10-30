@@ -32,8 +32,10 @@ naming it):
    probe plan records no reference), and a production sidecar embeds that reference; the manifest's effective config
    equals the task config built from the captured config bytes (the manifest records no config digest, and a digest
    of its effective config is not the frozen TOML's); its pre-run project digests are the plan's project copy's (the
-   solved project's later bytes are never compared with them); a recorded ``plan`` block names this plan and task;
-   the job's CSVs and manifest copies are those its sidecar lists (``acceptance_gate.sidecar_file_problems``).
+   solved project's later bytes are never compared with them), and its ``project.dataset_id_record`` is the plan's
+   frozen mapping record giving the plan's dataset; its ``plan`` block, which the runner's plan mode records, is
+   present and names this plan and task; the job's CSVs and manifest copies are those its sidecar lists
+   (``acceptance_gate.sidecar_file_problems``).
 3. grid: the sidecar's declared keys equal the frozen config's incidence (``sampling.incident_angle_values``), the
    exported polarizations the config's and the policy's, and ``solver.solved_variations`` holds exactly Ephi 0 and 1
    under either policy: the setup's sweep always solves both (HF-058).
@@ -821,19 +823,35 @@ class _Acceptance:
             source, copy = project.get("source_path"), plan_project.get("copy")
             if not (isinstance(source, str) and isinstance(copy, str) and Path(source).resolve() == Path(copy).resolve()):
                 problems.append(f"the manifest's project.source_path {source!r} is not the plan's project copy {copy!r}")
+            problems += self._record_identity(project, plan_project)
         label = _get(manifest, "solver", "frequency_label", where="the manifest", default=None)
         if label != self.label:
             problems.append(f"the manifest's solver.frequency_label {label!r} is not {self.label!r}")
         recorded = manifest.get("plan")
-        if recorded is not None:            # the runner's plan mode records which plan and task it ran
-            context = self.context
-            if not (isinstance(recorded, Mapping) and isinstance(recorded.get("path"), str)
-                    and Path(recorded["path"]).resolve() == Path(context.plan_path).resolve()
-                    and recorded.get("sha256") == context.plan_sha256 and type(recorded.get("index")) is int
-                    and recorded["index"] == context.index):
-                problems.append(f"the manifest's plan block {recorded!r} does not name this plan "
-                                f"({context.plan_path}, {context.plan_sha256}) and task {context.index}")
+        context = self.context
+        if recorded is None:                # the runner's plan mode records which plan and task it ran (HF-057)
+            problems.append("the manifest records no plan block {path, sha256, index}: a job-array task is run by the "
+                            "runner's plan mode, which records the plan and task it ran")
+        elif not (isinstance(recorded, Mapping) and isinstance(recorded.get("path"), str)
+                  and Path(recorded["path"]).resolve() == Path(context.plan_path).resolve()
+                  and recorded.get("sha256") == context.plan_sha256 and type(recorded.get("index")) is int
+                  and recorded["index"] == context.index):
+            problems.append(f"the manifest's plan block {recorded!r} does not name this plan "
+                            f"({context.plan_path}, {context.plan_sha256}) and task {context.index}")
         return problems
+
+    def _record_identity(self, project: Mapping, plan_project: Mapping) -> list[str]:
+        """The manifest's ``project.dataset_id_record``, the record that confirmed the dataset when the run staged its
+        project, is the plan's frozen record copy and gives the plan's dataset (HF-057)."""
+        record, frozen = project.get("dataset_id_record"), plan_project.get("record")
+        if not isinstance(frozen, Mapping) or not isinstance(frozen.get("copy"), str):
+            return [f"the plan's project records no frozen mapping record {{source, copy, sha256}}, got {frozen!r}"]
+        if not (isinstance(record, Mapping) and isinstance(record.get("path"), str)
+                and Path(record["path"]).resolve() == Path(frozen["copy"]).resolve()
+                and record.get("dataset_id") == self.dataset_id):
+            return [f"the manifest's project.dataset_id_record {record!r} is not the plan's frozen record "
+                    f"{frozen['copy']} giving {self.dataset_id!r}"]
+        return []
 
     def _sidecar_identity(self) -> list[str]:
         sidecar, problems = self._sidecar(), []
