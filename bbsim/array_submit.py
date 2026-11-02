@@ -49,10 +49,25 @@ never null. A job reads one value with ``python -m bbsim.array_submit job-field 
 ``BBSIM_CODE_DIR``: it checks the plan's bytes against the context's sha256, ``BBSIM_CODE_DIR`` (the plan's worktree,
 the checkout this module was imported from, clean at the plan's commit), ``BBSIM_LICENCE_GUARD`` (the shared guard,
 the context's and the plan's ``guard_dir``) and the context against the plan, and refuses a value holding a newline,
-carriage return or NUL; a list prints one element per line, null an empty line.
+carriage return or NUL; a list prints one element per line (nothing for an empty list; an empty element is
+refused), null an empty line.
+
+The assembly alone takes the assembler's ``--choose [PLAN_SHA256:]INDEX=JOB``, ``--allow-unqualified
+[PLAN_SHA256:]INDEX`` and ``--tree PATH`` (``assembly_args``; HF-057, OR-027), which reach its job as the context's
+``extra_args``: each is checked before anything is reserved, by the assembler's own parser and its reading of these
+choices against the plan (``assemble.parse_choices``), with absolute paths, no empty value and no control character
+(``--tree`` not for a probe plan, which assembles no tree). ``job-field extra_args`` prints them one argument per
+line, each line ending in a newline, and nothing at all for none, so a bash 3.2 script passes them on without
+``eval``::
+
+    EXTRA=$(python -m bbsim.array_submit job-field extra_args) || exit 2
+    ARGS=()
+    if [ -n "$EXTRA" ]; then while IFS= read -r a; do ARGS+=("$a"); done <<< "$EXTRA"; fi
+    python assemble_hfss_dataset.py --plan "$PLAN" --plan-sha256 "$SHA256" "${ARGS[@]}"
 
 CLI (``--root`` names the shared guard, by default ``licence_guard.DEFAULT_ROOT``): ``submit PLAN SHA256
-{array,monitor,assembly} [--class NAME] [--dependency DEP]``; ``rerun PLAN SHA256 --indices I,J [--mem M] [--time T]
+{array,monitor,assembly} [--class NAME] [--dependency DEP] [--choose C]... [--allow-unqualified A]... [--tree T]``
+(the last three the assembly's), full option names only; ``rerun PLAN SHA256 --indices I,J [--mem M] [--time T]
 [--qos Q]``, nothing else; ``throttle PLAN SHA256 ARRAY_ID THROTTLE``, a live throttle change of an array of this plan
 through ``Guard.change_throttle``, the only throttle change ``submissions.log`` records (``python -m
 bbsim.licence_guard throttle`` changes it without a line there); ``remaining PLAN SHA256``, what remains of the plan's
@@ -67,7 +82,9 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import contextlib
 import hashlib
+import io
 import json
 import os
 import re
@@ -543,19 +560,61 @@ def _unaccounted_refusal(items: Sequence[Mapping], plan: Mapping, root: Path) ->
 
 # --- submission -------------------------------------------------------------------------------------------------------
 
+def assembly_args(plan_path: Path, plan_sha256: str, plan: Mapping, choose: Sequence[str] = (),
+                  allow_unqualified: Sequence[str] = (), tree: str | os.PathLike | None = None) -> list[str]:
+    """The assembly job's arguments, in this order: ``--choose`` per choice, ``--allow-unqualified`` per override, then
+    ``--tree``; each value nonempty with no control character, the lot parsed by the assembler's own parser and its
+    choices read against the plan as the assembler reads them, with absolute paths (a job's working directory is not
+    the submitter's); ``--tree`` refused for a probe plan. Raises ``SubmitError``."""
+    from bbsim import assemble
+
+    args: list[str] = []
+    for option, values in (("--choose", choose), ("--allow-unqualified", allow_unqualified)):
+        for value in values:
+            args += [option, value]
+    if tree is not None:
+        args += ["--tree", os.fspath(tree)]
+    for option, value in zip(args[::2], args[1::2]):
+        if not isinstance(value, str) or not value or _CONTROL.search(value):
+            raise SubmitError(f"the assembly's {option} {value!r} is empty or holds a control character (a newline, a "
+                              "carriage return, a NUL...), which its job could not read back as one argument")
+    stream = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(stream):
+            parsed = assemble._parser().parse_args(["--plan", str(plan_path), "--plan-sha256", plan_sha256, *args])
+    except SystemExit:
+        raise SubmitError(f"the assembly's arguments {args} are not the assembler's: "
+                          f"{_one_line(stream.getvalue())}") from None
+    try:
+        assemble.parse_choices([assemble.load_plan(plan_path, plan_sha256)], parsed.choose, parsed.allow_unqualified,
+                               absolute=True)
+    except assemble.AssembleRefused as exc:
+        raise SubmitError(f"the assembly's arguments are refused by the assembler: {exc}") from None
+    if tree is not None:
+        if not os.path.isabs(args[-1]):
+            raise SubmitError(f"the assembly's --tree {args[-1]} must be an absolute path")
+        if _get(plan, "policy") == "probe":
+            raise SubmitError("the plan is a probe, whose assembly job reports and assembles no tree: no --tree")
+    return args
+
+
 def submit(plan_path: Path, plan_sha256: str, what: str, *, class_name: str | None = None, indices: str | None = None,
            mem: str | None = None, time: str | None = None, qos: str | None = None, guard: Any,
-           dependency: str | None = None, env: EnvironmentState | None = None) -> str:
+           dependency: str | None = None, env: EnvironmentState | None = None, choose: Sequence[str] = (),
+           allow_unqualified: Sequence[str] = (), tree: str | os.PathLike | None = None) -> str:
     """Submit one job of the plan through ``guard`` (the module docstring's checks, then ``Guard.submit``) and log it.
 
     ``what`` is ``array`` (``class_name`` and the class's indices; with ``indices`` a rerun of those, its class found
     from them), ``monitor`` or ``assembly``; ``mem``, ``time`` and ``qos`` replace the class's (or the monitor's or the
-    assembly's) for this job. ``env`` is the worktree's ``manifest.environment_state`` (read when None). Returns the
-    job id. ``SubmitError`` and ``licence_guard.GuardRefused`` refuse with nothing reserved; ``GuardError`` is a
-    failure with the reservation kept as the guard says; ``SubmissionNotLogged`` names a submitted job whose log line
-    is missing."""
+    assembly's) for this job; ``choose``, ``allow_unqualified`` and ``tree``, the assembly's alone, become its
+    ``extra_args`` (``assembly_args``). ``env`` is the worktree's ``manifest.environment_state`` (read when None).
+    Returns the job id. ``SubmitError`` and ``licence_guard.GuardRefused`` refuse with nothing reserved;
+    ``GuardError`` is a failure with the reservation kept as the guard says; ``SubmissionNotLogged`` names a submitted
+    job whose log line is missing."""
     if what not in WHATS:
         raise SubmitError(f"what must be one of {', '.join(WHATS)}, got {what!r}")
+    if what != "assembly" and (choose or allow_unqualified or tree is not None):
+        raise SubmitError(f"only the assembly takes --choose, --allow-unqualified and --tree; a {what} job does not")
     path, plan = read_plan(plan_path, plan_sha256)
     _check_root(plan, guard)
     state = _check_code(plan, env)
@@ -630,6 +689,7 @@ def submit(plan_path: Path, plan_sha256: str, what: str, *, class_name: str | No
                                   f"{run_dir / SUBMISSIONS_LOG} yet: submit the arrays first")
             planned_time, planned_mem, planned_qos = _get(plan, "slurm", "monitor", "time"), MONITOR_MEM, None
         else:
+            extra = assembly_args(path, plan_sha256, plan, choose, allow_unqualified, tree)
             assembly = _get(plan, "slurm", "assembly")
             planned_time, planned_mem, planned_qos = (_get(plan, "slurm", "assembly", "time"),
                                                       _get(plan, "slurm", "assembly", "mem"), assembly.get("qos"))
@@ -945,6 +1005,9 @@ def job_field(name: str, *, environ: Mapping[str, str] | None = None, root: Path
         if "\n" in item or "\r" in item or "\0" in item:
             raise SubmitError(f"the job context's {name} holds a newline, carriage return or NUL, which a shell cannot "
                               "read back as one value")
+    if isinstance(raw, list) and "" in raw:
+        raise SubmitError(f"the job context's {name} holds an empty element, which a shell reading one per line cannot "
+                          "tell from no element")
     return "\n".join(values)
 
 
@@ -963,6 +1026,11 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--class", dest="class_name", metavar="NAME", help="the array's class (A1, A2, ...)")
     s.add_argument("--dependency", metavar="DEP", help="after[any|ok|notok]:JOBID[:JOBID...], with "
                                                        "--kill-on-invalid-dep=yes")
+    s.add_argument("--choose", action="append", default=[], metavar="[PLAN_SHA256:]INDEX=JOB",
+                   help="the assembly's: the assembler's --choose (repeatable)")
+    s.add_argument("--allow-unqualified", action="append", default=[], metavar="[PLAN_SHA256:]INDEX",
+                   help="the assembly's: the assembler's convergence override (repeatable; OR-027)")
+    s.add_argument("--tree", metavar="PATH", help="the assembly's: the tree to write, an absolute path")
     r = sub.add_parser("rerun", allow_abbrev=False, help="submit indices of one class again, as a new array")
     r.add_argument("plan", type=Path)
     r.add_argument("sha256")
@@ -994,7 +1062,9 @@ def main(argv: list[str] | None = None, *, scheduler: Any = None, env: Environme
         return 2 if exc.code else 0
     try:
         if args.command == "job-field":
-            print(job_field(args.name, environ=environ, root=args.root, module_root=module_root))
+            value = job_field(args.name, environ=environ, root=args.root, module_root=module_root)
+            # A list prints one line per element and nothing for none (extra_args, read with while read)
+            sys.stdout.write(value + "\n" if value or args.name != "extra_args" else "")
             return 0
         root = args.root if args.root is not None else licence_guard.DEFAULT_ROOT
         guard = licence_guard.Guard(root, scheduler if scheduler is not None else licence_guard.SlurmScheduler())
@@ -1012,7 +1082,8 @@ def main(argv: list[str] | None = None, *, scheduler: Any = None, env: Environme
         else:
             what = args.what
             job = submit(args.plan, args.sha256, what, class_name=args.class_name, dependency=args.dependency,
-                         guard=guard, env=env)
+                         guard=guard, env=env, choose=args.choose, allow_unqualified=args.allow_unqualified,
+                         tree=args.tree)
         print(job)
         print(f"array_submit: {args.command} {what}: job {job}, reservation {guard.last_reservation_id} in "
               f"{guard.root}", file=sys.stderr)
