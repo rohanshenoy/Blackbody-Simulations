@@ -218,6 +218,16 @@ class GuardRefused(GuardError):
     """Refused before anything was reserved or submitted (exit 2)."""
 
 
+class LeaseRefused(GuardRefused):
+    """``Guard.acquire_lease`` refused a launch lease for want of capacity: ``reason`` is ``"ceiling"`` (``CEILING``
+    leases held in all) or ``"slots"`` (every slot of the job's reservation held by a lease, an earlier task's whose
+    cleanup is unverified included; HF-058(2)). A lock, record or reservation fault is another ``GuardError``."""
+
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 @dataclass(frozen=True)
 class QueueEntry:
     """One ``squeue`` line: a job, an array task or a range of pending array tasks (``123_[4-9%3]``)."""
@@ -1887,8 +1897,8 @@ class Guard:
         with self.locked():
             held = [lease for lease in self._read_leases() if lease["state"] != LEASE_RELEASED]
             if len(held) >= CEILING:
-                raise GuardRefused(f"{len(held)} launch leases are held, the ceiling of {CEILING} (OR-045): no AEDT "
-                                   "start is admitted until one is released after its cleanup is verified")
+                raise LeaseRefused(f"{len(held)} launch leases are held, the ceiling of {CEILING} (OR-045): no AEDT "
+                                   "start is admitted until one is released after its cleanup is verified", "ceiling")
             direct = reservation_id is None
             if direct:
                 rid = self.reserve_direct(cap=CEILING, context={"source": "direct session", "identity": identity})
@@ -1901,9 +1911,9 @@ class Guard:
                     raise GuardRefused(problem)
                 on_it = sum(1 for lease in held if lease["reservation_id"] == reservation_id)
                 if on_it + 1 > rec["slots"]:
-                    raise GuardRefused(f"reservation {reservation_id} holds {rec['slots']} slot(s) and {on_it} held "
+                    raise LeaseRefused(f"reservation {reservation_id} holds {rec['slots']} slot(s) and {on_it} held "
                                        "launch lease(s) name it already; a lease is released only after its cleanup "
-                                       "is verified")
+                                       "is verified", "slots")
                 rid = reservation_id
             lid = self._new_lease_id()
             record = {"id": lid, "reservation_id": rid, "direct": direct, "state": LEASE_ACQUIRED,

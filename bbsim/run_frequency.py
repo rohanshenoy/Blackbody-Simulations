@@ -31,7 +31,8 @@ written before AEDT starts; ``run_job`` then compares the exit face's lattice wi
 solve and records the plan block in the manifest; ``bbsim.run_acceptance`` judges the run against its plan; once its
 report is written, ``done.json`` records the completion and its verdict, PASS or a deterministic FAIL. The log ends
 ``done; manifest at <path>`` (exit 0) or ``completed; acceptance FAIL (<rows>); manifest at <path>`` (exit 1); a run
-that stops before the report writes no ``done.json`` (exit 1), and a launch lease the guard refuses is named as such.
+that stops before the report writes no ``done.json`` (exit 1). A launch lease the guard refuses for want of capacity
+is named as a refusal; any other guard failure before AEDT starts is named as a fault.
 """
 from __future__ import annotations
 
@@ -519,35 +520,17 @@ def _check_versions_for_reference(reference: Mapping | None, versions: Mapping[s
         dataset_v2.check_reference_compatible(dict(reference), aedt, pyaedt, REPO_ROOT)
 
 
-def lattice_differences(expected: Mapping, lo: Sequence[float], hi: Sequence[float], step: Sequence[float],
-                        counts: Sequence[int]) -> list[str]:
-    """How the lattice (``lo``, ``hi``, ``step``, ``counts`` along x_e, y_e, z_e, mm) differs from a plan task's
-    predicted one, ``expected`` (``array_plan.predict_exit_lattice``'s record): the bounds to ``dataset_v2.NODE_TOL``
-    of the predicted step (the exit-plane tolerance on the stepless x_e axis), the step to ``NODE_TOL`` relative and
-    the node count exactly, as the array_run check compares them (HF-045, HF-057). A record that is not a lattice is
-    one difference."""
-    from bbsim.extract import PLANE_TOL_M
-
+def lattice_record(expected: Mapping) -> tuple[list[float], list[float], list[float], list[int]]:
+    """A plan task's lattice record (``array_plan.predict_exit_lattice``'s) as its bounds, steps and node counts along
+    x_e, y_e and z_e; ``ValueError`` for a record that is not a lattice."""
     try:
-        want = {name: [float(v) for v in expected[name]] for name in ("lo_mm", "hi_mm", "step_mm")}
-        want_counts = list(expected["counts"])
-        if not (all(len(v) == 3 for v in want.values()) and len(want_counts) == 3
-                and all(type(c) is int for c in want_counts)):
-            raise ValueError("three values per field")
+        lo, hi, step = ([float(v) for v in expected[name]] for name in ("lo_mm", "hi_mm", "step_mm"))
+        counts = list(expected["counts"])
     except (KeyError, TypeError, ValueError) as exc:
-        return [f"the predicted lattice {expected!r} is not a lattice record ({exc})"]
-    problems = []
-    for axis, name in enumerate(("x_e", "y_e", "z_e")):
-        s = want["step_mm"][axis]
-        tol = dataset_v2.NODE_TOL * s if s > 0.0 else PLANE_TOL_M * 1e3
-        if not (abs(lo[axis] - want["lo_mm"][axis]) <= tol and abs(hi[axis] - want["hi_mm"][axis]) <= tol):
-            problems.append(f"along {name} it spans {lo[axis]!r} to {hi[axis]!r} mm, the prediction "
-                            f"{want['lo_mm'][axis]!r} to {want['hi_mm'][axis]!r} mm")
-        if not abs(step[axis] - s) <= dataset_v2.NODE_TOL * s:
-            problems.append(f"along {name} it steps {step[axis]!r} mm, the prediction {s!r} mm")
-        if counts[axis] != want_counts[axis]:
-            problems.append(f"along {name} it has {counts[axis]} nodes, the prediction {want_counts[axis]}")
-    return problems
+        raise ValueError(f"the plan's lattice {expected!r} is not a lattice record ({exc})") from None
+    if not (len(lo) == len(hi) == len(step) == len(counts) == 3 and all(type(c) is int for c in counts)):
+        raise ValueError(f"the plan's lattice {expected!r} does not give three bounds, steps and node counts")
+    return lo, hi, step, counts
 
 
 def _require_expected_lattice(face_geometry: Any, lattice: Any, expected: Mapping) -> None:
@@ -560,7 +543,13 @@ def _require_expected_lattice(face_geometry: Any, lattice: Any, expected: Mappin
     if lattice is None:
         problems.append("the run exports no manual lattice")
     else:
-        problems += lattice_differences(expected, lattice.lo_mm, lattice.hi_mm, lattice.step_mm, lattice.counts)
+        try:
+            plan = lattice_record(expected)
+        except ValueError as exc:
+            problems.append(str(exc))
+        else:   # the array_run check's exit_grid row compares the declared lattice with the plan's the same way
+            problems += array_plan.lattice_problems("the exit face's lattice", lattice.lo_mm, lattice.hi_mm,
+                                                    lattice.step_mm, lattice.counts, *plan)
     if problems:
         raise RuntimeError("the exit face's lattice is not the plan's prediction from the frozen geometry, so nothing "
                            "is solved (HF-057): " + "; ".join(problems))
@@ -1463,8 +1452,12 @@ def _check_lattice(task: Mapping, cfg: RunConfig, index: int) -> dict:
         raise PlanRefused(f"task {index}: {exc}") from None
     recorded = task.get("lattice")
     if recorded != predicted:
-        detail = (lattice_differences(recorded, predicted["lo_mm"], predicted["hi_mm"], predicted["step_mm"],
-                                      predicted["counts"]) if isinstance(recorded, Mapping) else [])
+        try:
+            detail = array_plan.lattice_problems("the frozen rectangle's HF-045 lattice", predicted["lo_mm"],
+                                                 predicted["hi_mm"], predicted["step_mm"], predicted["counts"],
+                                                 *lattice_record(recorded))
+        except ValueError as exc:
+            detail = [str(exc)]
         raise PlanRefused(f"task {index}'s recorded lattice {recorded!r} is not the frozen rectangle's HF-045 lattice "
                           f"{predicted!r}" + (f": {'; '.join(detail)}" if detail else ""))
     if task.get("l_step_mm") != predicted["step_mm"][1] or predicted["step_mm"][1] > limit:
@@ -1669,17 +1662,24 @@ def done_record(task: TaskContext, manifest_path: Path, report: Path, passed: bo
             "finished_utc": _utc_now()}
 
 
-def _lease_refused_line(task: TaskContext, exc: BaseException) -> str:
+def guard_failure_line(task: TaskContext, exc: licence_guard.GuardError) -> str:
+    """The last log line of a run whose licence guard stopped it inside ``run_job``, before AEDT started (OR-045).
+    Only ``licence_guard.LeaseRefused``, ``acquire_lease``'s refusal for want of capacity, is called a refusal; in an
+    array, a refusal because every slot of the reservation is held says that an earlier task's held lease, its
+    cleanup unverified, makes it expected (HF-058(2)). Any other guard failure (the lock, a record, the launch scope)
+    is a fault, named neutrally."""
+    if not isinstance(exc, licence_guard.LeaseRefused):
+        return f"job failed: the licence guard failed before AEDT started: {exc}; nothing was solved"
     root = task.guard.get("root")
-    if task.array_job_id:
-        hint = (f"Under the array's reservation {task.guard.get('reservation')}, a launch lease an earlier task still "
-                f"holds, its AEDT cleanup not yet verified, keeps its slot (HF-058(2)), so this refusal is expected "
-                f"while it is held: list the job's leases with python -m bbsim.licence_guard --root {root} status "
-                f"--job {task.array_job_id}, release a held one only after scope-check on its host (release LEASE "
-                f"--confirm-cleanup REASON), then rerun task {task.index}")
-    else:
-        hint = f"python -m bbsim.licence_guard --root {root} status lists what holds the shared capacity"
-    return f"job failed: launch lease refused by the licence guard (OR-045), so nothing was solved: {exc}. {hint}"
+    line = f"job failed: launch lease refused by the licence guard (OR-045), so nothing was solved: {exc}."
+    if exc.reason == "slots" and task.array_job_id:
+        return (f"{line} Under the array's reservation {task.guard.get('reservation')}, a launch lease an earlier task "
+                f"still holds, its AEDT cleanup not yet verified, keeps its slot (HF-058(2)), so this refusal is "
+                f"expected while it is held: list the job's leases with python -m bbsim.licence_guard --root {root} "
+                f"status --job {task.array_job_id}, release a held one only after scope-check on its host (release "
+                f"LEASE --confirm-cleanup REASON), then rerun task {task.index}")
+    return (f"{line} python -m bbsim.licence_guard --root {root} status lists the launch leases holding the "
+            f"capacity; rerun task {task.index} once one is released after its cleanup is verified")
 
 
 def _main_plan(args: argparse.Namespace, cleanup: ExitStack, argv: Sequence[str]) -> int:
@@ -1712,7 +1712,7 @@ def _main_plan(args: argparse.Namespace, cleanup: ExitStack, argv: Sequence[str]
         _log_system_exit("job", exc)
         raise
     except licence_guard.GuardError as exc:
-        log.error(_lease_refused_line(task, exc))
+        log.error(guard_failure_line(task, exc))
         return 1
     except Exception:  # noqa: BLE001 - report and exit non-zero; the session is already released
         log.exception("job failed")

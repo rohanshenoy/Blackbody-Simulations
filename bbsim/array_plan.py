@@ -78,9 +78,11 @@ ID`` records a job submitted by hand, with no admission (``array_submit.log_subm
 
 The planner, the runner, the array_run self-check (``bbsim.run_acceptance``) and the assembler all build a task's
 config here, and the planner and the self-check predict its lattice with ``predict_exit_lattice``, so none can
-disagree on either. A caller that hashes the config copy passes the mapping it parsed from those bytes as
-``raw_config``, and the copy is then never reopened. The module imports only the standard library and standard-library
-``bbsim`` modules at load time; numpy and the extractor are imported where the lattice is predicted.
+disagree on either; the runner's check of the exit face before the solve and the self-check's after it compare a
+lattice with the plan's through ``lattice_problems``, one comparison. A caller that hashes the config copy passes the
+mapping it parsed from those bytes as ``raw_config``, and the copy is then never reopened. The module imports only the
+standard library and standard-library ``bbsim`` modules at load time; numpy and the extractor are imported where the
+lattice is predicted or compared.
 """
 from __future__ import annotations
 
@@ -307,6 +309,42 @@ def predict_exit_lattice(cfg: RunConfig, effective_l_resolution_mm: float) -> di
             "step_mm": [float(v) for v in grid.step_mm], "counts": [int(n) for n in grid.counts],
             "fitted": [bool(f) for f in grid.fitted], "extent_mm": [p, l, g], "entrance_area_mm2": area,
             "extent_source": LATTICE_SOURCE}
+
+
+def node_tol_mm(step: float) -> float:
+    """A lattice bound's tolerance on an exit axis, in mm: ``dataset_v2.NODE_TOL`` of the axis's step, or on the
+    stepless x_e axis the exit-plane tolerance ``extract.PLANE_TOL_M`` (HF-045, CDX-023)."""
+    from bbsim.dataset_v2 import NODE_TOL
+    from bbsim.extract import PLANE_TOL_M
+
+    return NODE_TOL * step if step > 0.0 else PLANE_TOL_M * 1e3
+
+
+def lattice_problems(what: str, lo: Sequence[float], hi: Sequence[float], step: Sequence[float],
+                     counts: Sequence[int], plan_lo: Sequence[float], plan_hi: Sequence[float],
+                     plan_step: Sequence[float], plan_counts: Sequence[int],
+                     axes: Sequence[int] = (0, 1, 2)) -> list[str]:
+    """How the lattice ``what`` (``lo``, ``hi``, ``step``, ``counts`` along x_e, y_e, z_e, in mm) differs from the
+    plan's predicted one, on each axis of ``axes``: its bounds to ``node_tol_mm`` of the plan's step, its step to
+    ``dataset_v2.NODE_TOL`` of the plan's step, its node count exactly. The one comparison of an exit lattice with the
+    plan's: the runner's check of the exit face before the solve and the array_run check's ``exit_grid`` row after it
+    both call it, so they refuse the same lattices (HF-045, HF-057)."""
+    from bbsim.dataset_v2 import NODE_TOL
+
+    problems = []
+    for axis in axes:
+        name = ("x_e", "y_e", "z_e")[axis]
+        tol = node_tol_mm(plan_step[axis])
+        if not (abs(lo[axis] - plan_lo[axis]) <= tol and abs(hi[axis] - plan_hi[axis]) <= tol):
+            problems.append(f"{what} spans {lo[axis]!r} to {hi[axis]!r} mm along {name}, the plan's lattice "
+                            f"{plan_lo[axis]!r} to {plan_hi[axis]!r} mm")
+        if not abs(step[axis] - plan_step[axis]) <= NODE_TOL * plan_step[axis]:
+            problems.append(f"{what} steps {step[axis]!r} mm along {name}, the plan's lattice "
+                            f"{plan_step[axis]!r} mm")
+        if counts[axis] != plan_counts[axis]:
+            problems.append(f"{what} has {counts[axis]} nodes along {name}, the plan's lattice "
+                            f"{plan_counts[axis]}")
+    return problems
 
 
 # --- the planner's options -------------------------------------------------------------------------------------------

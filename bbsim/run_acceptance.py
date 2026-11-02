@@ -123,7 +123,7 @@ from bbsim.compare import Check
 from bbsim.config import RunConfig, build_config, config_to_dict
 from bbsim.convergence import CRITERION, qualify
 from bbsim.dataset_v2 import DatasetV2Error, key_text
-from bbsim.extract import PLANE_TOL_M, ExitGrid
+from bbsim.extract import ExitGrid
 from bbsim.manifest import write_json
 from bbsim.naming import dataset_dir_name, dataset_record_name, frequency_label
 from bbsim.sampling import incident_angle_values, incoming_power_w
@@ -370,8 +370,9 @@ def _nominal_lattice(cfg: RunConfig) -> dict:
 
 
 def _node_tol_mm(step: float) -> float:
-    """A bound's tolerance on an axis: ``NODE_TOL`` of its step, the exit-plane tolerance on the stepless x_e axis."""
-    return NODE_TOL * step if step > 0.0 else PLANE_TOL_M * 1e3
+    """A bound's tolerance on an axis: ``array_plan.node_tol_mm``, ``NODE_TOL`` of its step, the exit-plane tolerance on
+    the stepless x_e axis; the one the runner's check of the exit face before the solve uses (HF-057)."""
+    return array_plan.node_tol_mm(step)
 
 
 # --- the result ------------------------------------------------------------------------------------------------------
@@ -1356,20 +1357,10 @@ class _Acceptance:
     @staticmethod
     def _lattice_problems(what: str, lo: Sequence[float], hi: Sequence[float], step: Sequence[float],
                           counts: Sequence[int], lattice: _Lattice, axes: Sequence[int]) -> list[str]:
-        problems = []
-        for axis in axes:
-            name = ("x_e", "y_e", "z_e")[axis]
-            tol = _node_tol_mm(lattice.step[axis])
-            if not (abs(lo[axis] - lattice.lo[axis]) <= tol and abs(hi[axis] - lattice.hi[axis]) <= tol):
-                problems.append(f"{what} spans {lo[axis]!r} to {hi[axis]!r} mm along {name}, the plan's lattice "
-                                f"{lattice.lo[axis]!r} to {lattice.hi[axis]!r} mm")
-            if not abs(step[axis] - lattice.step[axis]) <= NODE_TOL * lattice.step[axis]:
-                problems.append(f"{what} steps {step[axis]!r} mm along {name}, the plan's lattice "
-                                f"{lattice.step[axis]!r} mm")
-            if counts[axis] != lattice.counts[axis]:
-                problems.append(f"{what} has {counts[axis]} nodes along {name}, the plan's lattice "
-                                f"{lattice.counts[axis]}")
-        return problems
+        """``array_plan.lattice_problems`` against the plan's lattice: the comparison the runner makes of the exit
+        face before the solve, so the two never disagree (HF-057)."""
+        return array_plan.lattice_problems(what, lo, hi, step, counts, lattice.lo, lattice.hi, lattice.step,
+                                           lattice.counts, axes)
 
     # -- 15. binding.inputs -------------------------------------------------------------------------------------------
     def _binding_inputs(self) -> Check:
