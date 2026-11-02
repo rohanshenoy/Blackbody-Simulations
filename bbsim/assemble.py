@@ -56,20 +56,22 @@ rerun only its own tasks). A plan with tasks still unresolved and nothing to rer
 resolved with a ``--choose`` or the convergence override, and a production plan whose every task has one valid run (its
 assembly job may have stopped without writing the tree) get the guarded re-assembly instead, except inside a logged
 assembly job of the plan (the job those lines would submit); it makes ``<RUN>/reassemble_<report stamp>`` first in the
-same way. Every assembly these lines submit carries the report's ``--choose`` and applied ``--allow-unqualified`` of
-that plan and its ``--tree`` (``array_submit``'s assembly arguments), so the guarded job assembles what the report
-selected. No guarded assembly is printed (``_guard_blocker``; the rerun blocks then rerun and submit none, and the
-re-assembly line is left out with the reason) for a report of several plans, whose tree is assembled by hand from the
-printed ``--check`` and assembly lines of the report's plans and ``--tree`` (no assembly line where a check would refuse
-or the tree checks failed); while the tree or its ``.partial`` is in the way; or when ``--check``'s tree checks failed.
-``--choose`` lines for an ambiguous task and an ``--allow-unqualified`` line for a FAIL the override could accept, which
-it never applies unasked (nor where a qualified run of the task passed), are ``--check`` lines with the report's
-``--tree``, or ``--report`` lines whenever a ``--check`` of the plans would refuse (a probe plan, plans at different
-commits or worktrees off them, a ``--tree`` the report was not given, an existing tree or ``<TREE>.partial``); they
-carry the overrides that accepted a run of their task. For every array of the plan ``sacct``, the ``du -sh`` of each job
-and its ``.aedtresults``, and the hosts' ``TempDirectory`` lines. Every line holds real values (paths, digests, indices,
-job ids), so it is pasted as printed. Its last line is ``REPORT PASS``/``REPORT FAIL: ...`` or ``CHECK PASS``/``CHECK
-FAIL: ...``.
+same way. The line for a plan whose every task has a run is pasted only once the ``squeue`` line printed under its
+header shows no assembly of the plan running; and where the tree already exists and the report changes nothing (no open
+task, no choice or override), the report says so: nothing to assemble, and no advice to clear the tree. Every assembly
+these lines submit carries the report's ``--choose`` and applied ``--allow-unqualified`` of that plan and its ``--tree``
+(``array_submit``'s assembly arguments), so the guarded job assembles what the report selected. No guarded assembly is
+printed (``_guard_blocker``; the rerun blocks then rerun and submit none, and the re-assembly line is left out with the
+reason) for a report of several plans, whose tree is assembled by hand from the printed ``--check`` and assembly lines
+of the report's plans and ``--tree`` (no assembly line where a check would refuse or the tree checks failed); while the
+tree or its ``.partial`` is in the way; or when ``--check``'s tree checks failed. ``--choose`` lines for an ambiguous
+task and an ``--allow-unqualified`` line for a FAIL the override could accept, which it never applies unasked (nor where
+a qualified run of the task passed), are ``--check`` lines with the report's ``--tree``, or ``--report`` lines whenever
+a ``--check`` of the plans would refuse (a probe plan, plans at different commits or worktrees off them, a ``--tree``
+the report was not given, an existing tree or ``<TREE>.partial``); they carry the overrides that accepted a run of their
+task. For every array of the plan ``sacct``, the ``du -sh`` of each job and its ``.aedtresults``, and the hosts'
+``TempDirectory`` lines. Every line holds real values (paths, digests, indices, job ids), so it is pasted as printed.
+Its last line is ``REPORT PASS``/``REPORT FAIL: ...`` or ``CHECK PASS``/``CHECK FAIL: ...``.
 
 ``assemble`` writes the tree once every task has one valid run (HF-057, S65, G4-012). The include jobs are those the
 plans recorded at plan time (``include_records``; a job two plans record must carry one record, and ``--include-job``
@@ -233,7 +235,8 @@ class Selection:
     the one the plans record); ``override_notes`` why a task named by ``--allow-unqualified`` took no override;
     ``check_refusals`` the refusals a ``--check`` of these plans would give (the CLI's), so printed lines are
     ``--report`` lines then; ``inputs`` the one capture every file was read through, which the assembly reads on;
-    ``tree_blocked`` why the tree cannot be written (it or its ``.partial`` exists), so no guarded assembly is printed;
+    ``tree_blocked`` why the tree cannot be written (it or its ``.partial`` exists), so no guarded assembly is printed,
+    ``tree_exists`` whether that is the tree itself;
     ``tree_checks`` ``--check``'s tree checks {problems, warnings}, None where they did not run."""
     plans: list[LoadedPlan]
     candidates: dict[Key, list[Candidate]]
@@ -252,6 +255,7 @@ class Selection:
     note_lines: list[str] = field(default_factory=list)
     inputs: gate.InputCapture | None = None
     tree_blocked: str | None = None
+    tree_exists: bool = False
     tree_checks: dict | None = None
 
     def plan(self, sha256: str) -> LoadedPlan:
@@ -941,7 +945,8 @@ def _guard_blocker(sel: Selection) -> str | None:
         return ("this report holds several plans, and a plan's guarded assembly job assembles that plan alone, so "
                 "their tree is assembled by hand (the lines below)")
     if sel.tree_blocked is not None:
-        return f"{sel.tree_blocked}; clear that first (the lines above), then make a new report"
+        where = "" if sel.tree_exists else " (the squeue and rm -rf lines above)"
+        return f"{sel.tree_blocked}; clear that first{where}, then make a new report"
     if sel.tree_checks is not None and sel.tree_checks["problems"]:
         return "the tree checks failed (above), and an assembly would fail them too"
     return None
@@ -1079,7 +1084,9 @@ def _lines(sel: Selection, mode: str, stamp: str) -> tuple[list[str], bool, str]
         # OUT_OF_MEMORY, a SIGKILL during its cleanup) without writing the tree
         ready = mode != "assembly" and not inside and (decided or plan.policy == "production")
         if (open_tasks or ready) and blocker is not None:
-            if len(sel.plans) == 1:
+            if len(sel.plans) == 1 and sel.tree_exists and not open_tasks and not decided:
+                lines.append(f"# The tree {q(str(sel.tree))} exists: nothing to assemble.")      # a done plan
+            elif len(sel.plans) == 1:
                 lines.append(f"# No guarded re-assembly is printed: {blocker}.")
         elif open_tasks or ready:
             assemblies = [r["id"] for r in records if r.get("kind") == "assembly" and r["id"] != current_job]
@@ -1091,6 +1098,8 @@ def _lines(sel: Selection, mode: str, stamp: str) -> tuple[list[str], bool, str]
             lines.append(f"# A new assembly of the plan {plan.path} through the guard, {when}; it makes {marker} "
                          "first, so this report submits it once, and a pending assembly of the plan is cancelled first "
                          "(in a shell that has sourced bb_env.sh):")
+            if not open_tasks and not decided:
+                lines.append(_assembly_squeue([plan]))
             stop = (f"STOP: this report's re-assembly was already pasted ({marker} exists, or cannot be made), so "
                     "nothing was submitted now: make a new report")
             lines.append(f"cd {q(str(plan.code_repo))} && (mkdir {q(str(marker))} || {{ echo {q(stop)}; exit 1; }}; "
@@ -1246,14 +1255,18 @@ def tree_problem(tree: Path, plans: Sequence[LoadedPlan]) -> tuple[str, list[str
         return f"{tree} exists; the assembly writes a new tree only, never into or over one", []
     if not os.path.lexists(partial):
         return None
-    names = sorted({p.data["slurm"]["job_name"] + "_asm" for p in plans if isinstance(p.data.get("slurm"), Mapping)
-                    and isinstance(p.data["slurm"].get("job_name"), str)})
-    squeue = (f"squeue -h -n {shlex.quote(','.join(names))} -o '%i %T %j'" if names else
-              "squeue -h -u \"$USER\" -o '%i %T %j'")
     return (f"{partial} exists: an assembly that stopped part way left it, or one is writing it now, and nothing is "
             "removed here. Remove it only once the squeue line below prints no assembly job of the plan(s) and no "
             "assembly run by hand is writing it, with the rm line below",
-            [squeue, f"rm -rf {shlex.quote(str(partial))}"])
+            [_assembly_squeue(plans), f"rm -rf {shlex.quote(str(partial))}"])
+
+
+def _assembly_squeue(plans: Sequence[LoadedPlan]) -> str:
+    """The paste-ready ``squeue`` line that shows any assembly job of ``plans`` (``<slurm.job_name>_asm``)."""
+    names = sorted({p.data["slurm"]["job_name"] + "_asm" for p in plans if isinstance(p.data.get("slurm"), Mapping)
+                    and isinstance(p.data["slurm"].get("job_name"), str)})
+    return (f"squeue -h -n {shlex.quote(','.join(names))} -o '%i %T %j'" if names else
+            "squeue -h -u \"$USER\" -o '%i %T %j'")
 
 
 def include_records(plans: Sequence[LoadedPlan], include_jobs: Sequence[Path | str] | None = None) -> list[dict]:
@@ -2016,7 +2029,7 @@ def main(argv: list[str] | None = None) -> int:
             refusals.append((f"the probe plan(s) {probes} are diagnostics, never assembled: --report reports them", []))
         refusals += [(note, []) for note in notes]
         tree_lines: list[str] = []
-        blocked = None
+        blocked, exists = None, False
         if tree is None:
             refusals.append((f"the plans record the trees {sorted({str(p.data.get('tree')) for p in plans})}, not one "
                              "absolute tree: give --tree", []))
@@ -2026,7 +2039,7 @@ def main(argv: list[str] | None = None) -> int:
                 refusals.append(found)
                 notes.append(found[0])
                 tree_lines = found[1]
-                blocked = found[0]
+                blocked, exists = found[0], os.path.lexists(tree)
         if mode != "report" and refusals:
             raise AssembleRefused(*refusals[0])
         if args.report_path is not None:
@@ -2039,7 +2052,7 @@ def main(argv: list[str] | None = None) -> int:
         selection.notes += notes
         selection.note_lines += tree_lines
         selection.tree = tree
-        selection.tree_blocked = blocked
+        selection.tree_blocked, selection.tree_exists = blocked, exists
         selection.check_refusals = [message for message, _ in refusals]
     except AssembleRefused as exc:
         return _refused(exc)
