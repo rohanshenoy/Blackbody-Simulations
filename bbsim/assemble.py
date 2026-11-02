@@ -47,15 +47,16 @@ every candidate with its verdict and reasons and every foreign entry; for a task
 frozen code (``python -m bbsim.array_submit rerun`` with the class's resources, then a new assembly after the reruns,
 any pending assembly of the plan's cancelled first), and the same block with twice the class's time (TIMEOUT) and
 twice its memory (OUT_OF_MEMORY), never more cores. One block of the three is pasted, once every listed task has ended
-(the ``sacct -X`` line printed above them): each makes ``<RUN>/rerun_<report stamp>`` first with ``mkdir``, so a second
-paste of any block of the report stops before submitting (one marker per plan; each plan's blocks rerun only its own
-tasks). ``--choose`` lines for an ambiguous task and an ``--allow-unqualified`` line for a FAIL the override could
-accept, which it never applies unasked, are ``--check`` lines with the report's ``--tree``, or ``--report`` lines for a
-probe plan (which ``--check`` refuses) or when the plans need a ``--tree`` the report was not given; they carry only the
-overrides that applied. For every array of the plan ``sacct``, the ``du -sh`` of each job and its
-``.aedtresults``, and the hosts' ``TempDirectory`` lines. Every line holds real values (paths, digests, indices, job
-ids), so it is pasted as printed. Its last line is ``REPORT PASS``/``REPORT FAIL: ...`` or ``CHECK PASS``/``CHECK FAIL:
-...``.
+(the ``sacct -X`` line printed above them, when an array holds them): each makes ``<RUN>/rerun_<report stamp>`` first
+with ``mkdir``, so a second paste of any block of the report stops before submitting (one marker per plan; each plan's
+blocks rerun only its own tasks). ``--choose`` lines for an ambiguous task and an ``--allow-unqualified`` line for a
+FAIL the override could accept, which it never applies unasked (nor where a qualified run of the task passed), are
+``--check`` lines with the report's ``--tree``, or ``--report`` lines whenever a ``--check`` of the plans would refuse
+(a probe plan, plans at different commits or worktrees off them, include jobs, a ``--tree`` the report was not given);
+they carry the overrides that accepted a run of their task. For every array of the plan ``sacct``, the ``du -sh`` of
+each job and its ``.aedtresults``, and the hosts' ``TempDirectory`` lines. Every line holds real values (paths, digests,
+indices, job ids), so it is pasted as printed. Its last line is ``REPORT PASS``/``REPORT FAIL: ...`` or ``CHECK
+PASS``/``CHECK FAIL: ...``.
 
 The CLI: ``--report`` reports any plan, a probe's too; ``--check`` is the report under the assembly's refusals: a probe
 plan, plans at different commits or an assembler not imported from one plan's worktree (``assembler_problem``, as the
@@ -171,7 +172,8 @@ class Selection:
     reason a task has no chosen run; ``foreign_reasons`` why each foreign entry is one; ``notes`` warnings the CLI
     adds (a plan's worktree, or the assembler's checkout, not the plans' code under ``--report``); ``tree`` the tree the
     printed ``--check`` lines name (``--tree``, or the one the plans record); ``override_notes`` why a task named by
-    ``--allow-unqualified`` took no override."""
+    ``--allow-unqualified`` took no override; ``check_refusals`` the refusals a ``--check`` of these plans would give
+    (the CLI's), so printed lines are ``--report`` lines then."""
     plans: list[LoadedPlan]
     candidates: dict[Key, list[Candidate]]
     chosen: dict[Key, Candidate]
@@ -185,14 +187,16 @@ class Selection:
     notes: list[str] = field(default_factory=list)
     tree: Path | None = None
     override_notes: dict[Key, str] = field(default_factory=dict)
+    check_refusals: list[str] = field(default_factory=list)
 
     def plan(self, sha256: str) -> LoadedPlan:
         return next(p for p in self.plans if p.sha256 == sha256)
 
     @property
     def applied_overrides(self) -> frozenset[Key]:
-        """The tasks whose selected run the convergence override accepted (OR-027)."""
-        return frozenset(key for key, cand in self.chosen.items() if cand.waived)
+        """The tasks with a run the convergence override accepted (OR-027), selected or not: a printed line of an
+        ambiguous task of such runs carries the override, or its --choose would name a FAIL."""
+        return frozenset(key for key, cands in self.candidates.items() if any(c.waived for c in cands))
 
 
 def _one_line(text: object) -> str:
@@ -707,7 +711,7 @@ def select(plans: list[LoadedPlan], *, choose: Mapping[Key, Path] | None = None,
             # counts as the FAIL it is, beside the PASS (OR-027, HF-057)
             for cand in candidates:
                 if cand.waived:
-                    cand.verdict, cand.waived = FAILED, None
+                    cand.verdict, cand.waived, cand.waivable = FAILED, None, False
                     cand.reasons = [f"its {REPORT_NAME} is a deterministic FAIL: {row}" for row in cand.failed_rows] + [
                         "the convergence override was not applied to it: a qualified run of this task passed"]
         valid = [c for c in candidates if c.verdict == VALID]
@@ -733,10 +737,9 @@ def select(plans: list[LoadedPlan], *, choose: Mapping[Key, Path] | None = None,
             sel.states[key] = MISSING
             sel.unresolved[key] = "no valid run" + ("" if candidates else " and no job")
     for key in sorted(allow - sel.applied_overrides):
-        chosen = sel.chosen.get(key)
         sel.override_notes[key] = (
-            "a qualified run of the task was selected" if chosen is not None else
-            "no run of the task was selected" if any(c.waivable for c in sel.candidates[key]) else
+            "a qualified run of the task passed, and is preferred to any FAIL the override would accept"
+            if any(c.verdict == VALID for c in sel.candidates[key]) else
             "no run of the task failed its convergence row alone, on otherwise usable evidence")
     return sel
 
@@ -804,11 +807,12 @@ def _rerun_block(plan: LoadedPlan, by_class: Mapping[str, list[int]], assemblies
     q = shlex.quote
     plan_arg, sha = q(str(plan.path)), plan.sha256
     classes = {c["name"]: c for c in plan.data["classes"]}
+    stop = (f"STOP: a block of this report was already pasted ({marker} exists, or cannot be made), so nothing was "
+            "submitted now: make a new report for what remains")
     lines = [f"cd {q(str(plan.code_repo))} && (",
              'bbsim_stop() { echo "STOP: $1 was not submitted (exit $2); what was submitted before it keeps running, '
              'and nothing after it was submitted."; exit 1; }',
-             f'mkdir {q(str(marker))} || {{ echo "STOP: a block of this report was already pasted ({marker} exists, '
-             'or cannot be made), so nothing was submitted now: make a new report for what remains"; exit 1; }']
+             f"mkdir {q(str(marker))} || {{ echo {q(stop)}; exit 1; }}"]
     for job in assemblies:
         if job != current_job:
             lines.append(f"squeue -h -j {job} -t PENDING -o %i 2>/dev/null | grep -qx {job} && scancel {job}")
@@ -833,9 +837,10 @@ def _rerun_block(plan: LoadedPlan, by_class: Mapping[str, list[int]], assemblies
 
 
 def _line_mode(sel: Selection) -> str:
-    """The mode of a printed assembler line: ``--check`` (the assembly's refusals) unless a plan is a probe, which
-    ``--check`` refuses, or the plans need a ``--tree`` the report was not given; then ``--report``."""
-    if any(p.policy == "probe" for p in sel.plans) or sel.tree is None:
+    """The mode of a printed assembler line: ``--check`` (the assembly's refusals) unless a ``--check`` of these plans
+    would refuse (a probe plan, the plans' commits or worktrees, include jobs, a ``--tree`` the report was not given:
+    ``check_refusals``); then ``--report``."""
+    if sel.check_refusals or any(p.policy == "probe" for p in sel.plans) or sel.tree is None:
         return "--report"
     return "--check"
 
@@ -921,13 +926,16 @@ def _lines(sel: Selection, mode: str, stamp: str) -> tuple[list[str], bool, str]
                 by_class.setdefault(_class_of(plan, key[1]), []).append(key[1])
             assemblies = [r["id"] for r in records if r.get("kind") == "assembly"]
             marker = rerun_marker(plan, stamp)
-            lines.append("# Paste exactly ONE of the three blocks below, and only once sacct shows every listed task "
-                         "has ended (no PENDING, RUNNING, REQUEUED or SUSPENDED State in the line below), in a shell "
-                         f"that has sourced bb_env.sh. Each block first makes {marker}, so this report admits one "
-                         "block of this plan, pasted once; each reruns these tasks through the licence guard (OR-045) "
-                         "from the frozen code, cancels a pending assembly of the plan first, and submits a new one "
-                         "that waits for the reruns.")
             listed = [f"{a}_{key[1]}" for key in rerun for a in _arrays(records, cands, key[1])]
+            when = ("only once sacct shows every listed task has ended (no PENDING, RUNNING, REQUEUED or SUSPENDED "
+                    "State in the line below)" if listed else
+                    "only once squeue shows none of these tasks queued (no array that submissions.log or the jobs "
+                    "record holds them, so no sacct line can show it)")
+            lines.append(f"# Paste exactly ONE of the three blocks below, and {when}, in a shell that has sourced "
+                         f"bb_env.sh. Each block first makes {marker}, so this report admits one block of this plan, "
+                         "pasted once; each reruns these tasks through the licence guard (OR-045) from the frozen "
+                         "code, cancels a pending assembly of the plan first, and submits a new one that waits for "
+                         "the reruns.")
             if listed:
                 lines.append(f"sacct -X -n -j {','.join(listed)} -o JobID%18,State%14")
             for variant, title in (("", "Block 1, with each class's resources:"),
@@ -954,7 +962,7 @@ def _lines(sel: Selection, mode: str, stamp: str) -> tuple[list[str], bool, str]
                     lines.append(_check_line(sel, "--choose", f"{key[0] + ':' if several else ''}{key[1]}="
                                                               f"{q(str(cand.job))}"))
         waivable = [c for c in sel.candidates[key] if c.verdict == FAILED and c.waivable]
-        if waivable:
+        if waivable and not any(c.verdict == VALID for c in sel.candidates[key]):
             lines.append(f"# {_task_name(sel, key)} failed only its convergence row, on otherwise usable evidence: the "
                          "diagnostic override accepts it only when asked (OR-027), recording it and rewriting nothing "
                          "(in a shell that has sourced bb_env.sh):")
@@ -1155,20 +1163,21 @@ def main(argv: list[str] | None = None) -> int:
         tree = _tree(args, plans)
         problems = [assembler_problem(plans), *map(worktree_problem, plans)]
         notes = [problem for problem in problems if problem is not None]
+        refusals = []                  # what a --check of these plans refuses, in order (an existing tree aside)
+        probes = [str(p.path) for p in plans if p.policy == "probe"]
+        if probes:
+            refusals.append(f"the probe plan(s) {probes} are diagnostics, never assembled: --report reports them")
+        refusals += notes
+        included = [str(p.path) for p in plans if p.data.get("include_jobs")]
+        if included:
+            refusals.append(f"the plan(s) {included} record include jobs, which this version of bbsim.assemble does "
+                            "not check")
+        if tree is None:
+            refusals.append(f"the plans record the trees {sorted({str(p.data.get('tree')) for p in plans})}, not one "
+                            "absolute tree: give --tree")
         if mode != "report":
-            probes = [str(p.path) for p in plans if p.policy == "probe"]
-            if probes:
-                raise AssembleRefused(f"the probe plan(s) {probes} are diagnostics, never assembled: --report "
-                                      "reports them")
-            if notes:
-                raise AssembleRefused(notes[0])
-            included = [str(p.path) for p in plans if p.data.get("include_jobs")]
-            if included:
-                raise AssembleRefused(f"the plan(s) {included} record include jobs, which this version of "
-                                      "bbsim.assemble does not check")
-            if tree is None:
-                raise AssembleRefused(f"the plans record the trees {sorted({str(p.data.get('tree')) for p in plans})}, "
-                                      "not one absolute tree: give --tree")
+            if refusals:
+                raise AssembleRefused(refusals[0])
             for path in (tree, tree.with_name(tree.name + ".partial")):
                 if os.path.lexists(path):
                     raise AssembleRefused(f"{path} exists; the assembly writes a new tree only"
@@ -1186,6 +1195,7 @@ def main(argv: list[str] | None = None) -> int:
         selection = select(plans, choose=choose, allow_unqualified=allow, expect_incidence=expect)
         selection.notes += notes
         selection.tree = tree
+        selection.check_refusals = refusals
     except AssembleRefused as exc:
         print(f"assemble: refused: {_one_line(exc)}", file=sys.stderr)
         return 2
