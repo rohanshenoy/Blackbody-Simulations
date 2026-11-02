@@ -57,13 +57,14 @@ The assembly alone takes the assembler's ``--choose [PLAN_SHA256:]INDEX=JOB``, `
 ``extra_args``: each is checked before anything is reserved, by the assembler's own parser and its reading of these
 choices against the plan (``assemble.parse_choices``), with absolute paths, no empty value and no control character
 (``--tree`` not for a probe plan, which assembles no tree). ``job-field extra_args`` prints them one argument per
-line, each line ending in a newline, and nothing at all for none, so a bash 3.2 script passes them on without
-``eval``::
+line, each line ending in a newline, and nothing at all for none, so a bash script passes them on without ``eval``,
+under ``set -u`` too (``${ARGS[@]+...}`` expands an empty array to no word on bash 3.2, where a bare ``"${ARGS[@]}"``
+is an unbound variable, and on 4.4 and later)::
 
     EXTRA=$(python -m bbsim.array_submit job-field extra_args) || exit 2
     ARGS=()
     if [ -n "$EXTRA" ]; then while IFS= read -r a; do ARGS+=("$a"); done <<< "$EXTRA"; fi
-    python assemble_hfss_dataset.py --plan "$PLAN" --plan-sha256 "$SHA256" "${ARGS[@]}"
+    python assemble_hfss_dataset.py --plan "$PLAN" --plan-sha256 "$SHA256" ${ARGS[@]+"${ARGS[@]}"}
 
 CLI (``--root`` names the shared guard, by default ``licence_guard.DEFAULT_ROOT``): ``submit PLAN SHA256
 {array,monitor,assembly} [--class NAME] [--dependency DEP] [--choose C]... [--allow-unqualified A]... [--tree T]``

@@ -7,7 +7,8 @@ refuses the tree. ``invariant(sidecar)`` builds the representation its sidecar p
 - ``schema``: the integer major of ``schema_version`` ("1" or "1.x" is 1, "2" or "2.x" is 2);
 - ``excitation``: only ``incident_phi_deg`` and ``incident_theta_deg``;
 - ``frames``: only ``hfss_global_axes_in_canonical`` and ``exit_cs_axes_in_canonical``;
-- ``symmetry`` and ``boundaries``: their blocks;
+- ``symmetry`` and ``boundaries``: their blocks, whose flags must be booleans and whose boundary names strings, as
+  BBRsim's loader requires (BBR024), so a value it refuses is refused here even when every frequency agrees on it;
 - ``geometry``: ``extent_mm``, and ``shape`` when the sidecar has one;
 - ``modes``: the block without ``basis`` and ``propagating_count``;
 - ``cross_section``: ``exit_field.cross_section``, which is not a top-level key of a sidecar.
@@ -51,10 +52,14 @@ def _block(parent: Mapping, key: str, where: str) -> Mapping:
     return value
 
 
-def _present(block: Mapping, keys: tuple[str, ...], where: str) -> None:
+def _present(block: Mapping, keys: tuple[str, ...], where: str, kind: type, what: str) -> None:
     missing = [k for k in keys if k not in block]
     if missing:
         raise InvariantError(f"{where} lacks {', '.join(missing)}")
+    for key in keys:
+        if not isinstance(block[key], kind):
+            raise InvariantError(f"{where}.{key} must be {what}, got {block[key]!r} (BBRsim's loader refuses it, "
+                                 "BBR024)")
 
 
 def _numbers(block: Mapping, key: str, where: str) -> list:
@@ -103,9 +108,9 @@ def invariant(sidecar: Mapping) -> dict:
     frames = _block(sidecar, "frames", "")
     hfss_axes, exit_axes = _axes(frames, "hfss_global_axes_in_canonical"), _axes(frames, "exit_cs_axes_in_canonical")
     symmetry = _block(sidecar, "symmetry", "")
-    _present(symmetry, SYMMETRY_FLAGS, "symmetry")
+    _present(symmetry, SYMMETRY_FLAGS, "symmetry", bool, "true or false")
     boundaries = _block(sidecar, "boundaries", "")
-    _present(boundaries, BOUNDARY_NAMES, "boundaries")
+    _present(boundaries, BOUNDARY_NAMES, "boundaries", str, "a string")
     geometry = _block(sidecar, "geometry", "")
     extent = _block(geometry, "extent_mm", "geometry.")
     _finite(extent, ("p", "l", "g"), "geometry.extent_mm.")
