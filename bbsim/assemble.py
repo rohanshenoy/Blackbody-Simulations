@@ -48,26 +48,27 @@ ambiguous until ``--choose`` names one; with none it is ``failed`` when a determ
 every candidate with its verdict and reasons and every foreign entry; for a task with no valid run and no FAIL its
 ``sacct -j <A>_<index>`` lines (``submissions.log``'s arrays holding it) and the guarded rerun block from the plan's
 frozen code (``python -m bbsim.array_submit rerun`` with the class's resources, then a new assembly after the reruns,
-any pending assembly of the plan's cancelled first), and the same block with twice the class's time (TIMEOUT) and
-twice its memory (OUT_OF_MEMORY), never more cores. One block of the three is pasted, once every listed task has ended
-(the ``sacct -X`` line printed above them, when an array holds them): each makes ``<RUN>/rerun_<report stamp>`` first
-with ``mkdir``, so a second paste of any block of the report stops before submitting (one marker per plan; each plan's
-blocks rerun only its own tasks). A plan with tasks still unresolved and nothing to rerun, or whose tasks this report
-resolved with a ``--choose`` or the convergence override (except inside a logged assembly job of the plan, whose
-choices they are), gets the guarded re-assembly instead, which makes ``<RUN>/reassemble_<report stamp>`` first in the
-same way. Every assembly these lines submit carries the report's ``--choose`` and applied ``--allow-unqualified``
-of that plan and its ``--tree`` (``array_submit``'s assembly arguments), so the guarded job assembles what the report
+any pending assembly of the plan's cancelled first), and the same block with twice the class's time (TIMEOUT) and twice
+its memory (OUT_OF_MEMORY), never more cores. One block of the three is pasted, once every listed task has ended (the
+``sacct -X`` line printed above them, when an array holds them): each makes ``<RUN>/rerun_<report stamp>`` first with
+``mkdir``, so a second paste of any block of the report stops before submitting (one marker per plan; each plan's blocks
+rerun only its own tasks). A plan with tasks still unresolved and nothing to rerun, a plan whose tasks this report
+resolved with a ``--choose`` or the convergence override, and a production plan whose every task has one valid run (its
+assembly job may have stopped without writing the tree) get the guarded re-assembly instead, except inside a logged
+assembly job of the plan (the job those lines would submit); it makes ``<RUN>/reassemble_<report stamp>`` first in the
+same way. Every assembly these lines submit carries the report's ``--choose`` and applied ``--allow-unqualified`` of
+that plan and its ``--tree`` (``array_submit``'s assembly arguments), so the guarded job assembles what the report
 selected. No guarded assembly is printed (``_guard_blocker``; the rerun blocks then rerun and submit none, and the
 re-assembly line is left out with the reason) for a report of several plans, whose tree is assembled by hand from the
-printed ``--check`` and assembly lines of the report's plans and ``--tree``; while the tree or its ``.partial`` is in
-the way; or when ``--check``'s tree checks failed. ``--choose`` lines
-for an ambiguous task and an ``--allow-unqualified`` line for a FAIL the override could accept, which it never applies
-unasked (nor where a qualified run of the task passed), are ``--check`` lines with the report's ``--tree``, or
-``--report`` lines whenever a ``--check`` of the plans would refuse (a probe plan, plans at different commits or
-worktrees off them, a ``--tree`` the report was not given, an existing tree or ``<TREE>.partial``); they carry the
-overrides that accepted a run of their task. For every array of the plan ``sacct``, the ``du -sh`` of each job and its
-``.aedtresults``, and the hosts' ``TempDirectory`` lines. Every line holds real values (paths, digests, indices, job
-ids), so it is pasted as printed. Its last line is ``REPORT PASS``/``REPORT FAIL: ...`` or ``CHECK PASS``/``CHECK
+printed ``--check`` and assembly lines of the report's plans and ``--tree`` (no assembly line where a check would refuse
+or the tree checks failed); while the tree or its ``.partial`` is in the way; or when ``--check``'s tree checks failed.
+``--choose`` lines for an ambiguous task and an ``--allow-unqualified`` line for a FAIL the override could accept, which
+it never applies unasked (nor where a qualified run of the task passed), are ``--check`` lines with the report's
+``--tree``, or ``--report`` lines whenever a ``--check`` of the plans would refuse (a probe plan, plans at different
+commits or worktrees off them, a ``--tree`` the report was not given, an existing tree or ``<TREE>.partial``); they
+carry the overrides that accepted a run of their task. For every array of the plan ``sacct``, the ``du -sh`` of each job
+and its ``.aedtresults``, and the hosts' ``TempDirectory`` lines. Every line holds real values (paths, digests, indices,
+job ids), so it is pasted as printed. Its last line is ``REPORT PASS``/``REPORT FAIL: ...`` or ``CHECK PASS``/``CHECK
 FAIL: ...``.
 
 ``assemble`` writes the tree once every task has one valid run (HF-057, S65, G4-012). The include jobs are those the
@@ -91,8 +92,9 @@ Then it makes ``<TREE>.partial`` with an exclusive ``mkdir`` (its parents as nee
 byte (never ``project/``, ``scratch/`` or logs), re-hashes every copy and compares it with the digest it was verified at
 (the CSVs' bytes and rows with the sidecar's too), writes ``tree_manifest.json`` (``TREE_SCHEMA``) and ``SHA256SUMS``
 (``sha256sum -c`` format, the paths under ``waveguides/`` and ``tree_manifest.json`` in C order), checks ``<TREE>`` is
-still absent and renames ``.partial`` to it. Any failure after the ``mkdir``, a SIGTERM included, removes ``.partial``.
-Its last line is ``ASSEMBLY PASS: <n> datasets + <m> included -> <TREE>; <id>: <f>, ... GHz x <keys> keys`` per ID, or
+still absent and renames ``.partial`` to it. Any failure after the ``mkdir``, a SIGTERM included, removes ``.partial``
+and the parents made for it; what cannot be removed is named, ``.partial`` with its paste-ready ``rm -rf`` line. Its
+last line is ``ASSEMBLY PASS: <n> datasets + <m> included -> <TREE>; <id>: <f>, ... GHz x <keys> keys`` per ID, or
 ``ASSEMBLY FAIL: ...``.
 
 The CLI: ``--report`` reports any plan, a probe's too; ``--check`` is the go/no-go before an assembly: the report,
@@ -1072,15 +1074,20 @@ def _lines(sel: Selection, mode: str, stamp: str) -> tuple[list[str], bool, str]
         open_tasks = any(k[0] == plan.sha256 for k in unresolved)
         # Inside a guarded assembly of the plan (its own --report too) the choices are that job's: no second one
         inside = current_job is not None and current_job in [r["id"] for r in records if r.get("kind") == "assembly"]
-        decided = any(a in ("--choose", "--allow-unqualified") for a in extra) and mode != "assembly" and not inside
-        if (open_tasks or decided) and blocker is not None:
+        decided = any(a in ("--choose", "--allow-unqualified") for a in extra)
+        # A production plan whose tasks all have a run gets the line too: its assembly job may have stopped (TIMEOUT,
+        # OUT_OF_MEMORY, a SIGKILL during its cleanup) without writing the tree
+        ready = mode != "assembly" and not inside and (decided or plan.policy == "production")
+        if (open_tasks or ready) and blocker is not None:
             if len(sel.plans) == 1:
                 lines.append(f"# No guarded re-assembly is printed: {blocker}.")
-        elif open_tasks or decided:
+        elif open_tasks or ready:
             assemblies = [r["id"] for r in records if r.get("kind") == "assembly" and r["id"] != current_job]
             marker = reassembly_marker(plan, stamp)
             when = ("once the tasks above are settled" if open_tasks else
-                    "with this report's choices, which the assembly submitted before does not take")
+                    "with this report's choices, which the assembly submitted before does not take" if decided else
+                    "should the assembly submitted before not have written the tree (it stopped, timed out or ran out "
+                    "of memory), pasted only once squeue shows no assembly of the plan running")
             lines.append(f"# A new assembly of the plan {plan.path} through the guard, {when}; it makes {marker} "
                          "first, so this report submits it once, and a pending assembly of the plan is cancelled first "
                          "(in a shell that has sourced bb_env.sh):")
@@ -1099,6 +1106,8 @@ def _lines(sel: Selection, mode: str, stamp: str) -> tuple[list[str], bool, str]
         lines.append(_check_line(sel))
         if sel.check_refusals:
             lines.append(f"# No assembly line: the assembly would refuse ({_one_line(sel.check_refusals[0])}).")
+        elif sel.tree_checks is not None and sel.tree_checks["problems"]:
+            lines.append("# No assembly line: the tree checks failed (above), and the assembly would fail them too.")
         else:
             lines.append(_check_line(sel, mode="assembly"))
     for key in unresolved:
@@ -1663,14 +1672,21 @@ class _Sigterm:
         raise SystemExit(EXIT_SIGTERM)
 
 
-def _write_tree(tree: Path, plans: Sequence[LoadedPlan], items: Sequence[TreeInput], record: Mapping) -> int:
+def _write_tree(tree: Path, plans: Sequence[LoadedPlan], items: Sequence[TreeInput], record: Mapping,
+                left: list[str]) -> int:
     """``<TREE>.partial`` by an exclusive ``mkdir``, the copies re-hashed against what was verified, the tree
     manifest, ``SHA256SUMS``, the rename; any failure removes ``.partial``. A SIGTERM handler is installed (in the main
     thread) before ``.partial`` is made and kept through its removal, which a SIGTERM never interrupts: the assembly
     then ends with exit 143. Returns the files ``SHA256SUMS`` lists. Raises ``AssembleRefused`` when another
     ``.partial`` appeared since the checks, ``_Failed`` for every failure, the tree's parent or ``.partial`` that
-    cannot be made included."""
+    cannot be made included. A failure removes ``.partial`` and the parent directories made for the tree; what cannot
+    be removed is put in ``left`` and printed (``.partial`` with its paste-ready ``rm -rf`` line)."""
     partial = partial_path(tree)
+    made_parents = []                                      # the tree's missing ancestors, deepest first
+    ancestor = tree.parent
+    while not os.path.lexists(ancestor) and ancestor != ancestor.parent:
+        made_parents.append(ancestor)
+        ancestor = ancestor.parent
     sigterm = _Sigterm()
     previous = signal.signal(signal.SIGTERM, sigterm) if threading.current_thread() is threading.main_thread() \
         else None
@@ -1723,15 +1739,34 @@ def _write_tree(tree: Path, plans: Sequence[LoadedPlan], items: Sequence[TreeInp
         raise _Failed([f"writing {partial} failed: {_one_line(exc)}"]) from exc
     finally:
         sigterm.cleaning = True
-        if made and not renamed:
-            shutil.rmtree(partial, ignore_errors=True)
-            if os.path.lexists(partial):
-                print(f"WARN: {partial} could not be removed; once no assembly runs: rm -rf "
-                      f"{shlex.quote(str(partial))}")
+        if not renamed:
+            left += _remove_partial(partial if made else None, made_parents)
         if previous is not None:
             signal.signal(signal.SIGTERM, previous)
         if sigterm.pending and not renamed:            # a whole tree, renamed, stays a success
             raise SystemExit(EXIT_SIGTERM)
+
+
+def _remove_partial(partial: Path | None, made_parents: Sequence[Path]) -> list[str]:
+    """After a failure: remove ``partial`` (when this assembly made it) and the empty parents made for the tree,
+    deepest first; print and return what is left (``.partial`` with its ``rm -rf`` line, to paste once no assembly
+    runs; a parent someone else wrote into is named, never removed)."""
+    left = []
+    if partial is not None:
+        shutil.rmtree(partial, ignore_errors=True)
+        if os.path.lexists(partial):
+            print(f"WARN: {partial} could not be removed; remove it once no assembly of the plan runs:")
+            print(f"rm -rf {shlex.quote(str(partial))}")
+            left.append(str(partial))
+    for directory in made_parents:
+        if not os.path.lexists(directory):
+            continue
+        try:
+            os.rmdir(directory)
+        except OSError:
+            print(f"WARN: {directory}, made for the tree, is left: it is not empty")
+            left.append(str(directory))
+    return left
 
 
 def _assembly_job() -> dict | None:
@@ -1834,10 +1869,12 @@ def assemble(selection: Selection, *, tree: Path, include_jobs: Sequence[Path]) 
             print(f"include {item.job}: {item.dataset_id} at {item.frequency_ghz:g} GHz "
                   f"({item.entry['acceptance_kind']}), re-validated, its {len(item.entry['evidence'])} recorded files "
                   "unchanged since planning")
+    left: list[str] = []
     try:
-        listed = _write_tree(tree, plans, items, _tree_record(selection, tree, items))
+        listed = _write_tree(tree, plans, items, _tree_record(selection, tree, items), left)
     except _Failed as failed:
-        return _fail(failed.problems, "no tree written, and nothing of it left")
+        return _fail(failed.problems, f"no tree written; left: {', '.join(left)} (the lines above)" if left else
+                     "no tree written, and nothing of it left")
     print(f"copied {listed - 1} files into {tree / WAVEGUIDES}, each re-hashed against what was verified; {SUMS} lists "
           f"them and {TREE_MANIFEST}")
     summary = []
