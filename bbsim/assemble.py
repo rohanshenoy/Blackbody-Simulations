@@ -7,6 +7,7 @@ Usage::
                              [--tree PATH] [--check | --report] [--report-path PATH]
                              [--choose [PLAN_SHA256:]INDEX=JOB]... [--expect-incidence THETAS:PHIS]
                              [--allow-unqualified [PLAN_SHA256:]INDEX]... [--include-job JOB]...
+    assemble_hfss_dataset.py --verify TREE [--report-path PATH]
 
 ``load_plan`` reads a plan once, checks the sha256 the caller recorded for it against those bytes and parses the same
 bytes. ``select`` finds every task's candidates and gives each a verdict:
@@ -107,7 +108,9 @@ runner requires of a task), a plan's worktree ``<RUN>/code`` off the plan's comm
 tracked files (``code_state``), an existing tree, or a ``<TREE>.partial`` (refused with the paste-ready ``squeue``
 line that shows no assembly job of the plans runs, and the ``rm -rf`` line); ``--report`` prints those as ``WARN:``
 lines. The assembly proper (neither option) takes the same refusals, prints the report, and writes the tree when every
-task has one valid run. ``--verify`` is not available in this version. Exit codes: 2 refused before anything was
+task has one valid run. ``--verify TREE`` (``verify``) re-checks a written tree, anywhere, against BBRsim's loader
+rules with the standard library only (``bbsim.tree_verify``, so it runs on Fir); it reads no plan and takes no option
+but ``--report-path``, and is dispatched before anything else is read. Exit codes: 2 refused before anything was
 judged or created, 1 a task without exactly one valid run, a failed check or a failure while writing (the
 ``.partial`` removed), or a report that could not be written, 0 success.
 
@@ -116,7 +119,8 @@ and git timeout), ``bbsim.tree_invariant`` (standard library; its names are this
 ``bbsim.acceptance_gate`` at module level (the binding, the required acceptance and the convergence gate, one
 implementation shared with the bridge's ``assemble_tree.sbatch``; HF-057); ``acceptance_gate.report_problems`` imports
 the checkers (numpy, pandas), so the selection runs in the bb venv. ``bbsim.array_plan`` and ``bbsim.config``
-(standard library at import) are imported where they are used.
+(standard library at import) are imported where they are used, and so is ``bbsim.tree_verify`` (standard library and
+``bbsim.tree_invariant``), so ``--verify`` needs nothing outside the standard library.
 """
 from __future__ import annotations
 
@@ -1902,6 +1906,14 @@ def assemble(selection: Selection, *, tree: Path, include_jobs: Sequence[Path]) 
     return 0
 
 
+def verify(tree: Path | str, *, report_path: Path | str | None = None) -> int:
+    """``--verify TREE``: ``bbsim.tree_verify.verify`` (its module docstring has the rules), imported here so the
+    assembler's own imports stay as they are. 0 ``VERIFY PASS``, 1 ``VERIFY FAIL: ...``, 2 an unusable path."""
+    from bbsim import tree_verify
+
+    return tree_verify.verify(tree, report_path=report_path)
+
+
 # --- the CLI ----------------------------------------------------------------------------------------------------------
 
 def _parser() -> argparse.ArgumentParser:
@@ -1914,7 +1926,8 @@ def _parser() -> argparse.ArgumentParser:
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="the report under the assembly's refusals")
     mode.add_argument("--report", action="store_true", help="the report only; probe plans are accepted")
-    p.add_argument("--report-path", type=Path, help="write the JSON report here (default <RUN>/assembly_<utc>.json)")
+    p.add_argument("--report-path", type=Path, help="write the JSON report here, a new file (default "
+                                                    "<RUN>/assembly_<utc>.json; with --verify, none)")
     p.add_argument("--choose", action="append", default=[], metavar="[PLAN_SHA256:]INDEX=JOB",
                    help="the valid run to assemble for an ambiguous task")
     p.add_argument("--include-job", action="append", default=[], metavar="JOB",
@@ -1923,7 +1936,9 @@ def _parser() -> argparse.ArgumentParser:
                    help="the incidence every sidecar declares, two comma lists of degrees (default the plan's)")
     p.add_argument("--allow-unqualified", action="append", default=[], metavar="[PLAN_SHA256:]INDEX",
                    help="accept a task's run whose only failed row is a missed convergence target (OR-027; diagnostic)")
-    p.add_argument("--verify", type=Path, metavar="TREE", help="re-check a tree with the standard library only")
+    p.add_argument("--verify", type=Path, metavar="TREE",
+                   help="re-check a written tree against BBRsim's loader rules with the standard library only; takes "
+                        "no option but --report-path")
     return p
 
 
@@ -1999,10 +2014,18 @@ def main(argv: list[str] | None = None) -> int:
         args = _parser().parse_args(argv)
     except SystemExit as exc:                     # argparse has printed its message
         return 2 if exc.code else 0
+    if args.verify is not None:                   # before any plan is read or anything heavier imported (HF-057)
+        given = [option for option, value in (("--plan", args.plan), ("--plan-sha256", args.plan_sha256),
+                                              ("--tree", args.tree), ("--check", args.check), ("--report", args.report),
+                                              ("--choose", args.choose), ("--include-job", args.include_job),
+                                              ("--expect-incidence", args.expect_incidence),
+                                              ("--allow-unqualified", args.allow_unqualified))
+                 if value not in (None, False, [])]
+        if given:
+            return _refused(AssembleRefused(f"--verify takes no plan or selection option: {', '.join(given)}"))
+        return verify(args.verify, report_path=args.report_path)
     mode = "check" if args.check else "report" if args.report else "assembly"
     try:
-        if args.verify is not None:
-            raise AssembleRefused("--verify is not available in this version of bbsim.assemble")
         if not args.plan or len(args.plan) != len(args.plan_sha256):
             raise AssembleRefused(f"give each --plan with its --plan-sha256 ({len(args.plan)} plans, "
                                   f"{len(args.plan_sha256)} digests)")
