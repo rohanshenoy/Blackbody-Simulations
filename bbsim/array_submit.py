@@ -7,8 +7,10 @@ line (exit 2):
 
 - the plan file's bytes have the given sha256 and schema ``bbsim-array-plan/2``, and it is its ``run_dir``'s
   ``plan.json``;
-- the guard is the plan's: ``Guard.root`` is the plan's ``guard_dir``, and an inherited ``BBSIM_LICENCE_GUARD`` names
-  the same directory (the guard checks both again; a second guard cannot bypass the cap);
+- the guard is the shared one and the plan's: ``Guard.root`` is ``licence_guard.DEFAULT_ROOT``
+  (``array_plan.check_shared_guard``; every task refuses another guard at its preflight, OR-045) and the plan's
+  ``guard_dir``, and an inherited ``BBSIM_LICENCE_GUARD`` names the same directory (the guard checks both again; a
+  second guard cannot bypass the cap);
 - the plan's worktree ``<RUN>/code`` is clean at the plan's commit (``manifest.environment_state``, one seam);
 - the plan's bridge is its code checkout's sibling clone ``../bbridge`` (OR-044), checked before anything is captured;
 - an array: its class and indices are the plan's (a rerun's indices lie in one class, and a class already submitted is
@@ -23,7 +25,10 @@ line (exit 2):
   guard (``Guard._read_reservations``) that is pending, uncertain or bound, or released with a job id, lacks its
   ``submissions.log`` line (``_unaccounted``): such a job was or may have been submitted, and the refusal names
   ``reconcile --resolve`` when its job is unknown, else the planner's ``--log-submission`` line. ``remaining`` prints
-  no block while one exists, only those lines;
+  no block while one exists, only those lines. A rerun is not in that check (``_unaccounted`` leaves reruns out; a
+  class's indices may be rerun any number of times): an uncertain rerun is settled by the guard itself, whose
+  admission refuses every submission that holds a slot while an uncertain reservation holds slots (a rerun holds at
+  least one, so a second paste of the same rerun is refused too), until ``reconcile --resolve`` settles it;
 - the plan's own sbatch arguments pass ``licence_guard.check_user_sbatch_args`` and set none of the resources the plan
   sets itself (``PLAN_RESOURCE_OPTIONS``); a dependency is ``after[any|ok|notok]:JOBID[:JOBID...]``;
 - the script is the git blob of the recorded bridge commit with the recorded sha256 (``capture_script``): a commit or
@@ -66,7 +71,8 @@ is an unbound variable, and on 4.4 and later)::
     if [ -n "$EXTRA" ]; then while IFS= read -r a; do ARGS+=("$a"); done <<< "$EXTRA"; fi
     python assemble_hfss_dataset.py --plan "$PLAN" --plan-sha256 "$SHA256" ${ARGS[@]+"${ARGS[@]}"}
 
-CLI (``--root`` names the shared guard, by default ``licence_guard.DEFAULT_ROOT``): ``submit PLAN SHA256
+CLI (``--root`` names the shared guard, ``licence_guard.DEFAULT_ROOT``, its default and the only root it takes, for
+every command: OR-045): ``submit PLAN SHA256
 {array,monitor,assembly} [--class NAME] [--dependency DEP] [--choose C]... [--allow-unqualified A]... [--tree T]``
 (the last three the assembly's), full option names only; ``rerun PLAN SHA256 --indices I,J [--mem M] [--time T]
 [--qos Q]``, nothing else; ``throttle PLAN SHA256 ARRAY_ID THROTTLE``, a live throttle change of an array of this plan
@@ -291,6 +297,7 @@ def _check_root(plan: Mapping, guard: Any) -> Path:
     root = getattr(guard, "root", None)
     if not isinstance(root, Path):
         raise SubmitError(f"submit takes a licence_guard.Guard, got {type(guard).__name__}")
+    _plan_check(array_plan.check_shared_guard, root, "the guard's root")
     recorded = _get(plan, "guard_dir")
     if not isinstance(recorded, str) or Path(recorded).resolve() != root:
         raise SubmitError(f"the plan's guard_dir {recorded!r} is not this guard {root}; one guard holds the shared cap "
@@ -490,7 +497,8 @@ def _unaccounted(guard: Any, plan_sha256: str, lines: Sequence[Mapping]) -> list
     """This plan's first submissions (no rerun) that the guard's reservations show were or may have been made and that
     ``submissions.log`` has no line for: a reservation pending, uncertain or bound, or released with a job id, whose
     id and job id no log line names. One released with no job id (resolved as not submitted) is left out. Read with
-    the guard's own reader; nothing is reserved or changed."""
+    the guard's own reader; nothing is reserved or changed. Reruns are left out: an uncertain rerun is settled by the
+    guard's admission, which refuses every slot while an uncertain reservation holds slots, not by this log."""
     try:
         records = guard._read_reservations()
     except licence_guard.GuardError as exc:
@@ -1018,7 +1026,8 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m bbsim.array_submit", allow_abbrev=False,
                                 description="Submit a job-array plan's jobs through the licence guard (OR-045).")
     p.add_argument("--root", type=Path, default=None,
-                   help=f"the shared guard directory (default {licence_guard.DEFAULT_ROOT})")
+                   help=f"the shared guard directory, its default {licence_guard.DEFAULT_ROOT} and the only one "
+                        "taken (OR-045)")
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("submit", allow_abbrev=False, help="submit one array (a class), the monitor or the assembly")
     s.add_argument("plan", type=Path)
@@ -1062,12 +1071,13 @@ def main(argv: list[str] | None = None, *, scheduler: Any = None, env: Environme
     except SystemExit as exc:                    # argparse has printed its message
         return 2 if exc.code else 0
     try:
+        root = _plan_check(array_plan.check_shared_guard,
+                           args.root if args.root is not None else licence_guard.DEFAULT_ROOT, "--root")
         if args.command == "job-field":
-            value = job_field(args.name, environ=environ, root=args.root, module_root=module_root)
+            value = job_field(args.name, environ=environ, root=root, module_root=module_root)
             # A list prints one line per element and nothing for none (extra_args, read with while read)
             sys.stdout.write(value + "\n" if value or args.name != "extra_args" else "")
             return 0
-        root = args.root if args.root is not None else licence_guard.DEFAULT_ROOT
         guard = licence_guard.Guard(root, scheduler if scheduler is not None else licence_guard.SlurmScheduler())
         if args.command == "remaining":
             print(remaining_block(args.plan, args.sha256, guard=guard))

@@ -26,11 +26,13 @@ creates nothing until every check has passed; each refusal is one ``PlanError`` 
   run only warns about); cores, the throttle L, the classes (which partition the task indices, their throttles summing
   to L), the resources, the stagger and the AEDT temp settings are well formed;
 - every ``--sbatch-arg`` passes ``licence_guard.check_user_sbatch_args`` and sets none of ``PLAN_RESOURCE_OPTIONS``,
-  which the plan sets itself; ``--licence-cap`` is 1 to 10; ``--guard-dir``
-  and an inherited ``BBSIM_LICENCE_GUARD`` are the guard's root; every pending or running array the guard manages
-  (comment ``bbsim:``) runs at the plan's ``--cores``, read from ``scontrol show job``, since arrays at two core counts
-  share the per-user ``pyaedt_config`` registry entry; and the guard's reconciled usage plus L fits the smaller of the
-  ceiling and the cap. That count is advisory: admission is repeated at every submission (OR-045);
+  which the plan sets itself; ``--licence-cap`` is 1 to 10; ``--guard-dir`` is the shared guard
+  ``licence_guard.DEFAULT_ROOT`` (``check_shared_guard``: every task refuses another guard at its preflight, so no plan
+  names one; OR-045), and it and an inherited ``BBSIM_LICENCE_GUARD`` are the guard's root; every pending or running
+  array the guard manages (comment ``bbsim:``) runs at the plan's ``--cores``, read from ``scontrol show job``, since
+  arrays at two core counts share the per-user ``pyaedt_config`` registry entry; and the guard's reconciled usage plus
+  L fits the smaller of the ceiling and the cap. That count is advisory: admission is repeated at every submission
+  (OR-045);
 - each ``--include-job`` (HF-057, S65) is a schema-2 job of another dataset ID on the expected incidence grid, qualified
   for both polarizations (``acceptance_gate.convergence_problems``), whose files are its sidecar's and whose recorded
   acceptance passes the gate (``required_acceptance``, then ``report_problems`` on its bound report); an ``array_run``
@@ -70,9 +72,11 @@ captured from that copy, with ``config.build_config`` and exactly five overrides
 
 After writing the plan the CLI prints its submission block (``submission_block``; OR-044, OR-045, HF-057): from the
 frozen code ``<RUN>/code``, one ``python -m bbsim.array_submit submit`` line per class, the licence monitor when the
-plan runs one, and the assembly after every array; then the rerun and throttle lines. Every job goes through the guard
-from the recorded bridge blob, and nothing in the block calls sbatch or scontrol. A line refused part way through
-prints what remains of the block, with the ids already admitted (``python -m bbsim.array_submit remaining``).
+plan runs one, and the assembly after every array; then the rerun lines and the throttle line, ``python -m
+bbsim.array_submit throttle``, which records the change in ``submissions.log`` (the guard's own ``licence_guard
+throttle``, named beside it, records nothing there). Every job goes through the guard from the recorded bridge blob, and
+nothing in the block calls sbatch or scontrol. A line refused part way through prints what remains of the block, with
+the ids already admitted (``python -m bbsim.array_submit remaining``).
 ``--submit`` does the same at once (``array_submit.submit_plan``); ``plan_hfss_array.py --log-submission RUN KIND
 ID`` records a job submitted by hand, with no admission (``array_submit.log_submission``).
 
@@ -404,6 +408,27 @@ def _integer(value: object, what: str, lo: int, hi: int | None = None) -> int:
         bounds = f"from {lo} to {hi}" if hi is not None else f"of at least {lo}"
         raise PlanError(f"{what} must be an integer {bounds}, got {value!r}")
     return value
+
+
+def check_shared_guard(root: object, what: str) -> Path:
+    """``root`` resolved, when it is the shared licence guard ``licence_guard.DEFAULT_ROOT`` (resolved too, so a link
+    to it is it). One guard holds the cap of 10 HFSS solves at a time (OR-045), and every task's preflight refuses a
+    plan naming another (the runner's plan mode, exit 2), so the planner refuses such a ``--guard-dir`` before anything
+    is written and ``bbsim.array_submit`` such a ``--root`` before anything is reserved. Raises ``PlanError``."""
+    try:
+        here = Path(os.fspath(root)).resolve(strict=True)
+    except (OSError, RuntimeError, TypeError) as exc:
+        raise PlanError(f"{what} {root} cannot be reached ({exc})") from None
+    try:
+        shared = Path(licence_guard.DEFAULT_ROOT).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise PlanError(f"the shared licence guard {licence_guard.DEFAULT_ROOT} cannot be reached ({exc}); it is "
+                        "created once, by hand") from None
+    if here != shared:
+        raise PlanError(f"{what} {here} is not the shared licence guard {shared}: one guard holds the cap of "
+                        f"{licence_guard.CEILING} HFSS solves at a time, and every task refuses another guard at its "
+                        "preflight (OR-045)")
+    return here
 
 
 def _mem(value: object, what: str) -> str:
@@ -1019,10 +1044,7 @@ def _draft(o: PlanOptions, env: EnvironmentState, guard: Any, now: datetime, rep
     if twice:
         uses = ", ".join(f"{n}, which the plan sets itself: use {PLAN_RESOURCE_OPTIONS[n]}" for n in twice)
         raise PlanError(f"--sbatch-arg sets {uses}; sbatch would take one of the two values silently (HF-057)")
-    try:
-        guard_dir = Path(os.fspath(o.guard_dir)).resolve(strict=True)
-    except (OSError, RuntimeError, TypeError) as exc:
-        raise PlanError(f"--guard-dir {o.guard_dir} cannot be reached ({exc})") from None
+    guard_dir = check_shared_guard(o.guard_dir, "--guard-dir")
     if guard_dir != guard.root:
         raise PlanError(f"--guard-dir {guard_dir} is not the guard's root {guard.root}; one guard holds the shared "
                         "cap (OR-045)")
@@ -1320,10 +1342,12 @@ def submission_block(plan_path: Path, plan_sha256: str, plan: Mapping[str, Any],
               f"#   cd {code} && python -m bbsim.array_submit rerun {plan_arg} {plan_sha256} --indices I,J "
               "[--mem MEM] [--time TIME] [--qos QOS]",
               f"#   cd {code} && {submit} assembly --dependency afterany:RERUN_ID",
-              "# Live throttle changes go through the guard from the frozen code, never through scontrol;",
-              f"# submissions.log records one only through python -m bbsim.array_submit throttle {plan_arg} "
-              f"{plan_sha256} ARRAY_ID THROTTLE:",
-              f"#   cd {code} && python -m bbsim.licence_guard throttle ARRAY_ID THROTTLE --cap {plan['licence_cap']}"]
+              "# Live throttle changes go through the guard from the frozen code, never through scontrol; this line",
+              "# also records the change in submissions.log:",
+              f"#   cd {code} && python -m bbsim.array_submit throttle {plan_arg} {plan_sha256} ARRAY_ID THROTTLE",
+              f"# (the guard's own python -m bbsim.licence_guard throttle ARRAY_ID THROTTLE --cap "
+              f"{plan['licence_cap']} changes it as well and",
+              "# records nothing in submissions.log.)"]
     return "\n".join(lines)
 
 
@@ -1392,7 +1416,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="scripts/hpc/hfss of the code checkout's sibling bridge clone ../bbridge, the only bridge a "
                         "plan takes (OR-044); the default")
     p.add_argument("--guard-dir", type=Path, default=licence_guard.DEFAULT_ROOT,
-                   help="the shared licence guard (default %(default)s)")
+                   help="the shared licence guard, its default %(default)s and the only one a plan takes (OR-045)")
     p.add_argument("--sbatch-arg", dest="sbatch_args", action="append", default=[], metavar="OPT",
                    help="an extra sbatch option from the guard's allowlist, given as --sbatch-arg=--nodelist=NODE "
                         "(repeatable)")
