@@ -7,7 +7,8 @@ scheduler-enforced limit would cover those.
 
 The lock is an atomic ``os.mkdir(<root>/lock)`` holding ``owner.json`` {nonce, host, boot_id, pid, process_start,
 slurm_job, utc}; ``flock`` on a network filesystem is not relied on. A waiting client retries every ``LOCK_POLL_S``
-seconds for ``lock_timeout_s`` and then refuses with ``lock_info``'s observation and the recovery command. A lock is
+seconds for ``lock_timeout_s`` (``LOCK_TIMEOUT_S`` for the operator's commands, ``IN_JOB_LOCK_TIMEOUT_S`` for a
+job's launch lease) and then refuses with ``lock_info``'s observation and the recovery command. A lock is
 never broken because it is old: a crashed owner's lock is removed only by one operator's ``recover-lock --expected-lock
 TOKEN --confirm-quiescent REASON``, after every guard client is stopped and the owner is verified dead (its pid and
 start time on its own host), or, when the record is absent or cannot be verified from here, after the whole workflow
@@ -131,6 +132,13 @@ BRIDGE_SCRIPTS_DIR = Path("scripts/hpc/hfss")
 
 LOCK_POLL_S = 0.2
 SCHEDULER_TIMEOUT_S = 30.0
+# The operator's commands (submit, status, ...) wait LOCK_TIMEOUT_S for the guard lock and then refuse with the
+# lock's observation. The lease calls a running job makes (acquire before AEDT, the launch scope and processes, the
+# settle after release_desktop) wait IN_JOB_LOCK_TIMEOUT_S: a concurrent submission holds the lock for an squeue, one
+# scontrol per counted array and one sacct per bound job that has left the queue, each up to SCHEDULER_TIMEOUT_S, and
+# a lease that times out ends a task whose queue time is spent, or leaves its lease held (HF-057, OR-045).
+LOCK_TIMEOUT_S = 60.0
+IN_JOB_LOCK_TIMEOUT_S = 600.0
 
 KINDS = ("array", "single", "reexport", "monitor", "assembly")
 ZERO_SLOT_KINDS = ("monitor", "assembly")
@@ -1231,7 +1239,7 @@ class _Reconciled:
 class Guard:
     """The shared admission in ``root`` (resolved once), with its scheduler and this host's launch-scope observer."""
 
-    def __init__(self, root: str | os.PathLike, scheduler: Scheduler, *, lock_timeout_s: float = 60.0,
+    def __init__(self, root: str | os.PathLike, scheduler: Scheduler, *, lock_timeout_s: float = LOCK_TIMEOUT_S,
                  clock: Callable[[], float] = time.time, observer: Any = None):
         try:
             resolved = Path(root).resolve(strict=True)
@@ -2294,11 +2302,14 @@ def launch_lease_from_env(identity: dict, *, cleanup_wait_s: float = CLEANUP_WAI
 
     On exit, whatever happened inside, ``settle_lease`` polls the lease's scope every ``CLEANUP_POLL_S`` for up to
     ``cleanup_wait_s`` and releases it on ``stopped``, or keeps it held and logs what it saw (HF-058(2)). A failure to
-    settle leaves the lease held and is logged, never raised over the body's own exception.
+    settle leaves the lease held and is logged, never raised over the body's own exception. Every lock this lease's
+    guard takes waits up to ``IN_JOB_LOCK_TIMEOUT_S``, since a concurrent submission can hold it longer than the
+    operator's ``LOCK_TIMEOUT_S``.
     """
     wait = _check_wait(cleanup_wait_s)
     found = check_job_guard()
-    guard = Guard(found["root"], scheduler if scheduler is not None else SlurmScheduler(), observer=observer)
+    guard = Guard(found["root"], scheduler if scheduler is not None else SlurmScheduler(),
+                  lock_timeout_s=IN_JOB_LOCK_TIMEOUT_S, observer=observer)
     lease = LaunchLease(guard.acquire_lease(reservation_id=found["reservation"], identity=identity), guard)
     try:
         yield lease
