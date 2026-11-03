@@ -10,17 +10,20 @@ take; a tree that passes is one BBRsim's loader accepts as far as these rules re
 - every entry under ``waveguides/`` is a directory ``<id>_<token>GHz_Ephi=0`` or ``=1`` or a sidecar file
   ``<id>_<token>GHz.dataset.json``: the token is the text after the last ``_`` and before ``GHz``, which must parse in
   full as C ``strtod`` parses it and be above 0 and finite, and the ID is the rest (``BBRCrackLibrary::Discover``). A
-  dataset directory without the frequency (``<id>_Ephi=0``) is refused (BBR011); any other entry (a token that does not
-  parse, which BBRsim would skip, a stray file or directory) fails;
+  dataset directory without the frequency (``<id>_Ephi=0``) is refused (BBR011); any other entry fails, a name BBRsim
+  skips (a token that does not parse, a frequency in MHz or THz, ``<id>_Ephi=1``) as not a dataset of this tree, and a
+  stray file or directory;
 - every stem is a whole dataset: its sidecar beside both Ephi directories, so an orphan or a partial trio fails
   (BBR024 without the sidecar; BBR001 and BBR002 without a directory's CSVs), and no two stems of one ID name the same
   frequency ("500" and "5e2"; BBR011);
 - each Ephi directory holds ``far_field.csv`` and ``waveguide.csv``, optionally ``manifest.json``, and nothing else; an
   empty one fails (BBR001, BBR002);
-- each sidecar is JSON, schema 2.x (one schema per tree, and the trees this assembler writes are schema 2, S65), whose
-  ``dataset_id`` and ``frequency_label`` are its name's and whose ``frequency_ghz`` is within 0.1 % of the directory
-  frequency (``BBRDatasetSidecar::Parse``, BBR024); its ``files`` has exactly the four CSV keys, each recording the
-  file's sha256, bytes and rows (the non-blank lines after the header), as BBRsim's validator checks them (BBR024);
+- each sidecar is JSON as BBRsim's parser takes it (no NaN or Infinity, no number beyond a double's range), schema 2.x
+  (one schema per tree, and the trees this assembler writes are schema 2, S65), whose ``dataset_id`` and
+  ``frequency_label`` are its name's and whose ``frequency_ghz`` is within 0.1 % of the directory frequency
+  (``BBRDatasetSidecar::Parse``, BBR024); its ``far_field.columns`` and ``exit_field.columns`` are the schema-2 lists
+  (absent BBR024, otherwise BBR025); its ``files`` has exactly the four CSV keys, each recording the file's sha256,
+  bytes and rows (the non-blank lines after the header), as BBRsim's validator checks them (BBR024);
 - per dataset ID, every sidecar's ``tree_invariant.invariant`` agrees with the lowest frequency's on the blocks
   BBRsim's reader compares (``InvariantDiff``, BBR024; G4-012), through the same projection the assembly uses;
 - each CSV's header is the schema-2 column list of its file (one leading UTF-8 byte-order mark and one trailing CR
@@ -33,9 +36,11 @@ BBRsim's loader checks every row's ``Freq`` and much more of each sidecar and ta
 its validator, with ``sha256sum -c SHA256SUMS``, is the check of record where this one stops. ``verify`` prints one
 ``FAIL:`` line per problem (an entry refused once is not reported again by the rules that would read it), then
 ``VERIFY PASS: <n> datasets -> <TREE>; <id>: <f>, ... GHz x <keys> keys`` per ID (exit 0) or ``VERIFY FAIL: <n>
-problem(s) in <TREE>: <the first>`` (exit 1). It writes nothing into the tree; a report goes only to a new file outside
-it. A path that is not a readable directory, or a report path that exists, has no directory or lies inside the tree, is
-refused (exit 2). It imports the standard library and ``bbsim.tree_invariant`` (standard library) only.
+problem(s) in <TREE>: <the first>`` (exit 1); a name that is not UTF-8 is printed backslash-escaped. It writes nothing
+into the tree; a report goes only to a new file outside it. A path that is not a readable directory, or a report path
+that exists, has no directory or lies inside the tree (by device and inode, so a case variant, a symlink or a bind
+mount is caught), is refused (exit 2). It imports the standard library and ``bbsim.tree_invariant`` (standard library)
+only.
 """
 from __future__ import annotations
 
@@ -78,6 +83,9 @@ _STRTOD = re.compile(r"[ \t\n\v\f\r]*[+-]?(?:"
                      r"|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
                      r"|(?i:inf|infinity|nan))")
 _UNITS = {"mhz": 1e-3, "ghz": 1.0, "thz": 1e3}
+_OTHER_UNIT = re.compile(r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?[A-Za-z]+")    # 500MHz, 0.5THz
+SKIPPED = ("a name BBRsim skips (it reads <id>_<freq>GHz_Ephi=0 or =1 and <id>_<freq>GHz.dataset.json), not a "
+           "dataset of this tree")
 
 
 def strtod_full(token: str) -> float | None:
@@ -98,11 +106,19 @@ def parse_frequency_ghz(token: str) -> float | None:
     return value * mult if value is not None and value > 0 else None
 
 
-def parse_stem(stem: str) -> tuple[str, str, float] | str:
-    """``<id>_<token>GHz`` as (dataset ID, token, frequency in GHz), or what is wrong with it."""
+def parse_stem(stem: str, *, ephi0: bool = False) -> tuple[str, str, float] | str:
+    """``<id>_<token>GHz`` as (dataset ID, token, frequency in GHz), or what is wrong with it. ``ephi0``: the stem is
+    an ``_Ephi=0`` directory's, the one name without a frequency BBRsim refuses (``<id>_Ephi=0``, BBR011); any other
+    name without one it skips."""
     if not stem.endswith("GHz"):
-        return ("a dataset directory without a frequency: BBRsim refuses it (BBR011); its name is "
-                "<id>_<freq>GHz_Ephi=N")
+        last = stem.rpartition("_")[2]
+        if _OTHER_UNIT.fullmatch(last):
+            return (f"a frequency in a unit other than GHz ({last!r}): BBRsim reads only <id>_<freq>GHz and skips this "
+                    "name, not a dataset of this tree")
+        if ephi0:
+            return ("a dataset directory without a frequency: BBRsim refuses <id>_Ephi=0 for a placed crack <id> "
+                    "(BBR011); a dataset's name is <id>_<freq>GHz_Ephi=N")
+        return SKIPPED
     dataset_id, sep, token = stem[:-3].rpartition("_")
     if not sep or not dataset_id:
         return "no dataset ID before the frequency (<id>_<freq>GHz)"
@@ -187,8 +203,14 @@ def _kind(mode: int) -> str:
 
 
 def _one_line(text: object) -> str:
-    """One printed line: line breaks (a path or an error may hold one) become spaces; other spacing is kept."""
-    return re.sub(r"[\r\n]+", " ", str(text))
+    """One printed line: line breaks (a path or an error may hold one) become spaces, other spacing is kept, and what
+    UTF-8 cannot encode (a name that is not UTF-8 arrives from os.listdir as surrogates) is backslash-escaped, so the
+    line prints under a strict UTF-8 stdout."""
+    return re.sub(r"[\r\n]+", " ", str(text)).encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+def _say(text: object) -> None:
+    print(_one_line(text))
 
 
 def _number(value: object) -> bool:
@@ -197,6 +219,24 @@ def _number(value: object) -> bool:
 
 def _no_constant(name: str) -> None:
     raise ValueError(f"{name} is not JSON")
+
+
+def _int(text: str) -> int:
+    """A JSON integer as BBRsim's parser takes it: one beyond a double's range is refused (its parser fails on the
+    overflow), so no later rule meets an integer that a float conversion cannot hold."""
+    value = int(text)
+    try:
+        float(value)
+    except OverflowError:
+        raise ValueError(f"the integer {text[:13]}... ({len(text.lstrip('-'))} digits) overflows a double") from None
+    return value
+
+
+def _float(text: str) -> float:
+    value = float(text)
+    if math.isinf(value):
+        raise ValueError(f"the number {text} overflows a double")
+    return value
 
 
 @dataclass
@@ -316,7 +356,7 @@ class _Verify:
         if match is None:
             self._refuse(path, "a stray directory, not <id>_<freq>GHz_Ephi=0 or =1")
             return
-        parsed = parse_stem(match["stem"])
+        parsed = parse_stem(match["stem"], ephi0=match["ephi"] == "0")
         if isinstance(parsed, str):
             self._refuse(path, parsed)
             return
@@ -370,9 +410,13 @@ class _Verify:
     def _parse_sidecar(self, rel: str, path: Path, data: bytes) -> None:
         stem = self.stems[rel[len(WAVEGUIDES) + 1:-len(SIDECAR_SUFFIX)]]
         try:
-            sidecar = json.loads(data.decode("utf-8"), parse_constant=_no_constant)
+            sidecar = json.loads(data.decode("utf-8"), parse_constant=_no_constant, parse_int=_int,
+                                 parse_float=_float)
         except (UnicodeDecodeError, ValueError) as exc:
-            self.fail(f"{path}: not valid JSON ({exc}) (BBR024)")
+            self.fail(f"{path}: not valid JSON for BBRsim's parser ({exc}) (BBR024)")
+            return
+        except RecursionError:
+            self.fail(f"{path}: not valid JSON for BBRsim's parser (nested too deep to parse) (BBR024)")
             return
         if not isinstance(sidecar, dict):
             self.fail(f"{path}: the top level must be a JSON object (BBR024)")
@@ -421,10 +465,33 @@ class _Verify:
             self.fail(f"{path}: frequency_ghz {frequency!r} is not within 0.1 % of the directory's "
                       f"{stem.frequency:g} GHz (BBR024)")
         self._files_block(stem, path, sidecar.get("files"))
+        self._columns(path, sidecar)
         try:
             stem.projection = invariant(sidecar)
         except InvariantError as exc:
             self.fail(f"{path}: {exc} (BBR024)")
+        except RecursionError:
+            self.fail(f"{path}: a block nested too deep to compare (BBR024)")
+
+    def _columns(self, path: Path, sidecar: dict) -> None:
+        """The declared column lists, as BBRsim's sidecar parser requires them: present (BBR024), an array (BBR024), and
+        exactly the schema-2 list of their file, strings in the order BBRHFSSData reads them (BBR025). A missing
+        ``exit_field`` is the projection's to report."""
+        for block, csv in (("far_field", "far_field.csv"), ("exit_field", "waveguide.csv")):
+            parent, want = sidecar.get(block), list(COLUMNS[csv])
+            if not isinstance(parent, dict):
+                if block == "far_field":
+                    self.fail(f"{path}: far_field is missing or not an object (BBR024)")
+                continue
+            if "columns" not in parent:
+                self.fail(f"{path}: {block}.columns is missing (BBR024)")
+                continue
+            columns = parent["columns"]
+            if not isinstance(columns, list):
+                self.fail(f"{path}: {block}.columns must be an array of column names, got {columns!r} (BBR024)")
+            elif not all(isinstance(c, str) for c in columns) or columns != want:
+                self.fail(f"{path}: {block}.columns {columns!r} differ from the positional order BBRHFSSData reads, "
+                          f"{want!r} (BBR025)")
 
     def _files_block(self, stem: _Stem, path: Path, files: object) -> None:
         want = {f"{stem.name}_Ephi={e}/{csv}" for e in (0, 1) for csv in CSV_NAMES}
@@ -538,13 +605,24 @@ class _Verify:
 
 
 def _refused(tree: Path, problem: str) -> int:
-    print(f"assemble: refused: --verify {tree}: {_one_line(problem)}", file=sys.stderr)
+    print(_one_line(f"assemble: refused: --verify {tree}: {problem}"), file=sys.stderr)
     return 2
 
 
 def _inside(path: Path, tree: Path) -> bool:
-    real, root = os.path.realpath(path), os.path.realpath(tree)
-    return real == root or real.startswith(root.rstrip(os.sep) + os.sep)
+    """Whether the directory ``path`` is the tree or lies under it: some ancestor of it, as written or resolved, is the
+    tree's directory by (device, inode), so a case variant, a symlink, ``..`` or a bind mount of the tree is caught,
+    which no comparison of path strings sees."""
+    root = os.stat(tree)
+    for candidate in (Path(os.path.abspath(path)), Path(os.path.realpath(path))):
+        for ancestor in (candidate, *candidate.parents):
+            try:
+                st = os.stat(ancestor)
+            except OSError:
+                continue
+            if (st.st_dev, st.st_ino) == (root.st_dev, root.st_ino):
+                return True
+    return False
 
 
 def verify(tree: Path | str, *, report_path: Path | str | None = None) -> int:
@@ -570,17 +648,17 @@ def verify(tree: Path | str, *, report_path: Path | str | None = None) -> int:
             return _refused(tree, f"--report-path {target} has no directory")
         if _inside(target.parent, tree):
             return _refused(tree, f"--report-path {target} lies inside the tree, which --verify never writes into")
-    print(f"== bbsim verify: {tree} against BBRsim's loader rules, with the standard library only (HF-057)")
+    _say(f"== bbsim verify: {tree} against BBRsim's loader rules, with the standard library only (HF-057)")
     check = _Verify(tree)
     check.run()
     datasets = check.datasets()
     for problem in check.problems:
-        print(f"FAIL: {problem}")
+        _say(f"FAIL: {problem}")
     if check.problems:
         verdict = f"VERIFY FAIL: {len(check.problems)} problem(s) in {tree}: {check.problems[0]}"
     else:
-        print(f"{SUMS}: {check.listed} files, each verifying; every file under {WAVEGUIDES}/ and {TREE_MANIFEST} "
-              "listed")
+        _say(f"{SUMS}: {check.listed} files, each verifying; every file under {WAVEGUIDES}/ and {TREE_MANIFEST} "
+             "listed")
         verdict = f"VERIFY PASS: {len(check.stems)} datasets -> {tree}; " + "; ".join(
             f"{dataset_id}: {', '.join(f'{f:g}' for f in d['frequencies_ghz'])} GHz x {d['incidence_keys']} keys"
             for dataset_id, d in datasets.items())
@@ -595,9 +673,9 @@ def verify(tree: Path | str, *, report_path: Path | str | None = None) -> int:
         except OSError as exc:
             if created:                                # never a half-written report
                 target.unlink(missing_ok=True)
-            print(f"the report could not be written to {target} ({_one_line(exc)})")
-            print("VERIFY FAIL: the report could not be written")
+            _say(f"the report could not be written to {target} ({exc})")
+            _say("VERIFY FAIL: the report could not be written")
             return 1
-        print(f"report: {target}")
-    print(verdict)
+        _say(f"report: {target}")
+    _say(verdict)
     return 1 if check.problems else 0
