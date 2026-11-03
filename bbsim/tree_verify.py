@@ -11,8 +11,9 @@ take; a tree that passes is one BBRsim's loader accepts as far as these rules re
   ``<id>_<token>GHz.dataset.json``: the token is the text after the last ``_`` and before ``GHz``, which must parse in
   full as C ``strtod`` parses it and be above 0 and finite, and the ID is the rest (``BBRCrackLibrary::Discover``). A
   dataset directory without the frequency (``<id>_Ephi=0``) is refused (BBR011); any other entry fails, a name BBRsim
-  skips (a token that does not parse, a frequency in MHz or THz, ``<id>_Ephi=1``) as not a dataset of this tree, and a
-  stray file or directory;
+  skips (a token that does not parse, NaN, 0 or below, a frequency in MHz or THz, ``<id>_Ephi=1``) as not a dataset of
+  this tree, an infinite token as one BBRsim lists and then refuses at its sidecar (BBR024), and a stray file or
+  directory;
 - every stem is a whole dataset: its sidecar beside both Ephi directories, so an orphan or a partial trio fails
   (BBR024 without the sidecar; BBR001 and BBR002 without a directory's CSVs), and no two stems of one ID name the same
   frequency ("500" and "5e2"; BBR011);
@@ -122,10 +123,17 @@ def parse_stem(stem: str, *, ephi0: bool = False) -> tuple[str, str, float] | st
     dataset_id, sep, token = stem[:-3].rpartition("_")
     if not sep or not dataset_id:
         return "no dataset ID before the frequency (<id>_<freq>GHz)"
+    # BBRCrackLibrary::Discover takes a token strtod parses in full to a value above 0: it skips any other (NaN, 0
+    # and below), and lists an infinite one, whose sidecar BBRDatasetSidecar::Load then refuses (BBR024)
     value = strtod_full(token)
-    if value is None or not (value > 0 and math.isfinite(value)):
-        return (f"the frequency {token!r} does not parse as BBRsim parses one (a number in full, above 0 and finite; "
-                "BBRsim skips such a directory)")
+    if value is None:
+        return (f"the frequency {token!r} does not parse as BBRsim parses one (a number in full): BBRsim skips such a "
+                "directory, not a dataset of this tree")
+    if not value > 0:
+        return (f"the frequency {token!r} is not above 0: BBRsim skips such a directory, not a dataset of this tree")
+    if not math.isfinite(value):
+        return (f"the frequency {token!r} is infinite: BBRsim lists such a directory as a frequency and then refuses "
+                "its sidecar (BBR024)")
     return dataset_id, token, value
 
 
