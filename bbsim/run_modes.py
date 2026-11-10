@@ -12,22 +12,30 @@ One job builds the bore and solves its ports, in its own directory ``<root>/<dat
 4. AEDT session 2 (``run_frequency.open_session``, under the CLI's temp mode) opens that project, sets driven modal,
    and is the verification: the opened design is the spec's bore (``build_project.verify_build``: name, units, one
    bare vacuum object, the bounding box and both end faces to 1e-6 mm). port1 goes on the end face at z = 0, port2 on
-   the one at z = L, the wall on the remaining curved face.
+   the one at z = L, the wall on the remaining face, curved. Its area as AEDT gives it is recorded beside 2 pi r L, as
+   information: the faces are identified without it.
 5. The wall, the mesh, two N-mode wave ports and one ports-only setup per frequency (``bbsim.modes_setup``), then one
    solve of every setup with the config's cores; AEDT's messages are logged and kept in ``logs/aedt_messages.txt``.
+   ``analyze`` returning True proves nothing, so every setup must then hold its one solution before the project is
+   saved.
 6. Per setup, every port mode's Gamma, and a Touchstone export into ``scratch/`` as evidence; a failed export is a
-   warning row, not a failure, since the acceptance check reads ``modes.csv`` alone.
+   warning row, not a failure, since the acceptance check reads ``modes.csv`` alone. AEDT's messages are kept again
+   after the reads, so an export's reason stays in the record.
 7. AEDT's temp directory is restored, ``modes.csv`` is written and self-checked (``bbsim.modes``), and
    ``modes_manifest.json`` records the run. Its top-level ``acceptance`` block, {bore_um: the bore's diameter in um,
    rho_ohm_m: 1/sigma, null for a pec wall}, is what the bridge script hands to the acceptance check.
 
-Exit codes: 0, every self-check row of fail severity passed; 1, a self-check failed (the CSV is written), or a read
-or a write failed after a finished solve (the solved project, AEDT's messages and a manifest whose ``passed`` is false
-are kept); 2, refused before AEDT (arguments, config, the guard, the checkout, an existing job directory); 3, the
-build or an AEDT session failed, the design would not take driven modal, or the opened design is not the spec's bore
-(the project and a manifest are kept). Every run with a job directory writes the manifest; SIGTERM raises
-``SystemExit(143)`` as in ``run_frequency``, and its cleanup runs on the way out. The last line on stdout is
-``== modes: PASS`` or ``== modes: FAIL <what>``.
+Exit codes: 0, every self-check row of fail severity passed; 1, a self-check failed (the CSV is written), or a read, a
+write or the self-check itself failed after a finished solve (the solved project, AEDT's messages and a manifest whose
+``passed`` is false are kept); 2, refused before AEDT (arguments, config, the guard, the checkout, an existing job
+directory); 3, the build or an AEDT session failed, the design would not take driven modal, the opened design is not
+the spec's bore, the solve left a setup without its solution, or the project could not be saved after the solve, since
+the solution may then not be on disk (the project and a manifest are kept).
+
+Once the run log is open and ``effective_config.json`` written, every run writes the manifest however it ends,
+SIGTERM aside, with a null sha256 for a project it cannot read; a failure to open the log or write that file stops
+the run before, with a traceback on stderr and exit 1. SIGTERM raises ``SystemExit(143)`` as in ``run_frequency``, and
+its cleanup runs on the way out. The last line on stdout is ``== modes: PASS`` or ``== modes: FAIL <what>``.
 """
 from __future__ import annotations
 
@@ -69,7 +77,6 @@ MANIFEST_NAME = "modes_manifest.json"
 CSV_NAME = "modes.csv"
 MESSAGES_NAME = "aedt_messages.txt"
 TEMP_MODES = ("off", "task")   # env is not offered: AEDT 2025.2 ignored TMPDIR on the cluster (OR-047 amended)
-SIDE_AREA_RTOL = 1e-6          # the side face's area against 2 pi r L, as check_face_area's end faces
 BUILD_TEMP = tempdir.TempSettings()   # the build's launch sets no temp directory
 _NAMED = 8
 
@@ -190,7 +197,8 @@ def bore_faces(design: Mapping[str, Any], spec: GeometrySpec) -> dict[str, Any]:
     The design must be the spec's bare bore (``verify_build``: name, units, one object, material, the bounding box and
     both planar end faces on the axis to 1e-6 mm, their areas) and the object vacuum (CDX-029). The entrance, port1, is
     the planar face on the spec's plane z = 0; the exit, port2, the one on z = L; the side, which takes the wall, the
-    one face left, curved, of area 2 pi r L. Returns {entrance, exit: FaceInfo, side: its inventory record};
+    one face left, curved. Returns {entrance, exit: FaceInfo, side: its inventory record, side_area: {area_mm2 as AEDT
+    gave it, expected_mm2 = 2 pi r L, ratio}}, the area information only (null when AEDT gave none);
     ``BoreMismatch`` otherwise, and nothing is set up."""
     diffs = verify_build(design, spec)
     if diffs:
@@ -209,16 +217,17 @@ def bore_faces(design: Mapping[str, Any], spec: GeometrySpec) -> dict[str, Any]:
             problems.append(f"{what} face {face.id} is at z = {face.center_mm[2]} mm, not {z} mm")
     rest = [f for f in obj["faces"] if f["id"] not in (entrance.id, exit_face.id)]
     side = rest[0] if len(rest) == 1 and rest[0].get("is_planar") is not True else None
-    area = 2 * math.pi * float(spec.solid.radius_mm) * float(spec.solid.length_mm)
     if side is None:
         problems.append(f"expected one curved side face besides the end faces {entrance.id} and {exit_face.id}, "
                         f"found {[(f['id'], f.get('is_planar')) for f in rest]}")
-    elif abs(float(side["area_mm2"]) - area) > SIDE_AREA_RTOL * area:
-        problems.append(f"side face {side['id']} has area {side['area_mm2']} mm^2, not the bore's 2 pi r L = "
-                        f"{area} mm^2")
     if problems:
         raise BoreMismatch(problems)
-    return {"entrance": entrance, "exit": exit_face, "side": side}
+    expected = 2 * math.pi * float(spec.solid.radius_mm) * float(spec.solid.length_mm)
+    area = side.get("area_mm2")
+    area = float(area) if area is not None else None
+    return {"entrance": entrance, "exit": exit_face, "side": side,
+            "side_area": {"area_mm2": area, "expected_mm2": expected,
+                          "ratio": area / expected if area is not None else None}}
 
 
 # --- the job -----------------------------------------------------------------------------------------------------------
@@ -281,7 +290,7 @@ def _setup(cfg: ModesConfig, hfss: Any, record: dict) -> None:
     log.info("versions: %s", record["versions"])
     record["solution_type"] = set_driven_modal(hfss)
     design = inventory_design(hfss)
-    record["verification"] = {"design": design, "differences": None, "faces": None}
+    record["verification"] = {"design": design, "differences": None, "faces": None, "side_area": None}
     try:
         faces = bore_faces(design, cfg.spec)
     except BoreMismatch as exc:
@@ -289,7 +298,7 @@ def _setup(cfg: ModesConfig, hfss: Any, record: dict) -> None:
         raise
     entrance, exit_face, side = faces["entrance"], faces["exit"], faces["side"]
     record["verification"].update(differences=[], faces={"entrance": asdict(entrance), "exit": asdict(exit_face),
-                                                         "side": side})
+                                                         "side": side}, side_area=faces["side_area"])
     log.info("the opened design is the spec's bore: entrance face %d (z = 0, port1), exit face %d (z = %g mm, port2), "
              "side face %d (the wall)", entrance.id, exit_face.id, cfg.spec.solid.length_mm, side["id"])
     record["wall"] = assign_wall(hfss, side["id"], cfg.wall)
@@ -317,7 +326,22 @@ def _solve(cfg: ModesConfig, hfss: Any, dirs: JobDirs, record: dict) -> None:
     _keep_messages(hfss, dirs, record)
     if not solved:
         raise RuntimeError("hfss.analyze returned False")
-    # AEDT writes the solution into the project's results folder only when the project is saved.
+    # analyze() returning True proves nothing (HPC step 4, baseline1: a licence checkout failure solved nothing): every
+    # setup must hold its one solution, found by the lookup the reads use, or the session failed (exit 3).
+    missing = []
+    for entry in record["setups"]:
+        try:
+            entry["solution"] = solution_of(hfss, entry["name"])
+        except RuntimeError as exc:
+            missing.append(f"{entry['name']}: {exc}")
+        else:
+            record["solutions"].append(entry["solution"])
+    if missing:
+        raise RuntimeError(f"the solve left {len(missing)} of {len(record['setups'])} setups without their solution: "
+                           + "; ".join(missing) + ". AEDT messages: "
+                           + (" | ".join(record["aedt_messages"]) or "(none)"))
+    # AEDT writes the solution into the project's results folder only when the project is saved; a failed save is
+    # exit 3, since the solution may then not be on disk.
     hfss.save_project()
 
 
@@ -326,9 +350,7 @@ def _read(cfg: ModesConfig, hfss: Any, dirs: JobDirs, record: dict) -> list[Gamm
     rows: list[GammaRow] = []
     names = record["ports"]["names"]
     for entry in record["setups"]:
-        setup = entry["name"]
-        entry["solution"] = solution_of(hfss, setup)
-        record["solutions"].append(entry["solution"])
+        setup = entry["name"]     # its solution was found in the solve stage
         got = read_gamma(hfss, setup, names, cfg.ports.modes, entry["frequency_ghz"])
         rows += got
         path = dirs.scratch / f"{setup}.s{len(names) * cfg.ports.modes}p"
@@ -358,6 +380,7 @@ def _build_and_solve(cfg: ModesConfig, dirs: JobDirs, project: Path, temp: tempd
                 _solve(cfg, session.hfss, dirs, record)
                 stage = "read"
                 rows = _read(cfg, session.hfss, dirs, record)
+                _keep_messages(session.hfss, dirs, record)   # a failed export's reason is only in AEDT's messages
                 session.before_write()    # the run's AEDT calls are done: AEDT's temp directory goes back now
                 stage = "done"
             except Exception:
@@ -382,17 +405,66 @@ def _touchstone_row(setups: Sequence[Mapping[str, Any]]) -> CheckRow:
                     "; ".join(failed[:_NAMED]) + (f"; and {more} more" if more > 0 else ""))
 
 
-def _write_and_check(cfg: ModesConfig, dirs: JobDirs, rows: list[GammaRow], record: dict,
-                     environment: EnvironmentState) -> tuple[dict, list[CheckRow]]:
+def _write(cfg: ModesConfig, dirs: JobDirs, rows: list[GammaRow], record: dict, environment: EnvironmentState) -> None:
+    """``modes.csv``, recorded in the manifest's ``outputs`` as soon as it is on disk."""
     path = dirs.root / CSV_NAME
     write_modes_csv(path, rows, csv_provenance(cfg, environment, record["versions"] or {}))
+    record["outputs"] = {"modes_csv": {"path": str(path), "sha256": sha256_file(path), "rows": len(rows)}}
     log.info("wrote %s (%d rows)", path, len(rows))
+
+
+def _check(cfg: ModesConfig, rows: list[GammaRow], record: dict) -> list[CheckRow]:
     checks = self_check(rows, cfg.radius_m, cfg.ports.modes, cfg.ports.frequencies_ghz, cfg.wall.kind)
     checks.append(_touchstone_row(record["setups"]))
     for row in checks:
         verdict = "PASS" if row.passed else ("FAIL" if row.severity == "fail" else "WARN")
         (log.info if row.passed else log.warning)("check %s: %s (%s)", row.name, verdict, row.detail)
-    return {"modes_csv": {"path": str(path), "sha256": sha256_file(path), "rows": len(rows)}}, checks
+    return checks
+
+
+def _project_sha256(project: Path) -> str | None:
+    """The project's sha256, or None when it is absent or cannot be read (a manifest is written either way)."""
+    try:
+        return sha256_file(project) if project.is_file() else None
+    except Exception:  # noqa: BLE001 - recorded as null; the run's own failure keeps its exit code
+        log.exception("the project %s could not be hashed", project)
+        return None
+
+
+def _write_manifest(cfg: ModesConfig, inputs: Mapping[str, Any], dirs: JobDirs, job_id: str, project: Path,
+                    record: dict, checks: Sequence[CheckRow], failure: _Stopped | None, code: int,
+                    launch_timeout_s: float, environment: EnvironmentState, guard: Mapping[str, Any]) -> bool:
+    """Build and write ``modes_manifest.json``; False, logged, if either fails (the caller keeps the exit code the run
+    earned, or makes a pass a failure)."""
+    try:
+        build_record = (record["build"] or {}).get("record") or {}
+        manifest = build_manifest(
+            environment=environment,
+            acceptance=acceptance_block(cfg),
+            job={"id": job_id, "root": str(dirs.root)},
+            **inputs,
+            config=config_record(cfg),
+            spec=asdict(cfg.spec),
+            code={"commit": environment.commit, "clean": not environment.dirty},
+            guard=dict(guard),
+            launches=record["launches"],
+            build=record["build"],
+            project={"path": str(project), "sha256": _project_sha256(project),
+                     "sha256_after_build": build_record.get("output_sha256")},
+            verification=record["verification"], solution_type=record["solution_type"], wall=record["wall"],
+            mesh=record["mesh"], ports=record["ports"], setups=record["setups"], solutions=record["solutions"],
+            versions=record["versions"], aedt=record["aedt"], aedt_temp=record["aedt_temp"],
+            launch_timeout_s=launch_timeout_s, aedt_messages=record["aedt_messages"], timings=record["timings"],
+            outputs=record["outputs"], self_check=[row._asdict() for row in checks], passed=code == 0,
+            exit_code=code,
+            failure=None if failure is None else {"stage": failure.stage, "exit_code": failure.code,
+                                                  "error": failure.error},
+        )
+        write_json(dirs.root / MANIFEST_NAME, manifest)
+    except Exception:  # noqa: BLE001 - a run without its manifest cannot pass
+        log.exception("%s could not be written", MANIFEST_NAME)
+        return False
+    return True
 
 
 def run_job(cfg: ModesConfig, inputs: Mapping[str, Any], dirs: JobDirs, job_id: str, *, temp: tempdir.TempSettings,
@@ -404,51 +476,31 @@ def run_job(cfg: ModesConfig, inputs: Mapping[str, Any], dirs: JobDirs, job_id: 
     record: dict[str, Any] = {
         "launches": 0, "build": None, "verification": None, "solution_type": None, "wall": None, "mesh": None,
         "ports": None, "setups": [], "solutions": [], "versions": None, "aedt": None, "aedt_temp": None,
-        "aedt_messages": [],
+        "aedt_messages": [], "outputs": None,
         "timings": {"wall_s": None, "build_s": None, "setup_s": None, "solve_s": None, "read_s": None}}
     failure: _Stopped | None = None
-    outputs, checks = None, []
+    checks: list[CheckRow] = []
     try:
         rows = _build_and_solve(cfg, dirs, project, temp, launch_timeout_s, record)
     except _Stopped as stop:
         failure = stop
     else:
+        stage = "write"
         try:
-            outputs, checks = _write_and_check(cfg, dirs, rows, record, environment)
+            _write(cfg, dirs, rows, record, environment)
+            stage = "check"
+            checks = _check(cfg, rows, record)
         except Exception as exc:  # noqa: BLE001 - the solve is kept; exit 1
-            log.exception("writing or checking %s failed", CSV_NAME)
+            log.exception("%s %s failed", "writing" if stage == "write" else "self-checking", CSV_NAME)
             log.error(solved_project_kept_message(project))
-            failure = _Stopped(1, "write", _text(exc))
+            failure = _Stopped(1, stage, _text(exc))
     failed_rows = [c.name for c in checks if c.severity == "fail" and not c.passed]
     code = failure.code if failure is not None else (1 if failed_rows else 0)
     record["timings"]["wall_s"] = time.perf_counter() - t_start
-    build_record = (record["build"] or {}).get("record") or {}
-    manifest = build_manifest(
-        environment=environment,
-        acceptance=acceptance_block(cfg),
-        job={"id": job_id, "root": str(dirs.root)},
-        **inputs,
-        config=config_record(cfg),
-        spec=asdict(cfg.spec),
-        code={"commit": environment.commit, "clean": not environment.dirty},
-        guard=dict(guard),
-        launches=record["launches"],
-        build=record["build"],
-        project={"path": str(project), "sha256": sha256_file(project) if project.is_file() else None,
-                 "sha256_after_build": build_record.get("output_sha256")},
-        verification=record["verification"], solution_type=record["solution_type"], wall=record["wall"],
-        mesh=record["mesh"], ports=record["ports"], setups=record["setups"], solutions=record["solutions"],
-        versions=record["versions"], aedt=record["aedt"], aedt_temp=record["aedt_temp"],
-        launch_timeout_s=launch_timeout_s, aedt_messages=record["aedt_messages"], timings=record["timings"],
-        outputs=outputs, self_check=[row._asdict() for row in checks], passed=code == 0, exit_code=code,
-        failure=None if failure is None else {"stage": failure.stage, "exit_code": failure.code,
-                                              "error": failure.error},
-    )
-    try:
-        write_json(dirs.root / MANIFEST_NAME, manifest)
+    if _write_manifest(cfg, inputs, dirs, job_id, project, record, checks, failure, code, launch_timeout_s,
+                       environment, guard):
         log.info("wrote %s", dirs.root / MANIFEST_NAME)
-    except Exception:  # noqa: BLE001 - a run without its manifest cannot pass
-        log.exception("%s could not be written", MANIFEST_NAME)
+    else:
         code = code or 1
     if code == 0:
         line = "== modes: PASS"
