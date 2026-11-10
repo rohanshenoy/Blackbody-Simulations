@@ -62,12 +62,14 @@ PROVENANCE_KEYS = ("dataset_id", "bore_um", "wall_kind", "conductivity_s_per_m",
                    "bbsim_commit", "tree_clean", "aedt_version", "pyaedt_version")
 PORTS = (1, 2)
 FREQUENCY_RTOL = 1e-9        # a row's frequency against the run's, after the export's %.10g
-SIGN_TOL = 1e-9              # alpha and beta may fall below zero by SIGN_TOL k (round-off)
+SIGN_TOL = 1e-9              # a pec wall's alpha and beta may fall below zero by SIGN_TOL k (round-off); a lossy
+                             # wall's may not fall below zero at all, since the acceptance check refuses that on read
 BETA_K_TOL = 1e-6            # beta <= k (1 + BETA_K_TOL)
 PEC_ALPHA_TOL = 1e-6         # a pec wall: alpha <= PEC_ALPHA_TOL beta for every propagating mode
 IMPLIED_CUTOFF_TOL = 0.01    # implied cutoffs against the ideal ones, relative
 PORTS_AGREE_TOL = 1e-3       # port 2's propagating betas against port 1's, relative (a warning)
 GROUP_RTOL = 1e-6            # ideal cutoffs equal to this form one group (degenerate orientations, TE0m with TM1m)
+BORE_RTOL = 1e-9             # compare's --bore-um against each export's bore_um
 # The acceptance check's pairing scales (OR-053): the implied cutoff's tolerance, and alpha's at f >= NEAR f_c and
 # nearer cutoff. The pairing must stay the acceptance check's, so these track it.
 FC_TOL = 0.005
@@ -159,17 +161,29 @@ def write_modes_csv(path: Path, rows: list[GammaRow], provenance: dict[str, str]
 
 def read_modes_csv(path: Path) -> list[GammaRow]:
     """The rows of an export, in file order. ``#`` and blank lines are skipped and other columns ignored. ValueError
-    names a missing column, a value that is not a number, a repeated (frequency, port, mode) or an export with no
-    rows; NaN and inf pass (the self-checks judge them). OSError if the file cannot be read."""
+    names a line the csv module cannot parse, a missing column, a value that is not a number, a repeated (frequency,
+    port, mode) or an export with no rows; NaN and inf pass (the self-checks judge them). OSError if the file cannot
+    be read."""
     numbered = [(number, line) for number, line in enumerate(Path(path).read_text().splitlines(), start=1)
                 if line.strip() and not line.lstrip().startswith("#")]
     reader = csv.DictReader([line for _, line in numbered])
-    missing = [c for c in CSV_COLUMNS if c not in (reader.fieldnames or [])]
+    try:
+        fieldnames = reader.fieldnames
+    except csv.Error as exc:
+        raise ValueError(f"{path}: line {numbered[0][0]}: not readable as CSV: {exc}") from exc
+    missing = [c for c in CSV_COLUMNS if c not in (fieldnames or [])]
     if missing:
         raise ValueError(f"{path}: missing column(s) {', '.join(missing)}; expected {', '.join(CSV_COLUMNS)}")
     rows: list[GammaRow] = []
     seen: set[tuple[float, int, int]] = set()
-    for (number, _), record in zip(numbered[1:], reader):
+    records = iter(reader)
+    for number, _ in numbered[1:]:
+        try:
+            record = next(records)
+        except StopIteration:
+            break
+        except csv.Error as exc:
+            raise ValueError(f"{path}: line {number}: not readable as CSV: {exc}") from exc
         try:
             row = GammaRow(float(record["frequency_ghz"]), int(record["port"]), int(record["mode"]),
                            float(record["alpha_np_per_m"]), float(record["beta_rad_per_m"]))
@@ -227,7 +241,9 @@ def self_check(rows: Sequence[GammaRow], radius_m: float, modes: int, frequencie
                wall_kind: str) -> list[CheckRow]:
     """The producer's checks of an export before it is handed over (OR-053), in order: rows.count, values.finite,
     values.sign, pec.alpha_zero (pec walls only), beta.below_k, propagating.count, implied_cutoff, ports.agree (warn).
-    "Propagating" is beta > alpha; counts are per orientation, as ideal_cutoffs_ghz. Ports are 1 and 2."""
+    "Propagating" is beta > alpha; counts are per orientation, as ideal_cutoffs_ghz. Ports are 1 and 2. values.sign
+    refuses any negative alpha or beta unless the wall is pec, as the acceptance check refuses one when it reads the
+    export; a pec export, which that check never reads, keeps a round-off tolerance of SIGN_TOL k."""
     rows = list(rows)
     freqs = [float(f) for f in frequencies_ghz]
     at: dict[tuple[float, int], list[GammaRow]] = {(f, p): [] for f in freqs for p in PORTS}
@@ -239,7 +255,7 @@ def self_check(rows: Sequence[GammaRow], radius_m: float, modes: int, frequencie
         else:
             at[(f, r.port)].append(r)
     finite = [r for r in rows if all(math.isfinite(v) for v in (r.frequency_ghz, r.alpha_np_per_m, r.beta_rad_per_m))]
-    out = [_rows_count(at, stray, modes), _values_finite(rows), _values_sign(finite)]
+    out = [_rows_count(at, stray, modes), _values_finite(rows), _values_sign(finite, wall_kind == "pec")]
     if wall_kind == "pec":
         out.append(_pec_alpha_zero(finite))
     out += [_beta_below_k(finite), _propagating_count(at, radius_m), _implied_cutoff(at, radius_m), _ports_agree(at)]
@@ -270,14 +286,18 @@ def _values_finite(rows) -> CheckRow:
     return _row("values.finite", problems, f"{len(rows)} rows, every frequency, alpha and beta finite")
 
 
-def _values_sign(finite) -> CheckRow:
+def _values_sign(finite, pec: bool) -> CheckRow:
     problems = []
     for r in finite:
-        floor = -SIGN_TOL * _k(r.frequency_ghz)
+        floor = -SIGN_TOL * _k(r.frequency_ghz) if pec else 0.0
+        allowed = (f"round-off allowed to {floor:.3g} on a pec wall" if pec
+                   else "tolerance 0: the acceptance check refuses a negative value")
         for name, value in (("alpha", r.alpha_np_per_m), ("beta", r.beta_rad_per_m)):
             if value < floor:
-                problems.append(f"{_where(r)}: {name} {value:.6g} below zero (round-off allowed to {floor:.3g})")
-    return _row("values.sign", problems, f"no alpha or beta below -{SIGN_TOL:g} k")
+                problems.append(f"{_where(r)}: {name} {value:.6g} below zero ({allowed})")
+    return _row("values.sign", problems,
+                f"no alpha or beta below -{SIGN_TOL:g} k (round-off on a pec wall)" if pec
+                else "no alpha or beta below zero (tolerance 0, as the acceptance check)")
 
 
 def _pec_alpha_zero(finite) -> CheckRow:
@@ -329,8 +349,11 @@ def _ports_agree(at) -> CheckRow:
         if len(b1) != len(b2):
             problems.append(f"{f:g} GHz: port 1 has {len(b1)} propagating modes, port 2 {len(b2)}")
             continue
-        worst = max((abs(y / x - 1) for x, y in zip(b1, b2)), default=0.0)
-        if not worst <= PORTS_AGREE_TOL:
+        # relative to the larger of the two, so a beta of zero (a propagating row with alpha below it) is compared too
+        off = [d for d in (0.0 if x == y else abs(y - x) / max(abs(x), abs(y)) for x, y in zip(b1, b2))
+               if not d <= PORTS_AGREE_TOL]
+        if off:
+            worst = max(off, key=lambda d: math.inf if math.isnan(d) else d)
             problems.append(f"{f:g} GHz: the ports' sorted propagating betas differ by up to {worst:.3g} relative")
     return _row("ports.agree", problems,
                 f"port 2's sorted propagating betas within {PORTS_AGREE_TOL:g} of port 1's at every frequency",
@@ -526,6 +549,19 @@ def _compare_command(args: argparse.Namespace) -> int:
     except (OSError, ValueError) as exc:
         print(f"compare: cannot read an export: {exc}")
         return 2
+    notes = []
+    for name, provenance in (("A", provenance_a), ("B", provenance_b)):
+        text = provenance.get("bore_um")
+        if text is None:
+            notes.append(f"note: export {name} carries no bore_um; --bore-um is not checked against it")
+            continue
+        try:
+            bore = float(text)
+        except ValueError:
+            bore = math.nan
+        if not math.isclose(bore, args.bore_um, rel_tol=BORE_RTOL, abs_tol=0.0):
+            print(f"compare: cannot use --bore-um {args.bore_um:g}: export {name}'s bore_um is {text}")
+            return 2
     if args.rho is not None:
         rho, source = args.rho, "--rho"
     else:
@@ -538,6 +574,8 @@ def _compare_command(args: argparse.Namespace) -> int:
     print(f"compare: A {args.a}")
     print(f"compare: B {args.b}")
     print(f"bore {args.bore_um:g} um; " + (f"rho {rho:.6g} ohm m ({source})" if rho is not None else source))
+    for note in notes:
+        print(note)
     for key in ("wall_kind", "conductivity_s_per_m"):
         if provenance_a.get(key) != provenance_b.get(key):
             print(f"note: {key} differs: A {provenance_a.get(key)!r}, B {provenance_b.get(key)!r}")
