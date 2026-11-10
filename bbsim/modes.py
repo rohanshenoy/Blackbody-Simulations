@@ -6,6 +6,7 @@ wave port must weight every family by that degeneracy, so a family with degenera
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 from bbsim.dataset_record import C as _C, disc_entries
 
@@ -31,3 +32,12 @@ def cutoff_distance(radius_m: float, frequency_ghz: float) -> float:
     lowest = _TE11_X * _C / (2 * math.pi * radius_m) / 1e9
     limit = max(_MARGIN * frequency_ghz, _MARGIN * lowest)
     return min(abs(frequency_ghz / c - 1.0) for c in ideal_cutoffs_ghz(radius_m, limit))
+
+
+class GammaRow(NamedTuple):
+    """One port mode's propagation constant read from AEDT: alpha = Re Gamma (Np/m), beta = Im Gamma (rad/m)."""
+    frequency_ghz: float
+    port: int
+    mode: int
+    alpha_np_per_m: float
+    beta_rad_per_m: float
