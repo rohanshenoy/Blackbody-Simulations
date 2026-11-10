@@ -1,0 +1,16 @@
+# Vacuum bore of the 2000 um fibre for the ports-only mode study (ledger OR-053): a cylinder in the
+# canonical pose (axis +z from z = 0, centred on x = y = 0). The modes run builds into its own job, so the
+# output below is a placeholder it never writes.
+
+[project]
+output = "/home/rshenoy/BBRSim/projects/unused_by_modes.aedt"
+design = "fibre_bore_D2000um"
+object = "bore"
+dataset_id = "FibreBore_D2000um"
+aedt_version = "2025.2"
+
+[solid]
+kind = "cylinder"
+material = "vacuum"
+radius_mm = 1.0
+length_mm = 1.0

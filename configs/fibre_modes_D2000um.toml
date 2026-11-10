@@ -1,0 +1,23 @@
+# Ports-only mode study of the 2000 um silver bore (ledger OR-053): vacuum cylinder, wave ports on both end faces,
+# bulk finite-conductivity wall, 47 modes per port. Every frequency lies at least 2 % from every ideal cutoff.
+
+[project]
+geometry_spec = "geometries/fibre_bore_D2000um.toml"
+
+[wall]
+kind = "finite_conductivity"
+conductivity_s_per_m = 6.29e7
+
+[ports]
+modes = 47
+frequencies_ghz = [92, 100, 105, 129, 163, 191, 222, 283, 313, 327, 346, 372, 392, 431]
+
+[solver]
+cores = 4
+curvilinear = true
+wall_normal_deviation_deg = 5.0
+port_accuracy_percent = 1
+port_face_max_length_mm = 0.0348
+
+[output]
+root = "/home/rshenoy/BBRSim/outputs"
