@@ -43,11 +43,21 @@ Usage is reconciled under the lock from the scheduler's queue, the reservations 
 
 Admission: the reconciled total plus the new slots must not exceed ``min(CEILING, cap)``, ``cap`` an integer 1 to 10;
 no slot is admitted while an uncertain reservation holds slots. Zero-slot kinds (``monitor``, ``assembly``) are
-logged and never counted. A submission reserves before calling ``sbatch --parsable --export=ALL`` and binds the
-returned id before the lock is released; a non-zero exit, an id that is not a plain number (``;cluster`` is dropped)
-or any interruption (``KeyboardInterrupt`` included) leaves the reservation ``uncertain``, counted, until
-``reconcile --resolve RESERVATION=released|job:<id> --reason TEXT`` after checking ``squeue``; a bind that cannot be
-written after sbatch accepted the job names the job and that command. ``sbatch --wait`` is never run under the lock.
+logged and never counted. The ceiling counts only our own solves, and the licence pool is shared with other users, so
+a submission of one slot or more first reads the licence server (``LmutilServer``, ``lmutil lmstat -f`` per feature)
+outside the lock, never under it: each of ``HEADROOM_FEATURES``, the five features one solve takes one of, must have
+as many free (issued minus in use) as the slots requested, or it refuses before anything is reserved. Under the lock
+the same reading must also hold our own counted slots that have not started (no launch lease yet, so not in lmstat's
+in-use count; ``queued_ours``). A reading that cannot be read is retried every ``HEADROOM_RETRY_INTERVAL_S`` for up to
+``HEADROOM_RETRY_WINDOW_S`` and then refuses, with no override; a full pool, or a feature the server issues none of,
+refuses at once. The reading is advisory, recorded as the reservation context's ``headroom`` and printed as one
+``licence headroom:`` line on stderr. A throttle raise is judged the same way against a reading taken before the lock;
+a lowered throttle never reads the server (OR-045). A submission reserves before calling
+``sbatch --parsable --export=ALL`` and binds the returned id before the lock is released; a non-zero exit, an id that
+is not a plain number (``;cluster`` is dropped) or any interruption (``KeyboardInterrupt`` included) leaves the
+reservation ``uncertain``, counted, until ``reconcile --resolve RESERVATION=released|job:<id> --reason TEXT`` after
+checking ``squeue``; a bind that cannot be written after sbatch accepted the job names the job and that command.
+``sbatch --wait`` is never run under the lock.
 
 Launch leases (``<root>/leases/<id>.json``): every owned AEDT start takes one (``bbsim.session.aedt_session`` through
 ``launch_lease_from_env``). Admission reads only their ``reservation_id`` and ``state``: any state but ``released``
@@ -152,9 +162,11 @@ PENDING_QUEUE_STATES = frozenset({"PENDING"})             # every other listed s
 TERMINAL_STATES = frozenset({"BOOT_FAIL", "CANCELLED", "COMPLETED", "DEADLINE", "FAILED", "NODE_FAIL",
                              "OUT_OF_MEMORY", "PREEMPTED", "REVOKED", "TIMEOUT"})
 
-# Path mode: script name -> (kind, slots). The two existing wrappers and I1's and I2b's zero-slot scripts.
+# Path mode: script name -> (kind, slots). The single-solve, modes and re-export wrappers, and I1's and I2b's
+# zero-slot scripts.
 PATH_MODE_SCRIPTS = {
     "run_frequency.sbatch": ("single", 1),
+    "run_modes.sbatch": ("single", 1),          # the fibre bore's ports-only mode run (OR-053)
     "reexport.sbatch": ("reexport", 1),
     "probe_cluster.sbatch": ("monitor", 0),
     "guard_lock_contention.sbatch": ("monitor", 0),
@@ -217,6 +229,26 @@ EXITED_STATES = frozenset({"Z", "X"})          # exited, not yet reaped: holds n
 CGROUP_V1_PREFERENCE = ("freezer", "pids", "memory", "cpuset", "cpuacct", "cpu")
 AEDT_PROCESS = re.compile(r"ansysedt|AnsysEM|hf3d|hfss", re.IGNORECASE)
 
+# The licence features one HFSS solve (asked for 4 cores, ran on one; HF-060) checks out, one of each (measured
+# 2026-11-10; OR-045). The pool is shared with other users, so a licensed submission first checks each has room for
+# its slots.
+HEADROOM_FEATURES = ("electronics_desktop", "electronics3d_gui", "elec_solve_hfss", "elec_solve_level1",
+                     "elec_solve_level2")
+LMSTAT_TIMEOUT_S = 60.0
+# A reading that fails is retried (OR-045): lmstat could not be read for about a minute on 2026-11-10. Attempts are
+# HEADROOM_RETRY_INTERVAL_S apart, and none starts more than HEADROOM_RETRY_WINDOW_S after the first. A full pool is a
+# reading, not a failure, and is never retried.
+HEADROOM_RETRY_WINDOW_S = 90.0
+HEADROOM_RETRY_INTERVAL_S = 15.0
+_retry_clock = time.monotonic                   # the retry loop's clock and wait (tests replace them)
+_retry_sleep = time.sleep
+LDLINUX_ENV = "BBSIM_LDLINUX"
+DEFAULT_LDLINUX = "/lib64/ld-linux-x86-64.so.2"
+LOADER_EXITS = (126, 127)                       # bash's "cannot execute" and "not found": rerun through the loader
+_USERS_OF = re.compile(r"Users of (\S+):\s+\(Total of ([0-9]+) licenses? issued;\s+Total of ([0-9]+) licenses? "
+                       r"in use\)")
+_LMUTIL_BANNER = re.compile(r"lmutil - Copyright")
+
 
 class GuardError(RuntimeError):
     """The guard cannot admit, reconcile or record something; after a reservation exists, it stays recorded."""
@@ -234,6 +266,11 @@ class LeaseRefused(GuardRefused):
     def __init__(self, message: str, reason: str) -> None:
         super().__init__(message)
         self.reason = reason
+
+
+class LicenceQueryError(GuardError):
+    """The licence server cannot be read for a feature: a variable or lmutil missing, a failed or timed-out lmstat, or
+    no ``Users of`` line for it. ``Guard.submit`` refuses a licensed submission on it, with no override (OR-045)."""
 
 
 @dataclass(frozen=True)
@@ -364,6 +401,107 @@ class _NoScheduler:
         raise GuardError("this guard was opened for its lock only and has no scheduler")
 
     queue = array_throttle = cpus_per_task = terminal_state = submit = set_throttle = _refuse
+
+
+# --- the licence server: headroom before a licensed submission (OR-045) ------------------------------------------
+
+class LicenceServer(Protocol):
+    def counts(self, features: Sequence[str]) -> dict[str, tuple[int, int]]:
+        """(issued, in use) per feature; ``LicenceQueryError`` when the server cannot be read."""
+        ...
+
+
+def parse_lmstat(feature: str, text: str) -> tuple[int, int]:
+    """(issued, in use) from ``lmutil lmstat -f <feature>``'s one line ``Users of <feature>:  (Total of N license(s)
+    issued;  Total of M license(s) in use)``; none, several or one not in that form is a ``LicenceQueryError``."""
+    lines = [line.strip() for line in text.splitlines() if line.strip().startswith(f"Users of {feature}:")]
+    if not lines:
+        raise LicenceQueryError(f"lmstat printed no 'Users of {feature}:' line ({_lmstat_reason(text)})")
+    if len(lines) > 1:
+        raise LicenceQueryError(f"lmstat printed {len(lines)} 'Users of {feature}:' lines, not one: {lines[:3]!r}")
+    match = _USERS_OF.fullmatch(lines[0])
+    if match is None or match.group(1) != feature:
+        raise LicenceQueryError(f"lmstat's line for {feature} is not 'Total of N licenses issued;  Total of M "
+                                f"licenses in use': {lines[0][:200]!r}")
+    return int(match.group(2)), int(match.group(3))
+
+
+def _retry_reason(why: str, limit: int = 200) -> str:
+    """A licence reading's failure on one line, cut to ``limit`` characters, for the retry's stderr line."""
+    text = " ".join(why.split())
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def _lmstat_reason(text: str) -> str:
+    """What lmutil's output says went wrong: its first line containing ``Error``, else its last line that is not
+    lmutil's copyright banner."""
+    shown = [line.strip() for line in text.splitlines() if line.strip()]
+    error = next((line for line in shown if "Error" in line), None)
+    if error is not None:
+        return f"its error: {error[:200]!r}"
+    rest = [line for line in shown if not _LMUTIL_BANNER.match(line)]
+    if rest:
+        return f"its last line: {rest[-1][:200]!r}"
+    return "only lmutil's banner" if shown else "no output"
+
+
+def _run_lmutil(argv: list[str], timeout_s: float) -> tuple[int, str]:
+    """Run ``argv`` with stdout and stderr together, as bash would: an executable that cannot be run is exit 126, one
+    not found (or whose ELF interpreter is missing) exit 127; a timeout is a ``LicenceQueryError``."""
+    try:
+        run = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             timeout=timeout_s)
+    except subprocess.TimeoutExpired as exc:
+        raise LicenceQueryError(f"lmutil timed out after {timeout_s:g} s") from exc
+    except FileNotFoundError as exc:
+        return 127, str(exc)
+    except OSError as exc:                          # permission denied, exec format error
+        return 126, str(exc)
+    return run.returncode, run.stdout.decode(errors="replace")
+
+
+class LmutilServer:
+    """The licence server through ``$ANSYS_ROOT/licensingclient/linx64/lmutil lmstat -c $ANSYSLMD_LICENSE_FILE -f
+    <feature>``, one query per feature with a ``timeout_s`` timeout, as ``monitor_licences.sbatch`` runs it: an exit of
+    126 or 127 reruns the query through the loader ``${BBSIM_LDLINUX:-/lib64/ld-linux-x86-64.so.2}``. The variables
+    are read at each ``counts``, so building one touches nothing; a missing variable or lmutil is reported once, before
+    any feature is queried, since it is no feature's fault. ``environ`` and ``runner`` (``(argv, timeout_s) ->
+    (returncode, output)``) replace ``os.environ`` and the subprocess (tests)."""
+
+    def __init__(self, *, environ: Mapping[str, str] | None = None,
+                 runner: Callable[[list[str], float], tuple[int, str]] | None = None,
+                 timeout_s: float = LMSTAT_TIMEOUT_S):
+        self.environ = environ
+        self.runner = runner if runner is not None else _run_lmutil
+        self.timeout_s = timeout_s
+
+    def counts(self, features: Sequence[str]) -> dict[str, tuple[int, int]]:
+        env = os.environ if self.environ is None else self.environ
+        for name in ("ANSYS_ROOT", "ANSYSLMD_LICENSE_FILE"):
+            if not env.get(name):
+                raise LicenceQueryError(f"{name} is not set: bb_env.sh sets it")
+        lmutil = Path(env["ANSYS_ROOT"]) / "licensingclient" / "linx64" / "lmutil"
+        if not lmutil.is_file():
+            raise LicenceQueryError(f"lmutil is not at {lmutil}")
+        found: dict[str, tuple[int, int]] = {}
+        for feature in features:
+            try:
+                found[feature] = self._query(env, lmutil, feature)
+            except LicenceQueryError as exc:
+                raise LicenceQueryError(f"{feature}: {exc}") from exc
+        return found
+
+    def _query(self, env: Mapping[str, str], lmutil: Path, feature: str) -> tuple[int, int]:
+        query = [str(lmutil), "lmstat", "-c", env["ANSYSLMD_LICENSE_FILE"], "-f", feature]
+        how = "lmutil"
+        code, output = self.runner(query, self.timeout_s)
+        if code in LOADER_EXITS:
+            loader = env.get(LDLINUX_ENV) or DEFAULT_LDLINUX
+            how += f" (direct exit {code}) through the loader {loader}"
+            code, output = self.runner([loader, *query], self.timeout_s)
+        if code != 0:
+            raise LicenceQueryError(f"{how} exited {code}: {_lmstat_reason(output)}")
+        return parse_lmstat(feature, output)
 
 
 # --- identity of this process and of a lock owner -------------------------------------------------------------
@@ -1194,6 +1332,13 @@ def _reservation_problem(rec: Any, error: str | None, stem: str) -> str | None:
     return None if ok else "fields"
 
 
+def format_headroom(headroom: Mapping[str, Any], slots: int) -> str:
+    """The admitted submission's one line: ``licence headroom: <feature> <free> free of <issued>, ... (each solve takes
+    one of each; <slots> requested; OR-045)``, the features in ``HEADROOM_FEATURES``'s order."""
+    parts = [f"{f} {headroom[f][0] - headroom[f][1]} free of {headroom[f][0]}" for f in HEADROOM_FEATURES]
+    return f"licence headroom: {', '.join(parts)} (each solve takes one of each; {slots} requested; OR-045)"
+
+
 def _parse_job_id(stdout: str) -> str | None:
     lines = [line.strip() for line in stdout.splitlines() if line.strip()]
     if len(lines) != 1:
@@ -1234,13 +1379,14 @@ class _Reconciled:
     blocking: list[str]                     # uncertain reservations holding slots
     held: dict[str, int]                    # reservation id -> held leases
     throttles: dict[str, int | None]        # array parent -> ArrayTaskThrottle, for the arrays asked
+    queued: int                             # our counted slots that may still start and hold no lease yet (OR-045)
 
 
 class Guard:
     """The shared admission in ``root`` (resolved once), with its scheduler and this host's launch-scope observer."""
 
     def __init__(self, root: str | os.PathLike, scheduler: Scheduler, *, lock_timeout_s: float = LOCK_TIMEOUT_S,
-                 clock: Callable[[], float] = time.time, observer: Any = None):
+                 clock: Callable[[], float] = time.time, observer: Any = None, licences: LicenceServer | None = None):
         try:
             resolved = Path(root).resolve(strict=True)
         except (OSError, RuntimeError) as exc:
@@ -1255,6 +1401,9 @@ class Guard:
         self.scheduler = scheduler
         # The launch-scope observer of this host (ProcScopeObserver); tests pass one reading a fake /proc.
         self.observer = observer if observer is not None else default_scope_observer()
+        # The licence server read before a licensed submission (OR-045); None is lmutil's, built at the first one,
+        # so the usage, a direct session's slot and the lease calls inside jobs never touch lmutil.
+        self.licences = licences
         self.lock_timeout_s = float(lock_timeout_s)
         self.clock = clock
         self.last_reservation_id: str | None = None
@@ -1544,6 +1693,11 @@ class Guard:
             return 1 if (group.names & SOLVE_JOB_NAMES or managed_slots) else 0
 
         total, sources, uncertain, unmanaged, blocking = 0, [], [], [], []
+        # queued: the slots of ours that may still start a solve and hold no launch lease yet, so lmstat's in-use
+        # count does not hold them (OR-045). A held lease is a started task; a job gone from the queue starts nothing;
+        # an array queues no more than its remaining tasks; jobs submitted outside the guard and leases naming no live
+        # reservation queue nothing here.
+        queued = 0
         counts: dict[str, int] = {}
         bound: dict[str, list[dict]] = {}
         for rid, rec in sorted(records.items(), key=lambda kv: (kv[1].get("created_utc", ""), kv[0])):
@@ -1561,6 +1715,7 @@ class Guard:
             n = max(rec["slots"], held.get(rid, 0))
             counts[rid] = n
             total += n
+            queued += max(0, rec["slots"] - held.get(rid, 0))
             if n:
                 what = state if state == "uncertain" or rec["kind"] == DIRECT_KIND else \
                     "pending with no bind: a crashed submission, uncertain"
@@ -1582,6 +1737,7 @@ class Guard:
                 leases_held = sum(held.get(rec["id"], 0) for rec in recs)
                 n = max(slots, scheduler_count(group, slots > 0), leases_held)
                 total += n
+                queued += max(0, min(n, group.tasks) - leases_held)
                 for rec in recs:
                     counts[rec["id"]] = n
                 if n:
@@ -1631,7 +1787,7 @@ class Guard:
                                           f"({lease['reservation_id']!r})"})
         usage = Usage(total=total, sources=sources, uncertain=uncertain, unmanaged=unmanaged)
         return _Reconciled(usage=usage, groups=groups, counts=counts, blocking=blocking, held=held,
-                           throttles=throttles)
+                           throttles=throttles, queued=queued)
 
     def _reconcile_refusing(self) -> _Reconciled:
         try:
@@ -1652,6 +1808,80 @@ class Guard:
         if state.usage.total + slots > limit:
             raise GuardRefused(f"{what}: {state.usage.total} in use + {slots} requested exceeds {limit}, the smaller "
                                f"of the ceiling {CEILING} (OR-045) and this request's cap {cap}")
+
+    def _licence_answer(self) -> tuple[dict[str, tuple[int, int]] | None, str]:
+        """One attempt at the licence server: all of ``HEADROOM_FEATURES`` read afresh, as ``(counts, "")``, or
+        ``(None, why)`` when it cannot be read (a ``LicenceQueryError``, any other failure, or an answer without two
+        nonnegative integers for every feature)."""
+        try:
+            if self.licences is None:
+                self.licences = LmutilServer()
+            answer = self.licences.counts(HEADROOM_FEATURES)
+        except Exception as exc:                # LicenceQueryError, or a server that failed otherwise
+            return None, str(exc) if isinstance(exc, LicenceQueryError) else f"{type(exc).__name__}: {exc}"
+        counts: dict[str, tuple[int, int]] = {}
+        bad = []
+        for feature in HEADROOM_FEATURES:
+            value = answer.get(feature) if isinstance(answer, Mapping) else None
+            if isinstance(value, (tuple, list)) and len(value) == 2 \
+                    and all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in value):
+                counts[feature] = (value[0], value[1])
+            else:
+                bad.append(f"{feature} {value!r}")
+        if bad:
+            return None, f"its answer holds no issued and in-use counts for {', '.join(bad)}"
+        return counts, ""
+
+    def _read_headroom(self, what: str, outcome: str = "nothing is submitted") -> dict:
+        """The licence reading for a licensed submission or a throttle raise, taken outside the lock: an lmstat can
+        take seconds, and jobs' lease calls wait on the lock (OR-045). An attempt that cannot be read is retried
+        ``HEADROOM_RETRY_INTERVAL_S`` later, each attempt reading every feature afresh, and none starting more than
+        ``HEADROOM_RETRY_WINDOW_S`` after the first; then it refuses, with no override. A feature the server issues
+        none of refuses at once, since nothing will free up. Returns one attempt's complete reading as the reservation
+        records it, ``{feature: [issued, in_use], ..., "utc": ...}``; ``_judge_headroom`` judges it."""
+        first = _retry_clock()
+        attempts = 0
+        while True:
+            attempts += 1
+            counts, why = self._licence_answer()
+            if counts is not None:
+                break
+            now = _retry_clock()
+            if now + HEADROOM_RETRY_INTERVAL_S - first > HEADROOM_RETRY_WINDOW_S:
+                raise GuardRefused(f"{what}: the licence server cannot be read ({why}) after {attempts} "
+                                   f"attempt{'' if attempts == 1 else 's'} over {now - first:g} s, so {outcome}; "
+                                   "there is no override (OR-045)")
+            # The operator's terminal would otherwise stay silent for the whole window. Not the headroom line's start:
+            # a paste expects that once per submission. Stdout stays the job id.
+            print(f"licence server unreadable (attempt {attempts}): {_retry_reason(why)}; the next attempt in "
+                  f"{HEADROOM_RETRY_INTERVAL_S:g} s (OR-045)", file=sys.stderr)
+            _retry_sleep(HEADROOM_RETRY_INTERVAL_S)
+        utc = self._now()
+        none = [f for f, (issued, _) in counts.items() if issued == 0]
+        if none:
+            raise GuardRefused(f"{what}: the licence server issues none of {', '.join(none)} (0 issued), so nothing "
+                               f"will free up and waiting will not help; each solve takes one of each of "
+                               f"{', '.join(HEADROOM_FEATURES)}, so {outcome} (OR-045)")
+        return {**{f: [issued, in_use] for f, (issued, in_use) in counts.items()}, "utc": utc}
+
+    @staticmethod
+    def _judge_headroom(reading: Mapping[str, Any], slots: int, queued: int, what: str,
+                        outcome: str = "nothing was reserved or submitted") -> None:
+        """Each of ``HEADROOM_FEATURES`` must have ``slots`` free (issued minus in use) on top of ``queued``, our own
+        slots that have not started and so are not in lmstat's in-use count. The pool is shared with other users,
+        whom the ceiling does not count, and a solve that cannot check a feature out runs with no solution. The
+        reading is advisory, since another user can take a licence at any moment (OR-045)."""
+        short = []
+        for f in HEADROOM_FEATURES:
+            issued, in_use = reading[f]
+            if issued - in_use < slots + queued:
+                short.append(f"{f} {issued - in_use} free of {issued} ({in_use} in use)"
+                             + (f" with {queued} of ours queued, for {slots} requested" if queued else ""))
+        if short:
+            ours = f" on top of {queued} of ours that have not started" if queued else ""
+            raise GuardRefused(f"{what}: the licence pool, shared with other users, has too few free for {slots} "
+                               f"solve(s){ours}: {'; '.join(short)}. Each solve takes one of each of "
+                               f"{', '.join(HEADROOM_FEATURES)}; {outcome}, so retry once they are free (OR-045)")
 
     def usage(self) -> Usage:
         """The reconciled usage, under the lock."""
@@ -1707,10 +1937,21 @@ class Guard:
         problems = script_directive_problems(data)
         if problems:
             raise GuardRefused("the script's #SBATCH header sets what the guard owns: " + "; ".join(problems))
+        what = f"a {kind} submission of {slots} slot(s)"
+        headroom = None
+        if slots >= 1:                          # the licence server, read before the lock (OR-045)
+            headroom = self._read_headroom(what)
+            self._judge_headroom(headroom, slots, 0, what)
+            context["headroom"] = headroom
         full = ["--parsable", "--export=ALL", *argv]
         with self.locked():
             state = self._reconcile_refusing()
-            self._admit(state, slots, cap, f"a {kind} submission of {slots} slot(s)")
+            self._admit(state, slots, cap, what)
+            if headroom is not None:            # the same reading, with our own slots that have not started
+                self._judge_headroom(headroom, slots, state.queued, what)
+                headroom["queued_ours"] = state.queued
+                # stderr: a caller's stdout is the job id, which pastes capture
+                print(format_headroom(headroom, slots), file=sys.stderr)
             record = self._create(kind=kind, slots=slots, cap=cap, context=context, sbatch_argv=full)
             rid = record["id"]
             sub_env = {k: v for k, v in os.environ.items() if not _scheduler_override(k) and k != RESERVATION_ENV}
@@ -1773,13 +2014,18 @@ class Guard:
 
         The reservation becomes the largest of the requested throttle, the array's running tasks and its held leases,
         with a drain target when that exceeds the request; whatever this adds to what was counted is admitted like a
-        submission. Only a request equal to the scheduler's throttle, with no drain pending, changes nothing.
+        submission, and needs the licence headroom a submission needs, from a reading taken before the lock (OR-045).
+        Only a request equal to the scheduler's throttle, with no drain pending, changes nothing. A lowered throttle
+        is a safety action: it never reads the licence server and never waits on it.
         """
         cap = _check_cap(cap)
         if not isinstance(parent_id, str) or not _JOB_ID.fullmatch(parent_id):
             raise GuardRefused(f"the array's parent job id must be a plain number, got {parent_id!r}")
         if isinstance(throttle, bool) or not isinstance(throttle, int) or not 1 <= throttle <= CEILING:
             raise GuardRefused(f"the throttle must be an integer from 1 to {CEILING}, got {throttle!r}")
+        what = f"setting array {parent_id}'s throttle to {throttle}"
+        reading = self._read_headroom(what, "the throttle is unchanged") \
+            if self._throttle_is_raise(parent_id, throttle) else None
         with self.locked():
             state = self._reconcile_refusing()
             records = [r for r in self._read_reservations().values()
@@ -1803,19 +2049,39 @@ class Guard:
             held = state.held.get(record["id"], 0)
             counted = state.counts.get(record["id"], record["slots"])
             new = max(throttle, group.active, held)
-            self._admit(state, max(0, new - counted), cap, f"setting array {parent_id}'s throttle to {throttle}")
+            added = max(0, new - counted)
+            self._admit(state, added, cap, what)
+            details: dict[str, Any] = {}
+            if added:
+                if reading is None:             # never an lmstat under the lock
+                    raise GuardRefused(f"{what}: it adds {added} slot(s), which need a licence reading taken before "
+                                       "the lock, and none was taken because the reservation changed meanwhile; the "
+                                       "throttle is unchanged, so retry the command (OR-045)")
+                self._judge_headroom(reading, added, state.queued, what, "the throttle is unchanged")
+                details["headroom"] = {**reading, "queued_ours": state.queued}
             previous, previous_target = record["slots"], record.get("throttle_target")
             record["slots"] = new
             record["throttle_target"] = throttle if new > throttle else None
             self._change(record, "bound", event="throttle_change", previous=previous, previous_target=previous_target,
                          throttle=throttle, scheduler_throttle=in_effect, active_tasks=group.active,
-                         held_leases=held)
+                         held_leases=held, **details)
             try:
                 self.scheduler.set_throttle(parent_id, throttle)
             except Exception as exc:
                 raise GuardError(f"scontrol could not set array {parent_id}'s throttle to {throttle}: {exc}; the "
                                  f"reservation records {record['slots']} slot(s), the larger count; check scontrol "
                                  "show job before retrying") from exc
+
+    def _throttle_is_raise(self, parent_id: str, throttle: int) -> bool:
+        """Whether a throttle request may add slots, decided before the lock (no lmstat runs under it) from the array's
+        reservation as recorded, read without the lock and changing nothing: a request above its recorded slots. A
+        record that cannot be read or found is no raise here; the same lookup under the lock refuses it (OR-045)."""
+        try:
+            records = [r for r in self._read_reservations().values()
+                       if r["state"] == "bound" and r["job_id"] == parent_id and r["kind"] == "array"]
+        except (GuardError, OSError):
+            return False
+        return len(records) == 1 and throttle > records[0]["slots"]
 
     def resolve(self, reservation_id: str, outcome: str, reason: str) -> None:
         """The logged manual resolve of an uncertain (or stuck) reservation: ``released`` or ``job:<id>``."""
@@ -2804,7 +3070,8 @@ def _cmd_submit(args: argparse.Namespace, guard: Guard, sbatch_args: list[str]) 
     return 0
 
 
-def main(argv: list[str] | None = None, *, scheduler: Scheduler | None = None, observer: Any = None) -> int:
+def main(argv: list[str] | None = None, *, scheduler: Scheduler | None = None, observer: Any = None,
+         licences: LicenceServer | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     sbatch_args = None
     if "--" in argv:
@@ -2837,7 +3104,8 @@ def main(argv: list[str] | None = None, *, scheduler: Scheduler | None = None, o
                                         iterations=args.iterations, hosts=args.hosts,
                                         barrier_timeout_s=args.barrier_timeout_s, hold_s=args.hold_s,
                                         pause_s=args.pause_s, lock_timeout_s=args.lock_timeout_s)
-        guard = Guard(root, scheduler if scheduler is not None else SlurmScheduler(), observer=observer)
+        guard = Guard(root, scheduler if scheduler is not None else SlurmScheduler(), observer=observer,
+                      licences=licences)
         if args.command == "status":
             if args.lock_info:
                 info = guard.lock_info()

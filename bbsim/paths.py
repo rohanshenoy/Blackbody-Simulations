@@ -46,3 +46,16 @@ def create_job_dirs(output_root: Path, dataset_id: str, frequency_ghz: float, jo
     for d in (dirs.project, dirs.scratch, dirs.logs):
         d.mkdir()
     return dirs
+
+
+def create_modes_job_dirs(output_root: Path, dataset_id: str, job_id: str) -> JobDirs:
+    """Create ``<root>/<dataset_id>_modes/job_<id>/{project,scratch,logs}`` for a mode study (OR-053); refuse if it
+    exists."""
+    root = Path(output_root) / f"{dataset_id}_modes" / f"job_{job_id}"
+    if root.exists():
+        raise FileExistsError(f"job directory already exists: {root}")
+    root.mkdir(parents=True, exist_ok=False)
+    dirs = JobDirs(root=root, project=root / "project", scratch=root / "scratch", logs=root / "logs")
+    for d in (dirs.project, dirs.scratch, dirs.logs):
+        d.mkdir()
+    return dirs

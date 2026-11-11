@@ -16,11 +16,12 @@ import sys
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from bbsim.config import FaceSelector
 from bbsim.geometry import GeometryError, check_face_area, select_face_on_bounding_plane
 from bbsim.geometry_spec import GeometrySpec, GeometrySpecError, load_geometry_spec, plan_text
+from bbsim.hfss_setup import save_project
 from bbsim.inventory import inventory_design, inventory_project
 from bbsim.manifest import sha256_file, write_json
 
@@ -78,6 +79,77 @@ def verify_build(design: Mapping[str, Any], spec: GeometrySpec) -> list[str]:
     return diffs
 
 
+REOPEN_SKIPPED = "reopen skipped: the caller reopens the project itself"
+
+
+class BuildOutcome(NamedTuple):
+    built: dict | None
+    reopened: dict | None
+    diffs: list[str]
+    versions: dict
+    error: str | None
+
+
+def build(spec: GeometrySpec, spec_file: Path, output: Path, version: str, *, reopen: bool = True) -> BuildOutcome:
+    """Build the spec's solid in an AEDT session, save it to ``output``, and (unless ``reopen`` is False) reopen the
+    saved project in a second session and verify it; write ``<output>.build.json`` either way.
+
+    ``reopen=False`` is one AEDT launch instead of two (each launch takes a licence lease, OR-045), for a caller
+    that reopens the project itself; the record then carries ``"reopened": null`` and the reason (OR-053).
+    """
+    from bbsim.session import aedt_session, aedt_versions  # lazy PyAEDT import
+
+    solid = spec.solid
+    versions: dict[str, str] = {}
+    built = reopened = error = None
+    build_diffs: list[str] = []
+    stage = "build"
+    try:
+        with aedt_session(None, design=spec.project.design, version=version) as hfss:
+            versions = aedt_versions(hfss)
+            hfss.modeler.model_units = "mm"
+            created = hfss.modeler.create_cylinder(orientation="Z", origin=[0.0, 0.0, 0.0], radius=solid.radius_mm,
+                                                   height=solid.length_mm, name=spec.project.object,
+                                                   material=solid.material)
+            if not created:
+                raise BuildError("create_cylinder returned False")
+            built = inventory_design(hfss)
+            build_diffs = verify_build(built, spec)
+            save_project(hfss, "the build", file_name=str(output), overwrite=True)   # checked (CDX-046)
+
+        if reopen:
+            stage = "reopen"
+            with aedt_session(output, design=None, version=version) as hfss:
+                reopened = inventory_project(hfss)
+    except Exception as exc:  # noqa: BLE001 - recorded below and reported as exit 3; the session is already released
+        log.exception("%s session failed", stage)
+        error = f"{stage} session failed: {type(exc).__name__}: {exc}"
+
+    diffs = [f"after build: {d}" for d in build_diffs]
+    if error:
+        diffs.append(error)
+    elif reopen:
+        designs = sorted(reopened["designs"])
+        if designs != [spec.project.design]:
+            diffs.append(f"reopened project designs {designs} != [{spec.project.design!r}]")
+        if spec.project.design in reopened["designs"]:
+            diffs += [f"after reopen: {d}" for d in verify_build(reopened["designs"][spec.project.design], spec)]
+        write_json(output.with_suffix(".inventory.json"), reopened)
+    # Written on failure too, so a record of an earlier build never sits beside a project it does not describe.
+    record = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "spec_file": str(Path(spec_file).resolve()), "spec": dataclasses.asdict(spec), "versions": versions,
+        "built_inventory": built, "reopened_inventory": reopened,
+        "output_project": str(output), "output_sha256": sha256_file(output) if output.is_file() else None,
+        "error": error, "verification_differences": diffs,
+    }
+    if not reopen:
+        record["reopened"] = None
+        record["reopen_skipped"] = REOPEN_SKIPPED
+    write_json(output.with_suffix(".build.json"), record)
+    return BuildOutcome(built, reopened, diffs, versions, error)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -106,51 +178,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    from bbsim.session import aedt_session, aedt_versions  # lazy PyAEDT import
-
-    solid = spec.solid
-    versions: dict[str, str] = {}
-    built = reopened = error = None
-    build_diffs: list[str] = []
-    stage = "build"
-    try:
-        with aedt_session(None, design=spec.project.design, version=spec.project.aedt_version) as hfss:
-            versions = aedt_versions(hfss)
-            hfss.modeler.model_units = "mm"
-            created = hfss.modeler.create_cylinder(orientation="Z", origin=[0.0, 0.0, 0.0], radius=solid.radius_mm,
-                                                   height=solid.length_mm, name=spec.project.object,
-                                                   material=solid.material)
-            if not created:
-                raise BuildError("create_cylinder returned False")
-            built = inventory_design(hfss)
-            build_diffs = verify_build(built, spec)
-            hfss.save_project(file_name=str(output), overwrite=True)
-
-        stage = "reopen"
-        with aedt_session(output, design=None, version=spec.project.aedt_version) as hfss:
-            reopened = inventory_project(hfss)
-    except Exception as exc:  # noqa: BLE001 - recorded below and reported as exit 3; the session is already released
-        log.exception("%s session failed", stage)
-        error = f"{stage} session failed: {type(exc).__name__}: {exc}"
-
-    diffs = [f"after build: {d}" for d in build_diffs]
-    if error:
-        diffs.append(error)
-    else:
-        designs = sorted(reopened["designs"])
-        if designs != [spec.project.design]:
-            diffs.append(f"reopened project designs {designs} != [{spec.project.design!r}]")
-        if spec.project.design in reopened["designs"]:
-            diffs += [f"after reopen: {d}" for d in verify_build(reopened["designs"][spec.project.design], spec)]
-        write_json(output.with_suffix(".inventory.json"), reopened)
-    # Written on failure too, so a record of an earlier build never sits beside a project it does not describe.
-    write_json(output.with_suffix(".build.json"), {
-        "created_utc": datetime.now(timezone.utc).isoformat(),
-        "spec_file": str(args.spec.resolve()), "spec": dataclasses.asdict(spec), "versions": versions,
-        "built_inventory": built, "reopened_inventory": reopened,
-        "output_project": str(output), "output_sha256": sha256_file(output) if output.is_file() else None,
-        "error": error, "verification_differences": diffs,
-    })
+    outcome = build(spec, args.spec, output, spec.project.aedt_version)
+    diffs = outcome.diffs
     if diffs:
         print("\nBUILD VERIFICATION FAILED:\n  " + "\n  ".join(diffs))
         return 3
