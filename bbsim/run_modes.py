@@ -16,8 +16,9 @@ One job builds the bore and solves its ports, in its own directory ``<root>/<dat
    information: the faces are identified without it.
 5. The wall, the mesh, two N-mode wave ports and one ports-only setup per frequency (``bbsim.modes_setup``), then one
    solve of every setup with the config's cores; AEDT's messages are logged and kept in ``logs/aedt_messages.txt``.
-   The project is saved as soon as the solve returns, so its solution is on disk whatever follows. ``analyze``
-   returning True proves nothing, so every setup must then hold its one solution.
+   The project is saved as soon as the solve returns, so its solution is on disk whatever follows; a save AEDT refuses,
+   before the solve or after it, stops the run (exit 3). ``analyze`` returning True proves nothing, so every setup must
+   then hold its one solution.
 6. Every setup's port modes' Gamma, read for all setups first; then per setup a Touchstone export into ``scratch/`` as
    evidence. A failed export is a warning row, not a failure, since the acceptance check reads ``modes.csv`` alone,
    and coming after every read it cannot stop one. AEDT's messages are kept again after the exports, so an export's
@@ -30,8 +31,9 @@ Exit codes: 0, every self-check row of fail severity passed; 1, a self-check fai
 write or the self-check itself failed after a finished solve (the solved project, AEDT's messages and a manifest whose
 ``passed`` is false are kept); 2, refused before AEDT (arguments, config, the guard, the checkout, an existing job
 directory); 3, the build or an AEDT session failed, the design would not take driven modal, the opened design is not
-the spec's bore, the solve left a setup without its solution, or the project could not be saved after the solve, since
-the solution may then not be on disk (the project and a manifest are kept).
+the spec's bore, the solve left a setup without its solution, or the project could not be saved after the setup or
+the solve (save_project returned False or raised; CDX-046), since the solution may then not be on disk (the project
+and a manifest are kept).
 
 Once the run log is open and ``effective_config.json`` written, every run writes the manifest however it ends,
 SIGTERM aside, with a null sha256 for a project it cannot read; a failure to open the log or write that file stops
@@ -58,7 +60,7 @@ from bbsim.build_project import TOL_MM, build, verify_build
 from bbsim.config import FaceSelector
 from bbsim.geometry import GeometryError, select_face_on_bounding_plane
 from bbsim.geometry_spec import GeometrySpec
-from bbsim.hfss_setup import aedt_messages, solve
+from bbsim.hfss_setup import aedt_messages, save_project, solve
 from bbsim.inventory import inventory_design
 from bbsim.manifest import (REPO_ROOT, EnvironmentState, EnvironmentStateError, build_manifest, environment_state,
                             sha256_file, write_json)
@@ -312,7 +314,9 @@ def _setup(cfg: ModesConfig, hfss: Any, record: dict) -> None:
         record["setups"].append({"name": setup, "frequency_ghz": f, "ports_only": True,
                                  "port_accuracy_percent": cfg.solver.port_accuracy_percent, "solution": None,
                                  "touchstone": None})
-    hfss.save_project()
+    # Before the licensed solve: an AEDT that will not save stops the run here (exit 3), not after a solve whose
+    # results it could not keep (CDX-046).
+    save_project(hfss, "the setup")
     record["timings"]["setup_s"] = time.perf_counter() - t
     log.info("wall %s, %d-mode ports %s, %d ports-only setups", record["wall"]["kind"], cfg.ports.modes, names,
              len(record["setups"]))
@@ -329,8 +333,10 @@ def _solve(cfg: ModesConfig, hfss: Any, dirs: JobDirs, record: dict) -> None:
         raise RuntimeError("hfss.analyze returned False")
     # AEDT writes the solution into the project's results folder only when the project is saved, so it is saved before
     # the lookup: a lookup that fails below still leaves the solve's results in the job, to be opened in AEDT. Saving a
-    # project with no solution is harmless. A failed save is exit 3, since the solution may then not be on disk.
-    hfss.save_project()
+    # project with no solution is harmless. A failed save is exit 3, since the solution may then not be on disk: PyAEDT
+    # reports it as a returned False, which save_project raises on as on an exception, before any lookup or read
+    # (CDX-046).
+    save_project(hfss, "the solve")
     # analyze() returning True proves nothing (HPC step 4, baseline1: a licence checkout failure solved nothing): every
     # setup must hold its one solution, found by the lookup the reads use, or the session failed (exit 3).
     missing = []

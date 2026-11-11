@@ -207,6 +207,23 @@ def solve(hfss: Any, cores: int) -> bool:
     return bool(hfss.analyze(cores=cores))
 
 
+class SaveError(RuntimeError):
+    """AEDT did not save the project (CDX-046)."""
+
+
+def save_project(hfss: Any, after: str, **kwargs: Any) -> None:
+    """``hfss.save_project(**kwargs)``, checked (CDX-046). PyAEDT 1.7.0's save_project returns True when the project
+    was saved and False when it was not, its error handler turning AEDT's exception into False; anything but True, or
+    an exception, raises SaveError naming ``after``, the step whose result the save was to keep on disk."""
+    try:
+        saved = hfss.save_project(**kwargs)
+    except Exception as exc:  # noqa: BLE001 - named and raised again; SystemExit (SIGTERM) passes untouched
+        raise SaveError(f"the project could not be saved after {after}: save_project raised "
+                        f"{type(exc).__name__}: {exc}") from exc
+    if saved is not True:
+        raise SaveError(f"the project could not be saved after {after}: save_project returned {saved!r}")
+
+
 def aedt_messages(hfss: Any) -> list[str]:
     """Every entry of AEDT's message manager for the open design (all severities), or one line saying why not.
 

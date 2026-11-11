@@ -581,6 +581,7 @@ def prepare_and_solve(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sta
         insert_far_field_sphere,
         missing_polarizations,
         reset_initial_mesh_settings,
+        save_project,
         set_total_fields,
         solve,
         solved_variations,
@@ -653,7 +654,8 @@ def prepare_and_solve(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sta
         _require_expected_lattice(face_geometry, lattice, expected_lattice)
     if cfg.output.schema == 2:
         _require_v2_lattice(face_geometry.cross_section, lattice)
-    hfss.save_project()
+    # Checked (CDX-046): an AEDT that will not save stops the run before the licensed solve, not after it.
+    save_project(hfss, "the setup")
 
     log.info("solving %s with %d cores (%d incident angles x 2 polarizations)", setup, cfg.solver.cores,
              len(phi_values) * len(theta_values))
@@ -679,7 +681,9 @@ def prepare_and_solve(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sta
         )
     # AEDT writes solution data into the project's results folder only when the project is saved; a run
     # that fails during extraction closes the project unsaved (HPC steps 4 and 4a lost their solves that way).
-    hfss.save_project()
+    # A save AEDT refuses (PyAEDT's False, or an exception) stops the run here, before any export, and before the
+    # message that the solved project is kept (CDX-046).
+    save_project(hfss, "the solve")
     return SolvedContext(
         ctx=ctx, face_geometry=face_geometry, lattice=lattice, entrance=entrance, exit_face=exit_face, solid=solid,
         setup=setup, parametric=parametric, sphere=sphere, grid=grid, plane_wave=plane_wave, wall_facets=wall_facets,
@@ -764,7 +768,7 @@ def extract_and_write(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sol
     """
     from bbsim.convergence import qualify
     from bbsim.extract import RIM_BAND_REL, evaluate_exit_powers, extract_far_field, extract_waveguide
-    from bbsim.hfss_setup import EXIT_CS, EXIT_FACE_LIST, export_convergence_text
+    from bbsim.hfss_setup import EXIT_CS, EXIT_FACE_LIST, export_convergence_text, save_project
     from bbsim.readers import require_finite_table
 
     schema = cfg.output.schema
@@ -796,7 +800,7 @@ def extract_and_write(cfg: RunConfig, dirs: JobDirs, job_id: str, hfss: Any, sol
             convergence[str(ephi)] = export_convergence_text(hfss, solved.setup, f"Ephi='{ephi}'",
                                                              dirs.logs / f"convergence_Ephi{ephi}.txt")
             log.info("extracted Ephi=%s (%d waveguide rows, %d far-field rows)", ephi, len(waveguide), len(far_field))
-        hfss.save_project()
+        save_project(hfss, "the extraction")      # checked (CDX-046): a refused save publishes nothing
     if session is not None:
         session.before_write()          # the run's AEDT calls are done: AEDT's temp directory goes back now (HF-057)
 

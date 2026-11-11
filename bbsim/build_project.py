@@ -21,6 +21,7 @@ from typing import Any, NamedTuple
 from bbsim.config import FaceSelector
 from bbsim.geometry import GeometryError, check_face_area, select_face_on_bounding_plane
 from bbsim.geometry_spec import GeometrySpec, GeometrySpecError, load_geometry_spec, plan_text
+from bbsim.hfss_setup import save_project
 from bbsim.inventory import inventory_design, inventory_project
 from bbsim.manifest import sha256_file, write_json
 
@@ -114,7 +115,7 @@ def build(spec: GeometrySpec, spec_file: Path, output: Path, version: str, *, re
                 raise BuildError("create_cylinder returned False")
             built = inventory_design(hfss)
             build_diffs = verify_build(built, spec)
-            hfss.save_project(file_name=str(output), overwrite=True)
+            save_project(hfss, "the build", file_name=str(output), overwrite=True)   # checked (CDX-046)
 
         if reopen:
             stage = "reopen"
