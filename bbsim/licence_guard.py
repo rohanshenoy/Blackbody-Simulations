@@ -229,8 +229,9 @@ EXITED_STATES = frozenset({"Z", "X"})          # exited, not yet reaped: holds n
 CGROUP_V1_PREFERENCE = ("freezer", "pids", "memory", "cpuset", "cpuacct", "cpu")
 AEDT_PROCESS = re.compile(r"ansysedt|AnsysEM|hf3d|hfss", re.IGNORECASE)
 
-# The licence features one 4-core HFSS solve checks out, one of each (measured 2026-11-10; OR-045). The pool is
-# shared with other users, so a licensed submission first checks each has room for its slots.
+# The licence features one HFSS solve (asked for 4 cores, ran on one; HF-060) checks out, one of each (measured
+# 2026-11-10; OR-045). The pool is shared with other users, so a licensed submission first checks each has room for
+# its slots.
 HEADROOM_FEATURES = ("electronics_desktop", "electronics3d_gui", "elec_solve_hfss", "elec_solve_level1",
                      "elec_solve_level2")
 LMSTAT_TIMEOUT_S = 60.0
@@ -423,6 +424,12 @@ def parse_lmstat(feature: str, text: str) -> tuple[int, int]:
         raise LicenceQueryError(f"lmstat's line for {feature} is not 'Total of N licenses issued;  Total of M "
                                 f"licenses in use': {lines[0][:200]!r}")
     return int(match.group(2)), int(match.group(3))
+
+
+def _retry_reason(why: str, limit: int = 200) -> str:
+    """A licence reading's failure on one line, cut to ``limit`` characters, for the retry's stderr line."""
+    text = " ".join(why.split())
+    return text if len(text) <= limit else text[:limit - 3] + "..."
 
 
 def _lmstat_reason(text: str) -> str:
@@ -1844,6 +1851,10 @@ class Guard:
                 raise GuardRefused(f"{what}: the licence server cannot be read ({why}) after {attempts} "
                                    f"attempt{'' if attempts == 1 else 's'} over {now - first:g} s, so {outcome}; "
                                    "there is no override (OR-045)")
+            # The operator's terminal would otherwise stay silent for the whole window. Not the headroom line's start:
+            # a paste expects that once per submission. Stdout stays the job id.
+            print(f"licence server unreadable (attempt {attempts}): {_retry_reason(why)}; the next attempt in "
+                  f"{HEADROOM_RETRY_INTERVAL_S:g} s (OR-045)", file=sys.stderr)
             _retry_sleep(HEADROOM_RETRY_INTERVAL_S)
         utc = self._now()
         none = [f for f, (issued, _) in counts.items() if issued == 0]
