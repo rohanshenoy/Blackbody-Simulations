@@ -1063,9 +1063,10 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None, *, scheduler: Any = None, env: EnvironmentState | None = None,
-         environ: Mapping[str, str] | None = None, module_root: Path | None = None) -> int:
-    """The CLI. ``scheduler``, ``env`` (the worktree's state), ``environ`` and ``module_root`` replace Slurm, the
-    worktree's ``environment_state``, a job's environment and this module's checkout (tests)."""
+         environ: Mapping[str, str] | None = None, module_root: Path | None = None, licences: Any = None) -> int:
+    """The CLI. ``scheduler``, ``env`` (the worktree's state), ``environ``, ``module_root`` and ``licences`` replace
+    Slurm, the worktree's ``environment_state``, a job's environment, this module's checkout and the licence server
+    lmutil reads (tests; OR-045)."""
     try:
         args = _parser().parse_args(argv)
     except SystemExit as exc:                    # argparse has printed its message
@@ -1078,7 +1079,8 @@ def main(argv: list[str] | None = None, *, scheduler: Any = None, env: Environme
             # A list prints one line per element and nothing for none (extra_args, read with while read)
             sys.stdout.write(value + "\n" if value or args.name != "extra_args" else "")
             return 0
-        guard = licence_guard.Guard(root, scheduler if scheduler is not None else licence_guard.SlurmScheduler())
+        guard = licence_guard.Guard(root, scheduler if scheduler is not None else licence_guard.SlurmScheduler(),
+                                    licences=licences)
         if args.command == "remaining":
             print(remaining_block(args.plan, args.sha256, guard=guard))
             return 0
