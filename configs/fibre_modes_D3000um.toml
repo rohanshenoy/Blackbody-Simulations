@@ -1,5 +1,6 @@
 # Ports-only mode study of the 3000 um silver bore (ledger OR-053): vacuum cylinder, wave ports on both end faces,
-# bulk finite-conductivity wall, 47 modes per port. Every frequency lies at least 2 % from every ideal cutoff.
+# bulk finite-conductivity wall, 25 modes per port, AEDT 2025 R2's cap for a wave port (OR-053). Every frequency
+# lies at least 2 % from every ideal cutoff, and at most 21 modes propagate at any of them.
 
 [project]
 geometry_spec = "geometries/fibre_bore_D3000um.toml"
@@ -9,8 +10,8 @@ kind = "finite_conductivity"
 conductivity_s_per_m = 6.29e7
 
 [ports]
-modes = 47
-frequencies_ghz = [61, 67, 70, 86, 109, 128, 148, 189, 209, 218, 231, 248, 261, 287]
+modes = 25
+frequencies_ghz = [61, 67, 70, 86, 109, 128, 148, 189, 209]
 
 [solver]
 cores = 4

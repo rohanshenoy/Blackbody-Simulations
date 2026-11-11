@@ -23,6 +23,8 @@ class ModesConfigError(ValueError):
 WALL_KINDS = ("pec", "finite_conductivity")
 MIN_CUTOFF_DISTANCE = 0.01
 EXTRA_MODES = 2
+MAX_PORT_MODES = 25         # AEDT 2025 R2 refuses a wave port with more: "The number of modes must be between 1 and 25"
+                            # (the bridge's HFSS RESULTS section 24; OR-053)
 
 
 def _finite(name: str, value: Any) -> float:
@@ -73,6 +75,9 @@ class PortsConfig:
     def __post_init__(self) -> None:
         if _integer("modes", self.modes) < 1:
             raise ModesConfigError(f"modes must be >= 1, got {self.modes!r}")
+        if self.modes > MAX_PORT_MODES:
+            raise ModesConfigError(f"modes = {self.modes}: AEDT 2025 R2 caps a wave port at {MAX_PORT_MODES} modes, so "
+                                   "the run would stop at its first port after two AEDT launches")
         if not isinstance(self.frequencies_ghz, tuple) or not self.frequencies_ghz:
             raise ModesConfigError("frequencies_ghz must be a non-empty list of numbers")
         for i, f in enumerate(self.frequencies_ghz):
