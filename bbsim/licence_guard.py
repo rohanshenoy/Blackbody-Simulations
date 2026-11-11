@@ -152,9 +152,11 @@ PENDING_QUEUE_STATES = frozenset({"PENDING"})             # every other listed s
 TERMINAL_STATES = frozenset({"BOOT_FAIL", "CANCELLED", "COMPLETED", "DEADLINE", "FAILED", "NODE_FAIL",
                              "OUT_OF_MEMORY", "PREEMPTED", "REVOKED", "TIMEOUT"})
 
-# Path mode: script name -> (kind, slots). The two existing wrappers and I1's and I2b's zero-slot scripts.
+# Path mode: script name -> (kind, slots). The single-solve, modes and re-export wrappers, and I1's and I2b's
+# zero-slot scripts.
 PATH_MODE_SCRIPTS = {
     "run_frequency.sbatch": ("single", 1),
+    "run_modes.sbatch": ("single", 1),          # the fibre bore's ports-only mode run (OR-053)
     "reexport.sbatch": ("reexport", 1),
     "probe_cluster.sbatch": ("monitor", 0),
     "guard_lock_contention.sbatch": ("monitor", 0),
