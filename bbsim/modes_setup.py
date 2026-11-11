@@ -66,8 +66,14 @@ def assign_mesh(hfss: Any, cfg: Any, end_face_ids: list[int]) -> dict[str, Any]:
                                           maximum_elements=None, name=PORT_FACES)
         if not op:
             raise RuntimeError(f"assign_length_mesh returned {op!r}")
-        out["port_faces"] = {"faces": list(end_face_ids), "maximum_length_mm": length,
-                             "name": str(getattr(op, "name", PORT_FACES))}
+        # PyAEDT returns the operation object whether or not AEDT created it, so read the design's mesh tree, as for
+        # the wall facets: a silent failure would solve the ports on AEDT's own mesh and record the length as applied.
+        name = str(getattr(op, "name", PORT_FACES))
+        present = [str(n) for n in hfss.mesh.meshoperation_names]
+        if name not in present:
+            raise RuntimeError(f"mesh operation {name!r} is not in the design after assign_length_mesh; its mesh "
+                               f"operations are {present}")
+        out["port_faces"] = {"faces": list(end_face_ids), "maximum_length_mm": length, "name": name}
     return out
 
 
@@ -110,8 +116,15 @@ def _port_number(name: str) -> int:
 def read_gamma(hfss: Any, setup: str, ports: list[str], modes: int, frequency_ghz: float) -> list[GammaRow]:
     """Gamma(port:m) of every port mode: rows ordered by port, then mode 1..modes (alpha = Re, beta = Im)."""
     expressions = [(_port_number(p), m, f"Gamma({p}:{m})") for p in ports for m in range(1, modes + 1)]
-    data = hfss.post.get_solution_data(expressions=[e for _, _, e in expressions],
-                                       setup_sweep_name=solution_of(hfss, setup))
+    names = [e for _, _, e in expressions]
+    solution = solution_of(hfss, setup)
+    data = hfss.post.get_solution_data(expressions=names, setup_sweep_name=solution)
+    if data is None or data is False:
+        # PyAEDT logs "No Data Available" and returns False (None from a failed per-variation read) when AEDT serves
+        # nothing for the category, the solution and the expressions: say for what.
+        raise RuntimeError(f"AEDT gave no solution data for setup {setup!r} ({solution}): get_solution_data returned "
+                           f"{data!r} for {', '.join(names[:3])}{', ...' if len(names) > 3 else ''} "
+                           f"({len(names)} expressions)")
     swept = [float(x) for x in data.primary_sweep_values]
     if len(swept) != 1 or not math.isclose(swept[0], frequency_ghz, rel_tol=FREQUENCY_RTOL, abs_tol=0.0):
         raise RuntimeError(f"setup {setup!r} solved at {swept} GHz, not the requested {frequency_ghz} GHz")
@@ -120,9 +133,10 @@ def read_gamma(hfss: Any, setup: str, ports: list[str], modes: int, frequency_gh
         values = []
         for formula in ("real", "imag"):
             x, y = data.get_expression_data(expr, formula=formula)
-            if len(y) != 1 or len(x) != 1:
+            # None is PyAEDT's per-column lookup finding no row: the empty case
+            if x is None or y is None or len(y) != 1 or len(x) != 1:
                 raise RuntimeError(f"AEDT returned no {formula} data for {expr} in setup {setup!r} "
-                                   f"({len(y)} values)")
+                                   f"({0 if y is None else len(y)} values)")
             if not math.isclose(float(x[0]), frequency_ghz, rel_tol=FREQUENCY_RTOL, abs_tol=0.0):
                 raise RuntimeError(f"{expr} was read at {float(x[0])} GHz, not {frequency_ghz} GHz")
             values.append(float(y[0]))

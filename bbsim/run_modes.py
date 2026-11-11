@@ -16,11 +16,12 @@ One job builds the bore and solves its ports, in its own directory ``<root>/<dat
    information: the faces are identified without it.
 5. The wall, the mesh, two N-mode wave ports and one ports-only setup per frequency (``bbsim.modes_setup``), then one
    solve of every setup with the config's cores; AEDT's messages are logged and kept in ``logs/aedt_messages.txt``.
-   ``analyze`` returning True proves nothing, so every setup must then hold its one solution before the project is
-   saved.
-6. Per setup, every port mode's Gamma, and a Touchstone export into ``scratch/`` as evidence; a failed export is a
-   warning row, not a failure, since the acceptance check reads ``modes.csv`` alone. AEDT's messages are kept again
-   after the reads, so an export's reason stays in the record.
+   The project is saved as soon as the solve returns, so its solution is on disk whatever follows. ``analyze``
+   returning True proves nothing, so every setup must then hold its one solution.
+6. Every setup's port modes' Gamma, read for all setups first; then per setup a Touchstone export into ``scratch/`` as
+   evidence. A failed export is a warning row, not a failure, since the acceptance check reads ``modes.csv`` alone,
+   and coming after every read it cannot stop one. AEDT's messages are kept again after the exports, so an export's
+   reason stays in the record.
 7. AEDT's temp directory is restored, ``modes.csv`` is written and self-checked (``bbsim.modes``), and
    ``modes_manifest.json`` records the run. Its top-level ``acceptance`` block, {bore_um: the bore's diameter in um,
    rho_ohm_m: 1/sigma, null for a pec wall}, is what the bridge script hands to the acceptance check.
@@ -326,6 +327,10 @@ def _solve(cfg: ModesConfig, hfss: Any, dirs: JobDirs, record: dict) -> None:
     _keep_messages(hfss, dirs, record)
     if not solved:
         raise RuntimeError("hfss.analyze returned False")
+    # AEDT writes the solution into the project's results folder only when the project is saved, so it is saved before
+    # the lookup: a lookup that fails below still leaves the solve's results in the job, to be opened in AEDT. Saving a
+    # project with no solution is harmless. A failed save is exit 3, since the solution may then not be on disk.
+    hfss.save_project()
     # analyze() returning True proves nothing (HPC step 4, baseline1: a licence checkout failure solved nothing): every
     # setup must hold its one solution, found by the lookup the reads use, or the session failed (exit 3).
     missing = []
@@ -340,25 +345,26 @@ def _solve(cfg: ModesConfig, hfss: Any, dirs: JobDirs, record: dict) -> None:
         raise RuntimeError(f"the solve left {len(missing)} of {len(record['setups'])} setups without their solution: "
                            + "; ".join(missing) + ". AEDT messages: "
                            + (" | ".join(record["aedt_messages"]) or "(none)"))
-    # AEDT writes the solution into the project's results folder only when the project is saved; a failed save is
-    # exit 3, since the solution may then not be on disk.
-    hfss.save_project()
 
 
 def _read(cfg: ModesConfig, hfss: Any, dirs: JobDirs, record: dict) -> list[GammaRow]:
     t = time.perf_counter()
     rows: list[GammaRow] = []
     names = record["ports"]["names"]
+    # Every setup's Gamma, which acceptance needs, is read before any export, which is evidence only: an export that
+    # fails, or takes the desktop down, cannot then stop a later read.
     for entry in record["setups"]:
         setup = entry["name"]     # its solution was found in the solve stage
         got = read_gamma(hfss, setup, names, cfg.ports.modes, entry["frequency_ghz"])
         rows += got
+        log.info("%s: %d port modes read from %s", setup, len(got), entry["solution"])
+    for entry in record["setups"]:
+        setup = entry["name"]
         path = dirs.scratch / f"{setup}.s{len(names) * cfg.ports.modes}p"
         error = export_touchstone_with_gamma(hfss, setup, path)
         entry["touchstone"] = {"path": str(path), "error": error}
         if error is not None:
             log.warning("%s: the Touchstone export failed (evidence only, a warning): %s", setup, error)
-        log.info("%s: %d port modes read from %s", setup, len(got), entry["solution"])
     record["timings"]["read_s"] = time.perf_counter() - t
     return rows
 
